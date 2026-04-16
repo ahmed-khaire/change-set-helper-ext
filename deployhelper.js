@@ -131,7 +131,11 @@ function cshRenderDeployHelper() {
     		<option value='NoTestRun'>NoTestRun</option>
     		<option value='RunLocalTests'>RunLocalTests</option>
     		<option value='RunAllTestsInOrg'>RunAllTestsInOrg</option>
+    		<option value='RunSpecifiedTests'>RunSpecifiedTests</option>
     	</select>
+
+        <textarea id='specifiedTestsInput' rows='2' cols='46' style='display:none;vertical-align:middle;margin-left:6px;font-family:Menlo,Consolas,monospace;'
+            placeholder='Test class names (comma- or space-separated): MyTest, MyOtherTest'></textarea>
 
         <input value="Go..." class="btn" name="deployTest" id="deployTest" title="Go.." type="button" />
 
@@ -202,6 +206,24 @@ function testDeploy() {
 
 	if (testLevel) {
 		opts.testLevel = testLevel;
+		// RunSpecifiedTests requires a non-empty runTests array alongside
+		// the test level. We parse the textarea on whitespace OR commas so
+		// the user can paste either "TestA, TestB" or a newline-separated
+		// list copied from a spreadsheet.
+		if (testLevel === 'RunSpecifiedTests') {
+			var tests = ($('#specifiedTestsInput').val() || '')
+				.split(/[\s,]+/)
+				.map(function (s) { return s.trim(); })
+				.filter(Boolean);
+			if (tests.length === 0) {
+				window.cshToast && window.cshToast.show(
+					'RunSpecifiedTests requires at least one test class name.',
+					{ type: 'error' }
+				);
+				return;
+			}
+			opts.runTests = tests;
+		}
 	}
 
 	console.log(opts);
@@ -398,6 +420,12 @@ function quickDeploy() {
 				if (onlyFail && $(this).hasClass('ok')) $(this).hide();
 				else $(this).show();
 			});
+		});
+
+		// Reveal the test-class textarea only when RunSpecifiedTests is picked.
+		$(document).on('change', '#testLevelInput', function () {
+			if ($(this).val() === 'RunSpecifiedTests') $('#specifiedTestsInput').show();
+			else $('#specifiedTestsInput').hide();
 		});
 	}
 
