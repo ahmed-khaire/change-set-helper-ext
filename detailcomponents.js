@@ -85,37 +85,18 @@
     }
 
     // -----------------------------------------------------------------------
-    // Page-context bridge. Injected once via a <script> tag whose textContent
-    // runs in the page's JS world where deleteComponent is defined. The
-    // bridge exposes nothing globally; it listens on window.message for a
-    // tagged command and calls deleteComponent, then posts a reply with the
-    // original message id.
+    // Page-context bridge is a separate MAIN-world content script
+    // (detailpagebridge.js) declared alongside this file in the manifest.
+    // That runs in the page's JavaScript context where deleteComponent is
+    // defined; inline <script> injection is refused by Salesforce's CSP.
+    //
+    // Here in the ISOLATED world we just install the reply listener so we
+    // can correlate the bridge's postMessage responses with our pending
+    // promises via the shared message id.
     // -----------------------------------------------------------------------
     function injectPageBridge() {
         if (pageBridgeInjected) return;
         pageBridgeInjected = true;
-
-        var s = document.createElement('script');
-        s.textContent =
-            '(function(){' +
-              'window.addEventListener("message",function(ev){' +
-                'var d=ev.data;' +
-                'if(!d||d.__cshBulk!==true||d.source==="page")return;' +
-                'try{' +
-                  'if(d.cmd==="delete"){' +
-                    'if(typeof deleteComponent!=="function")throw new Error("deleteComponent not available");' +
-                    'deleteComponent(d.cid);' +
-                    'window.postMessage({__cshBulk:true,source:"page",mid:d.mid,ok:true},"*");' +
-                  '}' +
-                '}catch(err){' +
-                  'window.postMessage({__cshBulk:true,source:"page",mid:d.mid,ok:false,error:err.message},"*");' +
-                '}' +
-              '});' +
-            '})();';
-        (document.head || document.documentElement).appendChild(s);
-        s.remove();
-
-        // Content-script side listener for the bridge's replies.
         window.addEventListener('message', function (ev) {
             var d = ev.data;
             if (!d || d.__cshBulk !== true || d.source !== 'page') return;
