@@ -79,26 +79,43 @@ var entityFolderMap = {
 }
 
 
-// Helper function to add columns to specific rows (avoids freezing with large datasets)
+// Remembered once in setupTable() so every row/column index is computed from
+// Salesforce's actual DOM instead of a hard-coded 1-or-2 guess. Lets the
+// extension work on entity types where Salesforce renders Name+Type+Parent
+// (CustomField, WorkflowFieldUpdate, RecordType, etc.) instead of only Name.
+var cshOriginalRowCellCount = null;    // max <td> count per tr.dataRow before we touched the table
+var cshOriginalHeaderCount = null;     // <th>+<td> count in tr.headerRow before we touched it
+
+function cshExtraColumnsPerRow() {
+    var dyn = (dynamicColumns && dynamicColumns.length > 0) ? dynamicColumns.length : 3;
+    return dyn + 4; // dynamic + 4 compare columns
+}
+
+// Helper function to add columns to specific rows (avoids freezing with large datasets).
+// Two-pass strategy: first find the widest existing row, then pad every row up to
+// (widest + extraColumns). Prevents ragged rows when Salesforce renders some rows
+// without the Type column (happens for heterogeneous folder-based types).
 function addColumnsToRows(rows) {
-    // Add dynamic columns based on metadata properties
-    // Use empty string since applyMetadataToRows() will immediately populate with actual values
-    if (dynamicColumns && dynamicColumns.length > 0) {
-        for (var i = 0; i < dynamicColumns.length; i++) {
-            rows.append("<td></td>"); // Will be populated by applyMetadataToRows
-        }
-    } else {
-        // Fallback to basic columns if metadata not loaded yet (should not happen in normal flow)
-        rows.append("<td></td>"); // Full Name
-        rows.append("<td></td>"); // Last Modified Date
-        rows.append("<td></td>"); // Last Modified By Name
+    if (!rows || rows.length === 0) return;
+
+    var extra = cshExtraColumnsPerRow();
+    var widest = 0;
+    rows.each(function () {
+        var c = $(this).children('td').length;
+        if (c > widest) widest = c;
+    });
+    if (cshOriginalRowCellCount === null) {
+        cshOriginalRowCellCount = widest;
+    } else if (widest > cshOriginalRowCellCount) {
+        cshOriginalRowCellCount = widest;
     }
 
-    // Add compare columns (empty initially, populated when compare is clicked)
-    rows.append("<td></td>"); // Folder
-    rows.append("<td></td>"); // Compare Date Modified
-    rows.append("<td></td>"); // Compare Modified By
-    rows.append("<td></td>"); // Full Name (for diff)
+    var target = cshOriginalRowCellCount + extra;
+    rows.each(function () {
+        var row = $(this);
+        var have = row.children('td').length;
+        for (var i = have; i < target; i++) row.append('<td></td>');
+    });
 }
 
 function setupTable() {
@@ -110,6 +127,21 @@ function setupTable() {
 
     console.log('setupTable: Type column exists:', typeColumn.length > 0);
     console.log('setupTable: Name column exists:', nameColumn.length > 0);
+
+    // Snapshot the ORIGINAL cell counts before we mutate the table. Every
+    // subsequent column-index computation keys off these values, which keeps
+    // the extension correct for any entity type Salesforce decides to render —
+    // including types that add a parent-object column (CustomField, Workflow*,
+    // RecordType, ListView, CompactLayout) and ones that drop the Type column.
+    cshOriginalHeaderCount = $("table.list tr.headerRow").children('th,td').length;
+    var widestDataRow = 0;
+    $("table.list tr.dataRow").each(function () {
+        var c = $(this).children('td').length;
+        if (c > widestDataRow) widestDataRow = c;
+    });
+    cshOriginalRowCellCount = widestDataRow;
+    console.log('setupTable: original header cells =', cshOriginalHeaderCount,
+                ', widest data row =', widestDataRow);
 
     // Log original header structure
     var originalHeaders = [];
@@ -246,16 +278,25 @@ function isSalesforceId(value) {
     return /^[a-zA-Z0-9]+$/.test(value);
 }
 
-// Determine which columns to add dynamically based on metadata properties
-function determineMetadataColumns(metadataRecord) {
-    if (!metadataRecord) {
+// Determine which columns to add dynamically based on metadata properties.
+// Accepts either a single record or an array; for an array we union properties
+// across all records so heterogeneous results (e.g. managed-package records
+// with extra fields) don't silently drop columns that only some rows carry.
+function determineMetadataColumns(metadataRecordOrArray) {
+    if (!metadataRecordOrArray) {
         console.log('determineMetadataColumns: No metadata record provided');
         return [];
     }
 
+    var records = Array.isArray(metadataRecordOrArray) ? metadataRecordOrArray : [metadataRecordOrArray];
+    records = records.filter(function (r) { return r && typeof r === 'object'; });
+    if (records.length === 0) {
+        console.log('determineMetadataColumns: No usable records');
+        return [];
+    }
+
     console.log('========================================');
-    console.log('determineMetadataColumns: Analyzing metadata properties');
-    console.log('Sample metadata record:', metadataRecord);
+    console.log('determineMetadataColumns: Analyzing', records.length, 'record(s) for column union');
 
     var columns = [];
 
@@ -274,47 +315,56 @@ function determineMetadataColumns(metadataRecord) {
         'lastModifiedByName'
     ];
 
-    // First add properties in preferred order if they exist
+    function propertyIsUsable(prop) {
+        // Scan up to the first 25 records: a property is "usable" when any one
+        // of them holds a non-ID, defined value. This tolerates records with
+        // sparse metadata (managed packages, older components).
+        var limit = Math.min(records.length, 25);
+        for (var r = 0; r < limit; r++) {
+            var rec = records[r];
+            if (rec && rec.hasOwnProperty(prop) && rec[prop] !== undefined && rec[prop] !== null && rec[prop] !== '') {
+                if (isSalesforceId(rec[prop])) continue;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // First add properties in preferred order if any record exposes them
     for (var i = 0; i < propertyOrder.length; i++) {
         var prop = propertyOrder[i];
-        console.log('  - Checking property:', prop, 'exists:', metadataRecord.hasOwnProperty(prop), 'value:', metadataRecord[prop]);
-
-        if (metadataRecord.hasOwnProperty(prop) && metadataRecord[prop] !== undefined) {
-            // Skip if the value is a Salesforce ID
-            if (isSalesforceId(metadataRecord[prop])) {
-                console.log('    → Skipping (Salesforce ID format)');
-                continue;
-            }
-
-            console.log('    → Adding column:', prop);
+        if (propertyIsUsable(prop)) {
+            console.log('    → Adding preferred column:', prop);
             columns.push({
                 propertyName: prop,
                 headerLabel: camelCaseToCapitalCase(prop),
                 isDate: prop.toLowerCase().includes('date')
             });
         } else {
-            console.log('    → Property not found or undefined');
+            console.log('    → Skipping preferred column (not present on any scanned record):', prop);
         }
     }
 
-    // Then add any remaining properties not already included
-    for (var prop in metadataRecord) {
-        if (metadataRecord.hasOwnProperty(prop) &&
-            skipProperties.indexOf(prop) === -1 &&
-            propertyOrder.indexOf(prop) === -1 &&
-            metadataRecord[prop] !== undefined) {
-
-            // Skip if the value is a Salesforce ID
-            if (isSalesforceId(metadataRecord[prop])) {
-                console.log('  - Skipping column', prop, '(Salesforce ID format)');
-                continue;
-            }
+    // Then union any remaining properties across all scanned records.
+    var seen = {};
+    columns.forEach(function (c) { seen[c.propertyName] = true; });
+    var scanLimit = Math.min(records.length, 25);
+    for (var r = 0; r < scanLimit; r++) {
+        var rec = records[r];
+        if (!rec) continue;
+        for (var prop in rec) {
+            if (!rec.hasOwnProperty(prop)) continue;
+            if (seen[prop]) continue;
+            if (skipProperties.indexOf(prop) !== -1) continue;
+            if (propertyOrder.indexOf(prop) !== -1) continue;
+            if (!propertyIsUsable(prop)) continue;
 
             columns.push({
                 propertyName: prop,
                 headerLabel: camelCaseToCapitalCase(prop),
                 isDate: prop.toLowerCase().includes('date')
             });
+            seen[prop] = true;
         }
     }
 
@@ -353,10 +403,10 @@ function processListResults(response) {
             console.log('Second JSforce result:', results[1]);
         }
 
-        // Determine dynamic columns from first metadata record (only once)
+        // Determine dynamic columns from the union of all records (only once)
         var isFirstTime = !dynamicColumns;
         if (isFirstTime && results[0]) {
-            dynamicColumns = determineMetadataColumns(results[0]);
+            dynamicColumns = determineMetadataColumns(results);
             console.log('Dynamic columns determined:', dynamicColumns.length, 'columns');
 
             // Setup table structure with dynamic columns (first time only)
@@ -456,12 +506,13 @@ function applyMetadataToRows(results) {
 
         var row = matchingInput.first().closest('tr');
 
-        // Calculate the starting column index for dynamic columns in row cells
-        // Row td cells: Name(0), EmptyType(1), Dynamic columns(2+)
-        // Note: Checkbox is in header but not in row td's
-        // Calculate base column count based on whether Type column exists
-        // Row structure: Name(td-0), [Type(td-1) if exists], Dynamic columns
-        var baseColumnCount = typeColumn.length > 0 ? 2 : 1;
+        // Dynamic columns start AFTER every cell Salesforce originally rendered
+        // in this row (Name + optional Type + optional ParentObject + ...).
+        // Using cshOriginalRowCellCount keeps alignment correct regardless of
+        // how many columns the entity type actually emits.
+        var baseColumnCount = (typeof cshOriginalRowCellCount === 'number' && cshOriginalRowCellCount > 0)
+            ? cshOriginalRowCellCount
+            : (typeColumn.length > 0 ? 2 : 1);
 
         // Log first row update
         if (i === 0) {
@@ -646,23 +697,21 @@ function createDataTable() {
         }
     }
 
-    // Build dynamic column configuration
-    // Salesforce header includes checkbox column, so DataTables needs to know about it
-    // Header structure depends on whether Type column exists:
-    // - If Type exists: Checkbox(0), Name(1), Type(2), Dynamic columns(3+)
-    // - If Type doesn't exist: Checkbox(0), Name(1), Dynamic columns(2+)
-    var columnConfig = [
-        {"searchable": false, "orderable": false, "targets": 0}, //0: checkbox (in header but not in row tds)
-        null, //1: name
-    ];
+    // Build dynamic column configuration from the header baseline captured by
+    // setupTable(). The first header cell is always the checkbox (searchable:
+    // false, orderable: false). Every subsequent original header cell — Name,
+    // Type, Parent Object, etc. — becomes a plain text column.
+    var baseColumnCount = (typeof cshOriginalHeaderCount === 'number' && cshOriginalHeaderCount > 0)
+        ? cshOriginalHeaderCount
+        : (typeColumn.length > 0 ? 3 : 2);
 
-    // Add Type column to config only if it exists in the DOM
-    if (typeColumn.length > 0) {
-        columnConfig.push(null); //2: type
+    var columnConfig = [];
+    // Column 0: the Salesforce checkbox header (no row-level <td>, DataTables still accounts for it)
+    columnConfig.push({ searchable: false, orderable: false });
+    // Columns 1..baseColumnCount-1: Name + whatever other base columns Salesforce rendered
+    for (var base = 1; base < baseColumnCount; base++) {
+        columnConfig.push(null);
     }
-
-    // Calculate base column count for dynamic column indices
-    var baseColumnCount = typeColumn.length > 0 ? 3 : 2; // checkbox, name, [optional type]
 
     // Find the column to order by (default to first date column)
     var orderByColumnIndex = baseColumnCount; // Default to first dynamic column
@@ -787,9 +836,11 @@ function basicTableInitComplete() {
  When the list table is added, these functionas are added to the make the columns searchable and selectable.
  **/
 function tableInitComplete() {
-    // Calculate the starting index for dynamic columns based on whether Type exists
-    // Column structure: Checkbox(0), Name(1), [Type(2) if exists], Dynamic columns
-    var dynamicColumnsStartIndex = typeColumn.length > 0 ? 3 : 2;
+    // Dynamic columns start after the checkbox + every original header cell.
+    // cshOriginalHeaderCount already counts the checkbox, so it IS the start.
+    var dynamicColumnsStartIndex = (typeof cshOriginalHeaderCount === 'number' && cshOriginalHeaderCount > 0)
+        ? cshOriginalHeaderCount
+        : (typeColumn.length > 0 ? 3 : 2);
 
     this.api().columns().every(function () {
         var column = this;
@@ -809,12 +860,12 @@ function tableInitComplete() {
             shouldAddFilter = true;
             useTextSearch = true;
         }
-        // Column 2: Type - dropdown (only if Type column exists)
-        else if (colIndex === 2 && typeColumn.length > 0) {
+        // Columns 2..dynamicColumnsStartIndex-1: Type / Parent Object / etc. -> dropdown
+        else if (colIndex > 1 && colIndex < dynamicColumnsStartIndex) {
             shouldAddFilter = true;
             useDropdown = true;
         }
-        // Dynamic columns (starting at 2 or 3 depending on Type)
+        // Dynamic columns (starting at dynamicColumnsStartIndex)
         else if (colIndex >= dynamicColumnsStartIndex && dynamicColumns) {
             var dynamicColIndex = colIndex - dynamicColumnsStartIndex; // Subtract base columns
             if (dynamicColIndex < dynamicColumns.length) {
@@ -1065,8 +1116,11 @@ if (selectedEntityType in entityTypeMap) {
         if (chrome.runtime.lastError) {
             console.error('OAuth connection failed:', chrome.runtime.lastError);
             $('#csh-loading-overlay').remove();
-            alert('Failed to connect to Salesforce. Please refresh the page and try again.\n\nError: ' +
-                  chrome.runtime.lastError.message);
+            window.cshToast && window.cshToast.show(
+                'Failed to connect to Salesforce. Please refresh the page and try again.\n\nError: ' +
+                chrome.runtime.lastError.message,
+                { type: 'error' }
+            );
             $("#editPage").removeClass("lowOpacity");
             $("#bodyCell").removeClass("changesetloading");
             return;
@@ -1076,7 +1130,10 @@ if (selectedEntityType in entityTypeMap) {
         if (response && response.error) {
             console.error('OAuth connection failed:', response.error);
             $('#csh-loading-overlay').remove();
-            alert('Failed to connect to Salesforce. Please refresh the page and try again.\n\nError: ' + response.error);
+            window.cshToast && window.cshToast.show(
+                'Failed to connect to Salesforce. Please refresh the page and try again.\n\nError: ' + response.error,
+                { type: 'error' }
+            );
             $("#editPage").removeClass("lowOpacity");
             $("#bodyCell").removeClass("changesetloading");
             return;
@@ -1114,7 +1171,10 @@ if (selectedEntityType in entityTypeMap) {
         } catch (error) {
             console.error('Error during metadata fetch:', error);
             $('#csh-loading-overlay').remove();
-            alert('An error occurred while fetching metadata. Please try again.\n\nError: ' + error.message);
+            window.cshToast && window.cshToast.show(
+                'An error occurred while fetching metadata. Please try again.\n\nError: ' + error.message,
+                { type: 'error' }
+            );
             $("#editPage").removeClass("lowOpacity");
             $("#bodyCell").removeClass("changesetloading");
         }
@@ -1329,7 +1389,11 @@ function startPaginationWithMetadata() {
 
             } catch (error) {
                 console.error("Error fetching page:", error);
-                alert("Error loading page " + (currentPage + 1) + ". Table will display " + totalRowsLoaded + " rows loaded so far.");
+                window.cshToast && window.cshToast.show(
+                    "Error loading page " + (currentPage + 1) +
+                    ". Table will display " + totalRowsLoaded + " rows loaded so far.",
+                    { type: 'warning' }
+                );
                 shouldContinuePagination = false;
                 isLoadingMorePages = false; // Mark as complete
 

@@ -27,26 +27,44 @@ function initializeOffscreen() {
         console.log('JSforce library loaded successfully, version:', jsforce.VERSION || 'unknown');
     }
 
-    // Initialize chrome.storage API calls after Chrome APIs are ready
+    // Initialize chrome.storage API calls after Chrome APIs are ready.
+    // Same priority ladder as background.js: sync user pref > local auto > 60.0.
+    var offscreenIsUserPref = false;
     try {
         if (chrome && chrome.storage && chrome.storage.sync) {
-            // Get initial API version from storage
-            chrome.storage.sync.get(['salesforceApiVersion'], function(items) {
+            chrome.storage.sync.get(['salesforceApiVersion'], function (items) {
                 if (chrome.runtime.lastError) {
-                    console.log('Could not read storage:', chrome.runtime.lastError.message);
+                    console.log('Could not read sync storage:', chrome.runtime.lastError.message);
                     return;
                 }
-                if (items.salesforceApiVersion) {
-                    CSH_APIVERSION = versionPattern.test(items.salesforceApiVersion) ? items.salesforceApiVersion : '60.0';
-                    console.log('Offscreen - API Version:', CSH_APIVERSION);
+                if (items && items.salesforceApiVersion && versionPattern.test(items.salesforceApiVersion)) {
+                    CSH_APIVERSION = items.salesforceApiVersion;
+                    offscreenIsUserPref = true;
+                    console.log('Offscreen - API Version:', CSH_APIVERSION, '(user pref)');
+                    return;
                 }
+                chrome.storage.local.get(['cshResolvedApiVersion'], function (local) {
+                    if (local && local.cshResolvedApiVersion && versionPattern.test(local.cshResolvedApiVersion)) {
+                        CSH_APIVERSION = local.cshResolvedApiVersion;
+                        console.log('Offscreen - API Version:', CSH_APIVERSION, '(auto)');
+                    }
+                });
             });
 
-            // Listen for API version changes
             chrome.storage.onChanged.addListener(function (changes, areaName) {
-                if (changes.salesforceApiVersion) {
-                    CSH_APIVERSION = versionPattern.test(changes.salesforceApiVersion.newValue) ? changes.salesforceApiVersion.newValue : '60.0';
-                    console.log('Offscreen - API Version changed:', CSH_APIVERSION);
+                if (areaName === 'sync' && changes.salesforceApiVersion) {
+                    if (versionPattern.test(changes.salesforceApiVersion.newValue)) {
+                        CSH_APIVERSION = changes.salesforceApiVersion.newValue;
+                        offscreenIsUserPref = true;
+                        console.log('Offscreen - API Version changed:', CSH_APIVERSION, '(user pref)');
+                    }
+                    return;
+                }
+                if (areaName === 'local' && changes.cshResolvedApiVersion && !offscreenIsUserPref) {
+                    if (versionPattern.test(changes.cshResolvedApiVersion.newValue)) {
+                        CSH_APIVERSION = changes.cshResolvedApiVersion.newValue;
+                        console.log('Offscreen - API Version changed:', CSH_APIVERSION, '(auto)');
+                    }
                 }
             });
 

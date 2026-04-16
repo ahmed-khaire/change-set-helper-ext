@@ -131,7 +131,7 @@ function oauthLogin() {
 	  console.log(response);
 	 if (response.error) {
 		 console.log("Problem logging in: " + response.error);
-		 alert('Problem logging in ' + response.error);
+		 window.cshToast && window.cshToast.show('Problem logging in: ' + response.error, { type: 'error' });
 		 //do nothing else
 	 } else {
               $("#loginSection").hide();

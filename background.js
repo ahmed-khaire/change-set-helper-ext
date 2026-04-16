@@ -2,19 +2,41 @@
 // JSforce operations are handled in offscreen.html/offscreen.js due to XMLHttpRequest requirement
 
 var CSH_APIVERSION = "60.0";
+var CSH_APIVERSION_IS_USER_PREF = false;
 const versionPattern = RegExp('^[0-9][0-9]\.0$');
 
-chrome.storage.sync.get(['salesforceApiVersion'], function(items) {
-    if (items.salesforceApiVersion) {
-        CSH_APIVERSION = versionPattern.test(items.salesforceApiVersion) ? items.salesforceApiVersion : '60.0';
-        console.log('Service Worker - API Version:', CSH_APIVERSION);
+// Priority:
+//   1. chrome.storage.sync.salesforceApiVersion  — user-set from options page
+//   2. chrome.storage.local.cshResolvedApiVersion — auto-discovered by common.js
+//   3. fallback "60.0"
+function applyApiVersion(value, isUserPref) {
+    if (value && versionPattern.test(value)) {
+        CSH_APIVERSION = value;
+        CSH_APIVERSION_IS_USER_PREF = !!isUserPref;
+        console.log('Service Worker - API Version:', CSH_APIVERSION, isUserPref ? '(user pref)' : '(auto)');
     }
+}
+
+chrome.storage.sync.get(['salesforceApiVersion'], function (items) {
+    if (items && items.salesforceApiVersion) {
+        applyApiVersion(items.salesforceApiVersion, true);
+        return;
+    }
+    // No user pref — fall back to the auto-detected value if one is cached.
+    chrome.storage.local.get(['cshResolvedApiVersion'], function (local) {
+        if (local && local.cshResolvedApiVersion) {
+            applyApiVersion(local.cshResolvedApiVersion, false);
+        }
+    });
 });
 
 chrome.storage.onChanged.addListener(function (changes, areaName) {
-    if (changes.salesforceApiVersion) {
-        CSH_APIVERSION = versionPattern.test(changes.salesforceApiVersion.newValue) ? changes.salesforceApiVersion.newValue : '60.0';
-        console.log('Service Worker - API Version changed:', CSH_APIVERSION);
+    if (areaName === 'sync' && changes.salesforceApiVersion) {
+        applyApiVersion(changes.salesforceApiVersion.newValue, true);
+        return;
+    }
+    if (areaName === 'local' && changes.cshResolvedApiVersion && !CSH_APIVERSION_IS_USER_PREF) {
+        applyApiVersion(changes.cshResolvedApiVersion.newValue, false);
     }
 });
 

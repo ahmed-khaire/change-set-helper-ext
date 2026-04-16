@@ -28,8 +28,11 @@ function downloadPackage() {
             },
             function (response) {
                 if (response.err) {
-                    alert('There was a problem downloading the package.');
-                    console.err;
+                    window.cshToast && window.cshToast.show(
+                        'There was a problem downloading the package.\n\n' + (response.err.message || response.err),
+                        { type: 'error' }
+                    );
+                    console.error(response.err);
                     unSetDownloading();
                 } else {
                     var zip = new JSZip();
