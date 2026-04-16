@@ -81,3 +81,82 @@ table.list tr.csh-diff-same > td:first-child {
 .csh-mod-filter input[type="number"] { width: 64px; }
 .csh-mod-filter input[type="text"]   { width: 200px; }
 .csh-mod-filter .btn { padding: 2px 10px; }
+
+/* Phase 6 — live deploy progress panel (Outbound Change Set Detail) */
+#csh-deploy-progress {
+    margin: 12px 0;
+    padding: 10px 12px;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 4px;
+    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
+}
+#csh-deploy-progress .csh-dp-summary {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+#csh-deploy-progress .csh-dp-label {
+    font-weight: 600;
+    color: #706e6b;
+}
+#csh-deploy-progress .csh-dp-counts .csh-dp-ok,
+#csh-deploy-progress .csh-dp-counts .csh-dp-fail {
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #ecebea;
+    color: #706e6b;
+    font-weight: 600;
+    font-size: 11px;
+}
+#csh-deploy-progress .csh-dp-ok.csh-dp-count-nonzero {
+    background: #dff0e2;
+    color: #194e30;
+}
+#csh-deploy-progress .csh-dp-fail.csh-dp-count-nonzero {
+    background: #ffe4e1;
+    color: #8e0916;
+}
+#csh-deploy-progress .csh-dp-barwrap {
+    height: 10px;
+    background: #e5e5e5;
+    border-radius: 5px;
+    overflow: hidden;
+    margin: 8px 0;
+}
+#csh-deploy-progress .csh-dp-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 240ms ease;
+}
+#csh-deploy-progress .csh-dp-fill.csh-dp-done {
+    background: #2e844a;
+}
+#csh-deploy-progress .csh-dp-fill.csh-dp-fail {
+    background: #ba0517;
+}
+#csh-deploy-progress .csh-dp-toolbar {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #706e6b;
+}
+#csh-deploy-progress .csh-dp-log {
+    max-height: 260px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-top: 6px;
+    font: 12px/1.5 Menlo, Consolas, monospace;
+}
+#csh-deploy-progress .csh-dp-entry {
+    padding: 1px 2px;
+    border-bottom: 1px solid #f4f4f4;
+    word-break: break-word;
+}
+#csh-deploy-progress .csh-dp-entry.ok   { color: #194e30; }
+#csh-deploy-progress .csh-dp-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }

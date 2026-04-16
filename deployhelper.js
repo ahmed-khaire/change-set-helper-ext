@@ -1,3 +1,110 @@
+// Phase 6 — live deploy progress.
+// Rendered off each checkDeployStatus poll. Builds a per-component log
+// (successes + failures) incrementally; de-duplicated so the user doesn't
+// see the same component twice if Salesforce re-emits it across polls.
+var cshDpStartTime = 0;
+var cshDpSeen = null;
+var cshDpElapsedTimer = null;
+
+function cshResetDeployProgress() {
+    cshDpStartTime = Date.now();
+    cshDpSeen = {};
+    var panel = document.getElementById('csh-deploy-progress');
+    if (panel) {
+        panel.style.display = '';
+        document.getElementById('csh-dp-count').textContent = '0 / 0';
+        document.getElementById('csh-dp-tests').textContent = '—';
+        document.getElementById('csh-dp-elapsed').textContent = '0s';
+        document.getElementById('csh-dp-fill').style.width = '0%';
+        document.getElementById('csh-dp-fill').classList.remove('csh-dp-done', 'csh-dp-fail');
+        document.getElementById('csh-dp-log').innerHTML = '';
+        panel.querySelector('.csh-dp-ok').textContent = '0 succeeded';
+        panel.querySelector('.csh-dp-fail').textContent = '0 failed';
+        panel.querySelector('.csh-dp-ok').classList.remove('csh-dp-count-nonzero');
+        panel.querySelector('.csh-dp-fail').classList.remove('csh-dp-count-nonzero');
+    }
+    if (cshDpElapsedTimer) clearInterval(cshDpElapsedTimer);
+    cshDpElapsedTimer = setInterval(function () {
+        var el = document.getElementById('csh-dp-elapsed');
+        if (!el) return;
+        var s = Math.floor((Date.now() - cshDpStartTime) / 1000);
+        el.textContent = s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+    }, 1000);
+}
+
+function cshFinishDeployProgress(resultStatus) {
+    if (cshDpElapsedTimer) { clearInterval(cshDpElapsedTimer); cshDpElapsedTimer = null; }
+    var fill = document.getElementById('csh-dp-fill');
+    if (!fill) return;
+    fill.style.width = '100%';
+    fill.classList.add(resultStatus === 'Succeeded' ? 'csh-dp-done' : 'csh-dp-fail');
+}
+
+function cshRenderDeployProgress(result) {
+    if (!result) return;
+    var panel = document.getElementById('csh-deploy-progress');
+    if (!panel) return;
+
+    var completed = result.numberComponentsDeployed || 0;
+    var total = result.numberComponentsTotal || 0;
+    var testsCompleted = result.numberTestsCompleted || 0;
+    var testsTotal = result.numberTestsTotal || 0;
+    var pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+    document.getElementById('csh-dp-count').textContent = completed + ' / ' + total + ' (' + pct + '%)';
+    document.getElementById('csh-dp-tests').textContent = testsTotal > 0 ? (testsCompleted + ' / ' + testsTotal) : '—';
+    document.getElementById('csh-dp-fill').style.width = Math.max(2, pct) + '%';
+
+    var details = result.details || {};
+    var successes = details.componentSuccesses || [];
+    var failures = details.componentFailures || [];
+    if (!Array.isArray(successes)) successes = [successes];
+    if (!Array.isArray(failures)) failures = [failures];
+
+    var okCount = 0, failCount = 0;
+    var logEl = document.getElementById('csh-dp-log');
+    var onlyFail = document.getElementById('csh-dp-only-fail') && document.getElementById('csh-dp-only-fail').checked;
+
+    function render(c, isSuccess) {
+        var fullName = c.fullName || c.apexClassName || c.name || '(unknown)';
+        var ctype = c.componentType || c.type || '';
+        // package.xml entries appear in successes with an empty componentType —
+        // don't count them as real components
+        if (isSuccess && !ctype && fullName === 'package.xml') return;
+        if (isSuccess) okCount++; else failCount++;
+        var key = (isSuccess ? 'ok|' : 'fail|') + ctype + '|' + fullName;
+        if (cshDpSeen[key]) return;
+        cshDpSeen[key] = true;
+        var entry = document.createElement('div');
+        entry.className = 'csh-dp-entry ' + (isSuccess ? 'ok' : 'fail');
+        if (onlyFail && isSuccess) entry.style.display = 'none';
+        var prefix = isSuccess ? '✓' : '✗';
+        var label = (ctype ? '[' + ctype + '] ' : '') + fullName;
+        var problem = c.problem || c.problemType || '';
+        var line = c.lineNumber ? (' (line ' + c.lineNumber + ')') : '';
+        entry.textContent = prefix + ' ' + label + (problem ? ' — ' + problem + line : '');
+        logEl.appendChild(entry);
+    }
+
+    successes.forEach(function (c) { render(c, true); });
+    failures.forEach(function (c) { render(c, false); });
+
+    // Count current totals, even for entries already seen on prior polls
+    var seenOk = 0, seenFail = 0;
+    Object.keys(cshDpSeen).forEach(function (k) {
+        if (k.indexOf('ok|') === 0) seenOk++;
+        else seenFail++;
+    });
+    var okEl = panel.querySelector('.csh-dp-ok');
+    var failEl = panel.querySelector('.csh-dp-fail');
+    okEl.textContent = seenOk + ' succeeded';
+    failEl.textContent = seenFail + ' failed';
+    okEl.classList.toggle('csh-dp-count-nonzero', seenOk > 0);
+    failEl.classList.toggle('csh-dp-count-nonzero', seenFail > 0);
+
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
 function cshRenderDeployHelper() {
 	$('.bDescription').append(`
     <div class='apexp'>
@@ -42,6 +149,30 @@ function cshRenderDeployHelper() {
         </div>
         <div id="deployContent">
         </div>
+
+        <!-- Phase 6 live progress panel -->
+        <div id="csh-deploy-progress" style="display:none">
+            <div class="csh-dp-summary">
+                <span class="csh-dp-label">Components:</span>
+                <span id="csh-dp-count">0 / 0</span>
+                <span class="csh-dp-label">Tests:</span>
+                <span id="csh-dp-tests">—</span>
+                <span class="csh-dp-label">Elapsed:</span>
+                <span id="csh-dp-elapsed">0s</span>
+            </div>
+            <div class="csh-dp-barwrap">
+                <div id="csh-dp-fill" class="csh-dp-fill"></div>
+            </div>
+            <div class="csh-dp-summary csh-dp-counts">
+                <span class="csh-dp-ok">0 succeeded</span>
+                <span class="csh-dp-fail">0 failed</span>
+            </div>
+            <div class="csh-dp-toolbar">
+                <label><input type="checkbox" id="csh-dp-only-fail"> Show only failures</label>
+            </div>
+            <div id="csh-dp-log" class="csh-dp-log"></div>
+        </div>
+
         <div>
             <pre id="json-renderer"></pre>
         </div>
@@ -80,6 +211,7 @@ function testDeploy() {
 	$('#quickDeploy').hide();
 	$('#cancelDeploy').hide();
 	$('#json-renderer').jsonViewer();
+	cshResetDeployProgress();
 
 	var sid = (window.cshSession && window.cshSession.current && window.cshSession.current()) || sessionId;
 	var port = chrome.runtime.connect({name: "deployHandler"});
@@ -105,6 +237,7 @@ function testDeploy() {
 			$('#deployContent').html('Status: ' + result.state );
 			$('#currentDeployId').val(result.id);
 			$('#cancelDeploy').show();
+			cshRenderDeployProgress(response);
 		} else {
 			//we're done!!
 			$('#json-renderer').jsonViewer(result);
@@ -112,6 +245,8 @@ function testDeploy() {
 			$('#deployTest').prop('disabled',false);
 			$('#cancelDeploy').hide();
 			$('#deployTest').val("Go...");
+			cshRenderDeployProgress(result);
+			cshFinishDeployProgress(result.status);
 
 			if (result.status == 'Succeeded') {
 				$('#currentDeployId').val(result.id);
@@ -198,6 +333,7 @@ function quickDeploy() {
 		$('#deployContent').html('Initiating quick deploy...');
 		$('#json-renderer').jsonViewer();
 		$('#quickDeploy').hide();
+		cshResetDeployProgress();
 
 		var port = chrome.runtime.connect({name: "quickDeployHandler"});
 		port.postMessage({'proxyFunction': "quickDeploy", "currentId": currentId});
@@ -220,6 +356,7 @@ function quickDeploy() {
 
 				$('#json-renderer').jsonViewer(response);
 				$('#deployContent').html('Status: ' + result.state);
+				cshRenderDeployProgress(response);
 
 				$('#currentDeployId').val(result.id);
 				$('#cancelDeploy').show();
@@ -230,6 +367,8 @@ function quickDeploy() {
 				$('#deployTest').prop('disabled', false);
 				$('#cancelDeploy').hide();
 				$('#deployTest').val("Go...");
+				cshRenderDeployProgress(result);
+				cshFinishDeployProgress(result.status);
 				port.disconnect();
 			}
 		});
@@ -250,6 +389,16 @@ function quickDeploy() {
 		$("#validateSection").hide();
 		$("#quickDeploy").hide();
 		$("#cancelDeploy").hide();
+
+		// Progress panel "show only failures" toggle — re-apply visibility
+		// without re-rendering so long logs stay snappy.
+		$(document).on('change', '#csh-dp-only-fail', function () {
+			var onlyFail = this.checked;
+			$('#csh-dp-log .csh-dp-entry').each(function () {
+				if (onlyFail && $(this).hasClass('ok')) $(this).hide();
+				else $(this).show();
+			});
+		});
 	}
 
 	if (window.cshSession && window.cshSession.ready) {
