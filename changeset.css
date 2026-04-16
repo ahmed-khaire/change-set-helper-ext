@@ -103,20 +103,57 @@ table.list tr.csh-diff-same > td:first-child {
     padding: 3px 10px;
 }
 
-/* Phase 7 — Detail page Components block: selection column + bulk remove.
-   Targets the inline components table on outboundChangeSetDetailPage.apexp.
-*/
+/* Phase 7 — Detail page Components block: selection column + bulk remove
+   + filter/search. Targets the inline components table on
+   outboundChangeSetDetailPage.apexp. */
 .csh-dc-toolbar {
     display: flex;
-    gap: 10px;
-    align-items: center;
+    flex-direction: column;
+    gap: 8px;
     padding: 10px 14px;
     margin: 8px 0;
     background: #f4f6f9;
     border: 1px solid #e5e5e5;
     border-radius: 4px;
     font: 13px "Salesforce Sans", Arial, sans-serif;
+}
+.csh-dc-filter-row,
+.csh-dc-action-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
     flex-wrap: wrap;
+}
+.csh-dc-filter-row .csh-dc-search {
+    flex: 1 1 260px;
+    min-width: 200px;
+    padding: 6px 10px;
+    border: 1px solid #c9c9c9;
+    border-radius: 3px;
+    font: inherit;
+    background: #fff;
+}
+.csh-dc-filter-row .csh-dc-search:focus {
+    outline: none;
+    border-color: #0176d3;
+    box-shadow: 0 0 0 1px #0176d3;
+}
+.csh-dc-filter-row select {
+    flex: 0 0 auto;
+    min-width: 140px;
+    max-width: 220px;
+    padding: 6px 10px;
+    border: 1px solid #c9c9c9;
+    border-radius: 3px;
+    font: inherit;
+    background: #fff;
+}
+.csh-dc-filter-row .csh-dc-visible-count {
+    flex: 0 0 auto;
+    color: #706e6b;
+    font-size: 12px;
+    margin-left: auto;
+    font-style: italic;
 }
 .csh-dc-toolbar .csh-dc-label {
     font-weight: 600;
