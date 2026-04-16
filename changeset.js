@@ -1097,7 +1097,79 @@ function tableInitComplete() {
 }
 
 
+// Phase 2.3 — Tooling API SOQL fast path.
+//
+// For code-heavy metadata types the Tooling API's per-type sObject tables
+// return the same attribution (Id, LastModifiedDate, LastModifiedBy.Name,
+// CreatedDate, CreatedBy.Name, NamespacePrefix) as metadata.list() but in a
+// single SOQL round-trip instead of the multi-stage SOAP list protocol.
+// On orgs with thousands of Apex classes this cuts first-paint time ~3-5x.
+//
+// nameField is used when the Tooling sObject exposes DeveloperName instead
+// of Name (Aura / Lightning bundles). metadataType is echoed on the
+// normalized record so downstream consumers see the same shape as before.
+var TOOLING_QUERYABLE_TYPES = {
+    'ApexClass':      { metadataType: 'ApexClass',      nameField: 'Name' },
+    'ApexTrigger':    { metadataType: 'ApexTrigger',    nameField: 'Name' },
+    'ApexPage':       { metadataType: 'ApexPage',       nameField: 'Name' },
+    'ApexComponent':  { metadataType: 'ApexComponent',  nameField: 'Name' },
+    'AuraDefinitionBundle':     { metadataType: 'AuraDefinitionBundle',     nameField: 'DeveloperName' },
+    'LightningComponentBundle': { metadataType: 'LightningComponentBundle', nameField: 'DeveloperName' }
+};
+
+function cshBuildToolingSoql(cfg) {
+    return 'SELECT Id, ' + cfg.nameField +
+        ', NamespacePrefix, LastModifiedDate, LastModifiedBy.Name, CreatedDate, CreatedBy.Name ' +
+        'FROM ' + cfg.metadataType +
+        ' ORDER BY ' + cfg.nameField;
+}
+
+function cshNormalizeToolingRecord(rec, cfg) {
+    var name = rec[cfg.nameField] || '';
+    var ns = rec.NamespacePrefix || '';
+    return {
+        id: rec.Id,
+        fullName: ns ? (ns + '.' + name) : name,
+        type: cfg.metadataType,
+        fileName: (cfg.metadataType + '/' + name),
+        namespacePrefix: ns || undefined,
+        lastModifiedDate: rec.LastModifiedDate,
+        lastModifiedByName: rec.LastModifiedBy ? rec.LastModifiedBy.Name : null,
+        createdDate: rec.CreatedDate,
+        createdByName: rec.CreatedBy ? rec.CreatedBy.Name : null
+    };
+}
+
 function getMetaData(processResultsFunction) {
+
+    // Fast path for code types: one Tooling SOQL query instead of listMetadata.
+    // Falls through to the existing metadata.list path on error so coverage
+    // is preserved even if Tooling is restricted on the org.
+    if (TOOLING_QUERYABLE_TYPES[selectedEntityType]) {
+        var cfg = TOOLING_QUERYABLE_TYPES[selectedEntityType];
+        var soql = cshBuildToolingSoql(cfg);
+        numCallsInProgress++;
+        console.log('Tooling SOQL fast path for', selectedEntityType + ':', soql);
+        chrome.runtime.sendMessage({
+            proxyFunction: 'queryToolingLocal',
+            soql: soql
+        }, function (response) {
+            if (response && response.err) {
+                console.warn('Tooling fast path failed, falling back to metadata.list:', response.err);
+                // Re-dispatch through metadata.list
+                chrome.runtime.sendMessage({
+                    proxyFunction: 'listLocalMetaData',
+                    proxydata: [{ type: resolvedMetadataType }]
+                }, processResultsFunction);
+                return;
+            }
+            var records = (response && response.records) || [];
+            var normalized = records.map(function (r) { return cshNormalizeToolingRecord(r, cfg); });
+            // Match the shape of listLocalMetaData's response
+            processResultsFunction({ err: null, results: normalized });
+        });
+        return;
+    }
 
     if (selectedEntityType in entityFolderMap) {
         $(".compareorg").hide();

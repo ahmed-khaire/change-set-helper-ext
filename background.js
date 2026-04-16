@@ -649,6 +649,20 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.proxyFunction == "queryToolingLocal") {
+        sendToOffscreen({
+            action: 'queryTooling',
+            connType: 'local',
+            soql: request.soql
+        }).then(response => {
+            sendResponse({err: response.error || null, records: response.records});
+        }).catch(err => {
+            console.error('Error in queryToolingLocal:', err);
+            sendResponse({err: err.message, records: null});
+        });
+        return true;
+    }
+
     if (request.proxyFunction == "describeLocalMetadata") {
         sendToOffscreen({
             action: 'describeMetadata',

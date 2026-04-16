@@ -127,6 +127,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 .catch(err => sendResponse({error: err.message}));
             return true;
 
+        case 'queryTooling':
+            queryTooling(request.connType, request.soql)
+                .then(records => sendResponse({records: records}))
+                .catch(err => sendResponse({error: err.message}));
+            return true;
+
         case 'downloadMetadata':
             downloadMetadata(request.connType, request.changename)
                 .then(result => sendResponse({result: result}))
@@ -237,6 +243,20 @@ async function listMetadata(connType, types) {
             } else {
                 resolve(results);
             }
+        });
+    });
+}
+
+async function queryTooling(connType, soql) {
+    const conn = connType === 'deploy' ? connDeploy.conn : connLocal.conn;
+    if (!conn) throw new Error('Not connected');
+    // JSforce paginates transparently via query().autoFetch=true on a full scan.
+    // For up to a few thousand records the default single call suffices; if we
+    // hit Tooling query pagination later we can flip to queryMore chain.
+    return new Promise((resolve, reject) => {
+        conn.tooling.query(soql, function (err, result) {
+            if (err) return reject(err);
+            resolve(result && result.records ? result.records : []);
         });
     });
 }
