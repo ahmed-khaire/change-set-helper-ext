@@ -70,11 +70,34 @@ chrome.storage.onChanged.addListener(function (changes, area) {
 
 var redirectUri = chrome.identity.getRedirectURL("sfdc");
 
+// Normalize a user-supplied My Domain string into a canonical origin. Accepts
+// "yourorg.my.salesforce.com", "https://yourorg.my.salesforce.com", or the
+// same with trailing slashes/paths. Returns null if the input is obviously
+// malformed so the caller can refuse rather than producing a bad URL.
+function cshNormalizeHost(raw) {
+    if (!raw) return null;
+    var host = String(raw).trim();
+    if (!host) return null;
+    if (!/^https?:\/\//i.test(host)) host = 'https://' + host;
+    try {
+        var u = new URL(host);
+        return u.protocol + '//' + u.host;
+    } catch (_) { return null; }
+}
+
 // Auth URLs are built lazily per request so the latest cshClientId is used.
-function buildAuthUrl(environment) {
-    var host = environment === 'prod'
-        ? 'https://login.salesforce.com'
-        : 'https://test.salesforce.com';
+// environment ∈ {'sandbox', 'prod', 'mydomain'}; customHost applies only to
+// 'mydomain' and must be an https origin.
+function buildAuthUrl(environment, customHost) {
+    var host;
+    if (environment === 'mydomain') {
+        host = cshNormalizeHost(customHost);
+        if (!host) host = 'https://login.salesforce.com'; // safe fallback
+    } else if (environment === 'prod') {
+        host = 'https://login.salesforce.com';
+    } else {
+        host = 'https://test.salesforce.com';
+    }
     return host + '/services/oauth2/authorize' +
         '?display=page' +
         '&prompt=select_account' +
@@ -590,7 +613,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 
     if (request.oauth == "connectToDeploy") {
-        connectToDeploy(sendResponse, request.environment);
+        connectToDeploy(sendResponse, request.environment, request.customHost);
         return true;
     }
 
@@ -740,16 +763,16 @@ async function setLocalConn(sendResponse, authValue, serverUrl, authMode, instan
     }
 }
 
-function connectToDeploy(sendResponse, environment) {
-    connectToOrg(sendResponse, environment, 'deploy');
+function connectToDeploy(sendResponse, environment, customHost) {
+    connectToOrg(sendResponse, environment, 'deploy', customHost);
 }
 
 function connectToLocalOauth(sendResponse) {
     connectToOrg(sendResponse, 'sandbox', 'local');
 }
 
-function connectToOrg(sendResponse, environment, connType) {
-    var auth_url = buildAuthUrl(environment);
+function connectToOrg(sendResponse, environment, connType, customHost) {
+    var auth_url = buildAuthUrl(environment, customHost);
 
     chrome.identity.launchWebAuthFlow({'url': auth_url, 'interactive': true}, async function (redirect_url) {
         if (chrome.runtime.lastError) {

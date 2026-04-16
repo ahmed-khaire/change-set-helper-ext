@@ -122,7 +122,9 @@ function cshRenderDeployHelper() {
 	<select id='loginEnv' name='Login Environment'>
 		<option value='sandbox'>Sandbox</option>
 		<option value='prod'>Prod/Dev</option>
+		<option value='mydomain'>My Domain URL…</option>
 	</select>
+	<input type='text' id='loginMyDomain' placeholder='https://yourorg.my.salesforce.com' style='display:none;margin-left:6px;padding:3px 6px;min-width:260px;' />
 
 	</td>
     <td class="pbButton" id="validateSection">
@@ -284,7 +286,22 @@ function testDeploy() {
 
 function oauthLogin() {
 	var env = $("#loginEnv :selected").val();
-	chrome.runtime.sendMessage({'oauth': 'connectToDeploy', 'environment': env}, function(response) {
+	var customHost = null;
+	if (env === 'mydomain') {
+		customHost = $.trim($('#loginMyDomain').val() || '');
+		if (!customHost) {
+			window.cshToast && window.cshToast.show(
+				'Enter a My Domain URL (e.g. https://yourorg.my.salesforce.com) before clicking Login.',
+				{ type: 'error' }
+			);
+			return;
+		}
+	}
+	chrome.runtime.sendMessage({
+		'oauth': 'connectToDeploy',
+		'environment': env,
+		'customHost': customHost
+	}, function(response) {
 	  console.log(response);
 	 if (response.error) {
 		 console.log("Problem logging in: " + response.error);
@@ -426,6 +443,12 @@ function quickDeploy() {
 		$(document).on('change', '#testLevelInput', function () {
 			if ($(this).val() === 'RunSpecifiedTests') $('#specifiedTestsInput').show();
 			else $('#specifiedTestsInput').hide();
+		});
+
+		// Reveal the My Domain URL input only when that option is picked.
+		$(document).on('change', '#loginEnv', function () {
+			if ($(this).val() === 'mydomain') $('#loginMyDomain').show();
+			else $('#loginMyDomain').hide();
 		});
 	}
 

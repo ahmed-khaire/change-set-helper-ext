@@ -235,7 +235,9 @@ function setupTable() {
 		<select id='compareEnv' name='Compare Environment'>
 			<option value='sandbox'>Sandbox</option>
 			<option value='prod'>Prod/Dev</option>
+			<option value='mydomain'>My Domain URL…</option>
 		</select>
+		<input type='text' id='compareMyDomain' placeholder='https://yourorg.my.salesforce.com' style='display:none;margin-left:6px;padding:3px 6px;min-width:240px;' />
 	<span id="loggedInUsername"></span>  <span id="logout">(<a id="logoutLink" href="#">Logout</a>)</span>
 `);
 
@@ -1304,10 +1306,25 @@ function listMetaDataProxy(data, retFunc, isDefault) {
 
 function oauthLogin(env) {
     var env = $("#compareEnv :selected").val();
+    var customHost = null;
+    if (env === 'mydomain') {
+        customHost = $.trim($('#compareMyDomain').val() || '');
+        if (!customHost) {
+            window.cshToast && window.cshToast.show(
+                'Enter a My Domain URL (e.g. https://yourorg.my.salesforce.com) before comparing.',
+                { type: 'error' }
+            );
+            return;
+        }
+    }
     console.log('oauthLogin');
-    chrome.runtime.sendMessage({'oauth': "connectToDeploy", environment: env}, function (response) {
+    chrome.runtime.sendMessage({
+        'oauth': "connectToDeploy",
+        environment: env,
+        customHost: customHost
+    }, function (response) {
         console.log(response);
-        $("#compareEnv").hide();
+        $("#compareEnv, #compareMyDomain").hide();
 
         $("#loggedInUsername").html(response.username);
         $("#logout").show();
@@ -1351,6 +1368,8 @@ function deployLogout() {
     });
 
     $("#compareEnv").show();
+    // Only show the My-Domain input if that option is currently selected.
+    if ($('#compareEnv').val() === 'mydomain') $('#compareMyDomain').show();
     $("#loggedInUsername").html('');
     $("#logout").hide();
 
@@ -1855,6 +1874,11 @@ $(document).ready(function () {
     });
 
     $('input[name="cancel"]').parent().on('click','#compareorg' , oauthLogin);
+    // Reveal My Domain URL input when the user picks it.
+    $(document).on('change', '#compareEnv', function () {
+        if ($(this).val() === 'mydomain') $('#compareMyDomain').show();
+        else $('#compareMyDomain').hide();
+    });
 
     // Three-stage auth ladder: cookie → chrome.cookies → OAuth. If all three
     // fail, show an actionable Sign In button that triggers the OAuth PKCE
