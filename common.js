@@ -221,7 +221,122 @@ var serverUrl = window.location.protocol + '//' + window.location.host;
     // only populate the local cache as a fallback.
     resolveApiVersion().then(function (version) {
         if (!version) return;
+        window.cshApiVersion.resolved = version;
         if (!chrome.storage || !chrome.storage.local) return;
         chrome.storage.local.set({ cshResolvedApiVersion: version });
     }).catch(function () { /* ignore — background falls back to 60.0 */ });
+})();
+
+// 5) describeMetadata cache + dynamic entity-type resolver.
+//    The Salesforce UI enumeration in the Component Type picker drifts between
+//    releases — every new release adds types we'd otherwise have to hard-code.
+//    Caching the result of `conn.metadata.describe(apiVersion)` lets us answer
+//    "is this a valid metadata type" from a live source of truth. We still
+//    apply a small override map for types whose UI name differs from the API
+//    name (TabSet → CustomApplication, ValidationFormula → ValidationRule …).
+(function () {
+    var CACHE_KEY = 'cshMetadataDescribe';
+    var TTL_MS = 24 * 60 * 60 * 1000;
+
+    function cacheKey(host, apiVersion) {
+        return host + '|' + (apiVersion || 'latest');
+    }
+
+    function readCache() {
+        return new Promise(function (resolve) {
+            if (!chrome.storage || !chrome.storage.local) return resolve(null);
+            chrome.storage.local.get([CACHE_KEY], function (items) {
+                var cache = items[CACHE_KEY] || {};
+                var apiVersion = (window.cshApiVersion && window.cshApiVersion.resolved) || 'latest';
+                var entry = cache[cacheKey(serverUrl, apiVersion)];
+                if (entry && entry.at && (Date.now() - entry.at) < TTL_MS) {
+                    resolve(entry.data);
+                } else {
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    function writeCache(data) {
+        if (!chrome.storage || !chrome.storage.local) return;
+        var apiVersion = (window.cshApiVersion && window.cshApiVersion.resolved) || 'latest';
+        var key = cacheKey(serverUrl, apiVersion);
+        chrome.storage.local.get([CACHE_KEY], function (items) {
+            var cache = items[CACHE_KEY] || {};
+            cache[key] = { at: Date.now(), data: data };
+            chrome.storage.local.set({ [CACHE_KEY]: cache });
+        });
+    }
+
+    function fetchDescribe() {
+        return new Promise(function (resolve) {
+            if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return resolve(null);
+            chrome.runtime.sendMessage({ proxyFunction: 'describeLocalMetadata' }, function (response) {
+                if (chrome.runtime.lastError) {
+                    console.warn('cshMetadata.fetchDescribe: runtime error', chrome.runtime.lastError.message);
+                    return resolve(null);
+                }
+                if (!response || response.err || !response.results) {
+                    console.warn('cshMetadata.fetchDescribe: no results', response && response.err);
+                    return resolve(null);
+                }
+                resolve(response.results);
+            });
+        });
+    }
+
+    // Returns the cached describeMetadata result, or null if the cache is cold
+    // or expired. Does NOT hit the network — call warmDescribeCache() after a
+    // successful JSforce connect to refresh the cache without blocking UI.
+    async function getDescribe() {
+        return await readCache();
+    }
+
+    // Fetches describeMetadata via the offscreen JSforce connection and writes
+    // it to cache. Must be called only AFTER connectToLocal has succeeded,
+    // otherwise the offscreen document has no connection to use.
+    async function warmDescribeCache() {
+        var cached = await readCache();
+        if (cached) return cached;
+        var fresh = await fetchDescribe();
+        if (fresh) writeCache(fresh);
+        return fresh;
+    }
+
+    // Resolve a Salesforce UI entity name (what appears in the #entityType
+    // hidden field) to a Metadata API type name.
+    //   1. override map: hardcoded translations for UI names that differ from
+    //      API names (stable, small).
+    //   2. describe identity match: if describe contains a metadataObject
+    //      whose xmlName equals the UI name, use that directly. Catches every
+    //      new type Salesforce adds without code changes.
+    //   Returns null when neither path produces a mapping.
+    function resolveEntityType(uiName, describeData, overrideMap) {
+        if (!uiName) return null;
+        if (overrideMap && Object.prototype.hasOwnProperty.call(overrideMap, uiName)) {
+            return overrideMap[uiName];
+        }
+        if (describeData && Array.isArray(describeData.metadataObjects)) {
+            for (var i = 0; i < describeData.metadataObjects.length; i++) {
+                var mo = describeData.metadataObjects[i];
+                if (mo && mo.xmlName === uiName) return uiName;
+                // Fold "children" (e.g. CustomField lives under CustomObject's childXmlNames)
+                if (mo && Array.isArray(mo.childXmlNames)) {
+                    for (var j = 0; j < mo.childXmlNames.length; j++) {
+                        if (mo.childXmlNames[j] === uiName) return uiName;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    window.cshMetadata = {
+        getDescribe: getDescribe,
+        warmDescribeCache: warmDescribeCache,
+        resolveEntityType: resolveEntityType,
+        CACHE_KEY: CACHE_KEY,
+        TTL_MS: TTL_MS
+    };
 })();

@@ -116,6 +116,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 .catch(err => sendResponse({error: err.message}));
             return true;
 
+        case 'describeMetadata':
+            describeMetadata(request.connType)
+                .then(results => sendResponse({results: results}))
+                .catch(err => sendResponse({error: err.message}));
+            return true;
+
         case 'downloadMetadata':
             downloadMetadata(request.connType, request.changename)
                 .then(result => sendResponse({result: result}))
@@ -217,6 +223,24 @@ async function listMetadata(connType, types) {
                 reject(err);
             } else {
                 resolve(results);
+            }
+        });
+    });
+}
+
+async function describeMetadata(connType) {
+    const conn = connType === 'deploy' ? connDeploy.conn : connLocal.conn;
+
+    if (!conn) {
+        throw new Error('Not connected');
+    }
+
+    return new Promise((resolve, reject) => {
+        conn.metadata.describe(CSH_APIVERSION, function(err, result) {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(result);
             }
         });
     });

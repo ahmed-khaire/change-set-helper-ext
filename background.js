@@ -297,6 +297,19 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.proxyFunction == "describeLocalMetadata") {
+        sendToOffscreen({
+            action: 'describeMetadata',
+            connType: 'local'
+        }).then(response => {
+            sendResponse({err: response.error || null, results: response.results});
+        }).catch(err => {
+            console.error('Error in describeLocalMetadata:', err);
+            sendResponse({err: err.message, results: null});
+        });
+        return true;
+    }
+
     if (request.proxyFunction == "downloadLocalMetadata") {
         sendToOffscreen({
             action: 'downloadMetadata',

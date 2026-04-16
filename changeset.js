@@ -6,6 +6,7 @@ var totalComponentCount = 0; // Track total rows loaded for pagination decisions
 var isLoadingMorePages = false; // Flag to indicate we're still loading pages in background
 var cachedMetadataResults = []; // Store metadata results to reuse during pagination
 var dynamicColumns = null; // Store dynamic column configuration based on metadata properties
+var resolvedMetadataType = null; // Metadata API type name resolved via override map or describeMetadata cache
 
 // Compare functionality column indices (set dynamically after table setup)
 var compareColumnIndices = {
@@ -950,7 +951,7 @@ function getMetaData(processResultsFunction) {
                     n++;
                     folderName = results[i].fullName;
                     var folderQuery = {};
-                    folderQuery.type = entityTypeMap[selectedEntityType];
+                    folderQuery.type = resolvedMetadataType;
                     folderQuery.folder = folderName;
                     folderQueries.push(folderQuery);
                     if (n == 3) {
@@ -983,7 +984,7 @@ function getMetaData(processResultsFunction) {
         numCallsInProgress++;
         chrome.runtime.sendMessage({
                 'proxyFunction': "listLocalMetaData",
-                'proxydata': [{type: entityTypeMap[selectedEntityType]}]
+                'proxydata': [{type: resolvedMetadataType}]
             },
             processResultsFunction
         );
@@ -1015,7 +1016,7 @@ function oauthLogin(env) {
         $("#loggedInUsername").html(response.username);
         $("#logout").show();
 
-        listMetaDataProxy([{type: entityTypeMap[selectedEntityType]}],
+        listMetaDataProxy([{type: resolvedMetadataType}],
             function (results) {
                 if (results.error) {
                     console.log("Problem logging in: " + results.error);
@@ -1038,7 +1039,7 @@ function getContents() {
     //(itemToGet);
     chrome.runtime.sendMessage({
             'proxyFunction': "compareContents",
-            'entityType': entityTypeMap[selectedEntityType],
+            'entityType': resolvedMetadataType,
             'itemName': itemToGet
         },
         function (response) {
@@ -1080,8 +1081,38 @@ var nextPageLsr = 1000;
 var shouldContinuePagination = false;
 var ENABLE_PAGINATION_THRESHOLD = 1500; // Enable DataTables paging above this threshold
 
-// Show loading overlay and fetch metadata FIRST before showing any rows
-if (selectedEntityType in entityTypeMap) {
+// Resolve the UI entity name (e.g. "ApexClass", "CustomEntityDefinition",
+// "LightningMessageChannel") to a Metadata API type name:
+//   1. hardcoded entityTypeMap override (for UI names that differ from API names)
+//   2. describeMetadata identity match from the per-host cache
+//   3. null → type is not yet supported; we fall back to a plain DataTable
+// Describe-based resolution eliminates most of the need to hand-maintain the
+// override map as Salesforce adds new component types each release.
+window.cshMetadata.getDescribe().then(function (describeCache) {
+    resolvedMetadataType = window.cshMetadata.resolveEntityType(
+        selectedEntityType, describeCache, entityTypeMap
+    );
+    console.log('Entity type resolution:', selectedEntityType, '->', resolvedMetadataType,
+                describeCache ? '(describe cache warm)' : '(describe cache cold)');
+
+    if (resolvedMetadataType == null) {
+        // Coverage gap — toast the user so they know why the table isn't enhanced.
+        window.cshToast && window.cshToast.show(
+            'Metadata enhancement is not available for "' + selectedEntityType + '".\n\n' +
+            'The table will still load. To enable last-modified columns for this type, ' +
+            'visit any supported component type first to refresh the type cache, ' +
+            'then return to this page.',
+            { type: 'info', duration: 10000 }
+        );
+        totalComponentCount = listTableLength;
+        startMetadataLoading();
+        return;
+    }
+
+    runEnhancedFlow();
+});
+
+function runEnhancedFlow() {
     // Show loading spinner
     var loadingHtml = `
         <style>
@@ -1141,6 +1172,15 @@ if (selectedEntityType in entityTypeMap) {
 
         console.log('Fetching metadata before loading rows for type:', selectedEntityType);
 
+        // Warm the describeMetadata cache in the background — doesn't block
+        // list fetching. Fresh cache feeds resolveEntityType() on the next visit,
+        // so newly added Salesforce types become supported without a release.
+        if (window.cshMetadata && window.cshMetadata.warmDescribeCache) {
+            window.cshMetadata.warmDescribeCache().catch(function (e) {
+                console.warn('warmDescribeCache failed:', e && e.message);
+            });
+        }
+
         try {
             // Custom callback that waits for all metadata calls to complete
             getMetaData(function(metadataResponse) {
@@ -1179,11 +1219,9 @@ if (selectedEntityType in entityTypeMap) {
             $("#bodyCell").removeClass("changesetloading");
         }
     });
-} else {
-    // Non-mapped entity types - proceed without metadata
-    totalComponentCount = listTableLength;
-    startMetadataLoading();
 }
+// End of runEnhancedFlow — the coverage-gap path is handled inside the
+// resolveEntityType .then() above.
 
 // Function to start pagination after metadata is loaded
 function startPaginationWithMetadata() {
@@ -1315,7 +1353,7 @@ function startPaginationWithMetadata() {
             var nextTable = parsedResponse.find("table.list tr.dataRow");
 
             // Add columns to new rows
-            if (selectedEntityType in entityTypeMap) {
+            if (resolvedMetadataType != null) {
                 addColumnsToRows(nextTable);
             }
 
@@ -1436,7 +1474,7 @@ function initializeTableWithMetadata() {
 
 // Function to start metadata loading after pagination is complete (or skipped)
 function startMetadataLoading() {
-    if (selectedEntityType in entityTypeMap) {
+    if (resolvedMetadataType != null) {
         // Don't call setupTable yet - wait until first metadata batch returns
         // so we can determine dynamic columns from the metadata properties
         $("#editPage").addClass("lowOpacity");
