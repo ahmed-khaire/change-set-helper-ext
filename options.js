@@ -141,10 +141,18 @@ async function runDiagnostic() {
         '&scope=' + encodeURIComponent('api refresh_token id') +
         '&code_challenge=' + encodeURIComponent(pkce.challenge) +
         '&code_challenge_method=S256' +
-        '&prompt=login' +
         '&state=' + state;
     lines.push(resultLine(null, 'Authorization URL built'));
+    lines.push(
+        '<details style="margin-left:14px"><summary class="muted">Show full authorization URL</summary>' +
+        '<pre style="max-height:160px">' + escapeHtml(authUrl) + '</pre>' +
+        '<p><button type="button" class="secondary" id="openAuthUrlBtn">Open this URL in a new tab (bypasses the popup)</button> ' +
+        '<span class="muted">— use this if the popup shows \"Authorization page could not be loaded\"; you\'ll see the real Salesforce error.</span></p>' +
+        '</details>'
+    );
     renderResult(lines.join(''));
+    var openBtn = byId('openAuthUrlBtn');
+    if (openBtn) openBtn.addEventListener('click', function () { window.open(authUrl, '_blank'); });
 
     var redirectResult;
     try {
@@ -160,13 +168,34 @@ async function runDiagnostic() {
         });
     } catch (err) {
         lines.push(resultLine(false, 'launchWebAuthFlow failed: ' + err.message));
-        if (/redirect_uri_mismatch/i.test(err.message) ||
-            /redirect/i.test(err.message)) {
+        if (/Authorization page could not be loaded/i.test(err.message)) {
+            lines.push(advice(
+                '<strong>Salesforce refused to render the authorize page.</strong> This is NOT a redirect mismatch — ' +
+                'it means the initial request to <code>/services/oauth2/authorize</code> failed before any redirect could happen. ' +
+                'Common causes, in order of likelihood:' +
+                '<ol>' +
+                '<li><strong>Invalid <code>client_id</code></strong> — the Consumer Key is wrong or the connected app was deleted. ' +
+                'Copy it fresh from Setup → App Manager → [your app] → View → Manage Consumer Details.</li>' +
+                '<li><strong>Wrong environment</strong> — a connected app defined in a Sandbox is <em>not</em> reachable via ' +
+                '<code>login.salesforce.com</code>. Try <em>Sandbox</em> or the My Domain URL instead.</li>' +
+                '<li><strong>Callback URL not registered</strong> — add <code>' + escapeHtml(redirectUri) + '</code> to the ' +
+                'connected app\'s Callback URL list and wait 5–10 minutes for propagation.</li>' +
+                '<li><strong>Connected app is not yet available</strong> — Salesforce can take 2–10 minutes after ' +
+                'creating / editing a connected app before <code>/services/oauth2/authorize</code> recognises it.</li>' +
+                '<li><strong>Scope <code>refresh_token</code> not selected</strong> on the connected app — requesting ' +
+                'a scope the app doesn\'t support can 400 before the page renders.</li>' +
+                '</ol>' +
+                'Click <em>Open this URL in a new tab</em> above — Salesforce\'s own error page will tell you exactly which of these applies.'
+            ));
+        } else if (/redirect_uri_mismatch/i.test(err.message) ||
+                   /redirect/i.test(err.message)) {
             lines.push(advice(
                 'The Connected App does not accept our redirect URL. Add <code>' +
                 escapeHtml(redirectUri) + '</code> to the connected app\'s Callback URL list ' +
                 '(Setup → App Manager → [your app] → Edit → Callback URL).'
             ));
+        } else if (/User did not approve|canceled|user_cancelled/i.test(err.message)) {
+            lines.push(advice('You closed the auth popup before finishing. Re-run the test and complete the login.'));
         }
         renderResult(lines.join(''));
         return;
