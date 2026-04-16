@@ -27,13 +27,20 @@
     var pendingDeletes = {};     // mid -> {resolve, reject}
     var pageBridgeInjected = false;
     var bulkCancelled = false;
-    var selectionCount = 0;
 
     // Column indices resolved by scanning the header row once the table is
     // found. Keyed by header text lowercased; -1 if that header isn't present.
     // Indices are measured AFTER our select column is inserted (so the Action
     // column is typically 1, Name is 2, Type is somewhere after).
     var colIndex = { action: -1, name: -1, parent: -1, type: -1, fullName: -1 };
+
+    // Selection state persisted across A4J partial refreshes, pagination,
+    // and sort changes. Keyed by the component's Salesforce Id so it survives
+    // any DOM mutation. value = { cid, name, type, linkId }. linkId is the
+    // Visualforce-generated id of the Remove <a> on THE CURRENT page — we
+    // refresh it on every annotateRow so whatever page the user is on, we
+    // always have a valid click target for visible selected rows.
+    var selectedItems = new Map();
 
     // Wait for the Components table to appear. Salesforce renders this
     // synchronously for most orgs, but some Lightning wrappers delay it
@@ -123,11 +130,31 @@
     }
 
     function annotateRow(row) {
-        if (row.querySelector('.csh-dc-select-col')) return;
         var removeLink = row.querySelector(REMOVE_LINK_SEL);
         var cid = extractComponentIdFromLink(removeLink);
-        var nameCell = row.querySelectorAll('td')[1]; // 0=Remove action, 1=Name
+        var linkId = removeLink ? removeLink.id : '';
+        var nameCell = row.querySelectorAll('td')[1]; // 0=Remove action, 1=Name (pre-inject indices)
         var displayName = nameCell ? (nameCell.textContent || '').trim() : (cid || '(unknown)');
+
+        // Refresh the linkId in the selection map if this row corresponds
+        // to a previously-selected component. The linkId is an in-page
+        // Visualforce id that can change when A4J redraws or the user pages.
+        if (cid && selectedItems.has(cid) && linkId) {
+            var existing = selectedItems.get(cid);
+            existing.linkId = linkId;
+            existing.name = existing.name || displayName;
+        }
+
+        if (row.querySelector('.csh-dc-select-col')) {
+            // Row already has a select column (from a previous annotate pass);
+            // just make sure its checked state reflects the current selection.
+            var cbExisting = row.querySelector('.csh-dc-select-row');
+            if (cbExisting && cid) {
+                cbExisting.checked = selectedItems.has(cid);
+                cbExisting.setAttribute('data-link-id', linkId);
+            }
+            return;
+        }
 
         var td = document.createElement('td');
         td.className = 'csh-dc-select-col';
@@ -136,7 +163,10 @@
         cb.className = 'csh-dc-select-row';
         cb.setAttribute('data-cid', cid || '');
         cb.setAttribute('data-name', displayName);
+        cb.setAttribute('data-link-id', linkId);
         if (!cid) cb.disabled = true;
+        // Re-tick if previously selected.
+        if (cid && selectedItems.has(cid)) cb.checked = true;
         td.appendChild(cb);
         row.insertBefore(td, row.firstChild);
     }
@@ -274,11 +304,17 @@
         document.addEventListener('change', function (ev) {
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all')) {
-                // Header checkbox — only ticks currently-visible rows
+                // Header checkbox — only ticks currently-visible rows. Updates
+                // the central selectedItems map so state persists across
+                // A4J refreshes / pagination.
                 var checked = t.checked;
-                visibleSelectCheckboxes().forEach(function (cb) { cb.checked = checked; });
+                visibleSelectCheckboxes().forEach(function (cb) {
+                    cb.checked = checked;
+                    updateSelectionForCheckbox(cb);
+                });
                 updateSelectionCount();
             } else if (t.classList.contains('csh-dc-select-row')) {
+                updateSelectionForCheckbox(t);
                 updateSelectionCount();
             } else if (t.classList.contains('csh-dc-filter-type') ||
                        t.classList.contains('csh-dc-filter-parent')) {
@@ -299,12 +335,16 @@
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all-btn')) {
                 // Select visible — does NOT tick rows hidden by the filter
-                visibleSelectCheckboxes().forEach(function (cb) { cb.checked = true; });
+                visibleSelectCheckboxes().forEach(function (cb) {
+                    cb.checked = true;
+                    updateSelectionForCheckbox(cb);
+                });
                 var allCb = document.querySelector('.csh-dc-select-all');
                 if (allCb) allCb.checked = true;
                 updateSelectionCount();
             } else if (t.classList.contains('csh-dc-select-none-btn')) {
                 document.querySelectorAll('.csh-dc-select-row, .csh-dc-select-all').forEach(function (cb) { cb.checked = false; });
+                selectedItems.clear();
                 updateSelectionCount();
             } else if (t.classList.contains('csh-dc-remove-btn')) {
                 handleRemoveSelected();
@@ -312,11 +352,6 @@
         });
     }
 
-    // Returns checkboxes whose containing row is currently visible (not
-    // hidden by the filter) and not disabled (no cid extractable). Used by
-    // "Select visible" and the header Select-all checkbox so filter + select
-    // compose naturally — the user narrows the view, hits select-all, gets
-    // only what they intended.
     function visibleSelectCheckboxes() {
         return Array.from(document.querySelectorAll('.csh-dc-select-row:not([disabled])'))
             .filter(function (cb) {
@@ -325,12 +360,37 @@
             });
     }
 
+    // Syncs the central selectedItems map with the state of a single
+    // checkbox element. Checked -> add/update entry. Unchecked -> remove.
+    // Entry carries (cid, name, type, linkId) so handleRemoveSelected can
+    // fire the right page-context click regardless of what page the user
+    // is on when they hit Remove.
+    function updateSelectionForCheckbox(cb) {
+        var cid = cb.getAttribute('data-cid');
+        if (!cid) return;
+        if (cb.checked) {
+            var row = cb.closest('tr');
+            var cells = row ? row.children : null;
+            var type = (cells && colIndex.type >= 0 && cells[colIndex.type])
+                ? (cells[colIndex.type].textContent || '').trim()
+                : '';
+            selectedItems.set(cid, {
+                cid: cid,
+                name: cb.getAttribute('data-name') || cid,
+                type: type,
+                linkId: cb.getAttribute('data-link-id') || ''
+            });
+        } else {
+            selectedItems.delete(cid);
+        }
+    }
+
     function updateSelectionCount() {
-        selectionCount = document.querySelectorAll('.csh-dc-select-row:checked').length;
+        var count = selectedItems.size;
         var countEl = document.querySelector('.csh-dc-count');
-        if (countEl) countEl.textContent = selectionCount + ' selected';
+        if (countEl) countEl.textContent = count + ' selected';
         var btn = document.querySelector('.csh-dc-remove-btn');
-        if (btn) btn.disabled = selectionCount === 0;
+        if (btn) btn.disabled = count === 0;
     }
 
     // -----------------------------------------------------------------------
@@ -383,79 +443,94 @@
     // Bulk remove worker — sequential deletes with progress modal.
     // -----------------------------------------------------------------------
     async function handleRemoveSelected() {
-        var checkboxes = Array.from(document.querySelectorAll('.csh-dc-select-row:checked'));
-        if (checkboxes.length === 0) return;
-        if (!confirm('Remove ' + checkboxes.length + ' component(s) from this change set? This cannot be undone.')) return;
+        var items = Array.from(selectedItems.values());
+        if (items.length === 0) return;
+        if (!confirm('Remove ' + items.length + ' component(s) from this change set? This cannot be undone.')) return;
 
         bulkCancelled = false;
-        showProgressModal(checkboxes.length);
+        showProgressModal(items.length);
+        console.log('[CSH] bulk remove starting for', items.length, 'component(s)');
 
         var done = 0, failed = 0;
-        for (var i = 0; i < checkboxes.length; i++) {
+        for (var i = 0; i < items.length; i++) {
             if (bulkCancelled) break;
-            var cb = checkboxes[i];
-            var cid = cb.getAttribute('data-cid');
-            var name = cb.getAttribute('data-name') || cid;
-            var row = cb.closest('tr');
+            var item = items[i];
 
             try {
-                if (!cid) throw new Error('No component ID on this row');
-                await requestDelete(cid);
-                await waitForRowRemoval(row);
+                if (!item.cid) throw new Error('No component ID');
+                // Re-resolve the current linkId from the DOM in case A4J has
+                // re-rendered. If the row isn't in the current view (e.g. user
+                // paginated past it), surface a clear error rather than
+                // timing out — Salesforce's removeLink id is page-scoped.
+                var freshLinkId = findLinkIdForCid(item.cid) || item.linkId;
+                if (!freshLinkId) {
+                    throw new Error('Not on current page — navigate to the page containing ' + item.name + ' and retry');
+                }
+
+                console.log('[CSH] remove', item.cid, '(' + item.name + ') via', freshLinkId);
+                await requestDeleteByClick(freshLinkId);
+                // Fixed delay so A4J has time to dispatch its AJAX request and
+                // start updating the DOM. 1s is conservative; bumps to 1.5s on
+                // the first delete (cold A4J state) when nothing's happened yet.
+                await delay(i === 0 ? 1500 : 1000);
+
+                // Remove from selection map (one-shot — if Salesforce rejects,
+                // the user will see it didn't disappear visually).
+                selectedItems.delete(item.cid);
                 done++;
-                appendLog('✓ ' + name, 'ok');
+                appendLog('✓ ' + item.name, 'ok');
             } catch (err) {
                 failed++;
-                appendLog('✗ ' + name + ' — ' + err.message, 'fail');
+                appendLog('✗ ' + item.name + ' — ' + err.message, 'fail');
+                console.warn('[CSH] remove failed for', item.cid, err);
             }
-            updateProgress(done + failed, checkboxes.length);
+            updateProgress(done + failed, items.length);
         }
+
+        // Release the bridge's confirm-dialog override once the batch ends.
+        try { await sendBridgeCmd({ cmd: 'bulk-end' }); } catch (_) {}
 
         finishProgressModal(done, failed);
         updateSelectionCount();
     }
 
-    function requestDelete(cid) {
+    function findLinkIdForCid(cid) {
+        var cb = document.querySelector('.csh-dc-select-row[data-cid="' + cssEscape(cid) + '"]');
+        if (!cb) return null;
+        return cb.getAttribute('data-link-id') || null;
+    }
+
+    function cssEscape(s) {
+        // Minimal escape for values inside a CSS attribute selector: quotes
+        // and backslashes. Salesforce IDs are [a-zA-Z0-9]{15,18} so usually
+        // no escaping is actually needed; defensive anyway.
+        return String(s).replace(/["\\]/g, '\\$&');
+    }
+
+    function requestDeleteByClick(linkId) {
+        return sendBridgeCmd({ cmd: 'delete', linkId: linkId });
+    }
+
+    function sendBridgeCmd(payload) {
         return new Promise(function (resolve, reject) {
             var mid = 'csh-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
             pendingDeletes[mid] = { resolve: resolve, reject: reject };
-            // Safety timeout — if the bridge doesn't reply in 8 s something's
-            // wrong and we surface it rather than hanging forever.
             setTimeout(function () {
                 if (pendingDeletes[mid]) {
                     delete pendingDeletes[mid];
-                    reject(new Error('bridge timeout (is A4J still loaded?)'));
+                    reject(new Error('bridge timeout (MAIN-world script may not be loaded; check Chrome ≥ 111)'));
                 }
             }, 8000);
-            window.postMessage({ __cshBulk: true, cmd: 'delete', cid: cid, mid: mid }, '*');
+            window.postMessage(Object.assign({ __cshBulk: true, mid: mid }, payload), '*');
         });
     }
 
-    function waitForRowRemoval(row) {
-        return new Promise(function (resolve) {
-            // If the row is already detached (some A4J responses do this on
-            // the client before our next microtask), resolve immediately.
-            if (!row || !row.isConnected) { resolve(); return; }
+    function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-            var timeout = setTimeout(function () {
-                observer.disconnect();
-                // Give up waiting; continue. Next iteration's delete still works;
-                // the server state is authoritative.
-                resolve();
-            }, 10000);
-
-            var observer = new MutationObserver(function () {
-                if (!row.isConnected) {
-                    clearTimeout(timeout);
-                    observer.disconnect();
-                    // Small settle delay so the next A4J submit's ViewState
-                    // picks up the new state rather than the one mid-swap.
-                    setTimeout(resolve, 250);
-                }
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-        });
-    }
+    // Expose a diagnostic pinger on the module for DevTools use.
+    window.cshDetailDiag = function () {
+        return sendBridgeCmd({ cmd: 'ping' });
+    };
 
     // -----------------------------------------------------------------------
     // Progress modal.

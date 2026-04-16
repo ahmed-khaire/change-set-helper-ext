@@ -1,55 +1,104 @@
 // ---------------------------------------------------------------------------
 // Change Set Helper — Detail page MAIN-world bridge.
 //
-// Registered in manifest.json with `"world": "MAIN"` so Chrome loads this
-// script into the page's JavaScript context, where `deleteComponent`,
-// `confirmRemoveComponent`, and `A4J.AJAX.Submit` are defined. Our isolated-
-// world content script (detailcomponents.js) can't call those globals
-// directly, and inline <script> injection is refused by Salesforce's CSP.
+// Registered with "world": "MAIN" in manifest.json so this script loads
+// directly into the page's JavaScript context — bypassing the CSP that
+// refuses inline <script textContent="..."> injection. Here we have access
+// to Salesforce's page-context globals: confirmRemoveComponent,
+// deleteComponent, A4J, and the actual DOM elements / event handlers.
 //
-// The bridge is a single `message` listener. When our isolated-world script
-// postMessages a delete command, this bridge invokes deleteComponent and
-// responds with the original message id so the requester can correlate.
+// Why we click the link rather than calling deleteComponent(cid) directly:
+//   The native Remove link's onclick is:
+//     confirmRemoveComponent(cid);
+//     if (window != window.top) { form.action += '?' or '&' }  // iframe fix
+//     A4J.AJAX.Submit(form, event, {...});
+//     return false;
 //
-// Payloads
-//   request  : { __cshBulk: true, cmd: 'delete', cid: <componentId>, mid: <id> }
-//   response : { __cshBulk: true, source: 'page', mid: <id>, ok: bool, error?: string }
+//   Calling deleteComponent(cid) alone passes `null` as the A4J event
+//   argument. On some RichFaces builds that causes A4J to fall back to a
+//   synchronous form.submit() which triggers a full page reload instead of
+//   a partial AJAX update — which is exactly the bug the user hit (first
+//   item deletes, page hard-reloads, nothing else happens). Clicking the
+//   actual anchor element fires the real onclick with a real event, the
+//   iframe fix runs, A4J takes the AJAX path, and no navigation happens.
 //
-// This script runs on every load of the Outbound Change Set Detail page —
-// including nested frames per the manifest's all_frames: true — which matches
-// where our isolated content script runs so their windows coincide.
+// Payload
+//   request  : { __cshBulk: true, cmd: 'delete', linkId: <anchor id>, mid: <id> }
+//   request  : { __cshBulk: true, cmd: 'bulk-end', mid: <id> }
+//   request  : { __cshBulk: true, cmd: 'ping', mid: <id> }
+//   response : { __cshBulk: true, source: 'page', mid: <id>, ok, ...extras }
 // ---------------------------------------------------------------------------
 
 (function () {
     'use strict';
 
+    // Override confirmRemoveComponent once while a bulk run is in flight so
+    // each link.click() doesn't spawn a dialog. Restored via 'bulk-end'.
+    var _origConfirmRemove = null;
+    function silenceConfirm() {
+        if (_origConfirmRemove !== null) return;
+        if (typeof window.confirmRemoveComponent === 'function') {
+            _origConfirmRemove = window.confirmRemoveComponent;
+            window.confirmRemoveComponent = function () { /* no-op during bulk */ };
+            console.log('[CSH bridge] confirmRemoveComponent silenced');
+        }
+    }
+    function restoreConfirm() {
+        if (_origConfirmRemove !== null) {
+            window.confirmRemoveComponent = _origConfirmRemove;
+            _origConfirmRemove = null;
+            console.log('[CSH bridge] confirmRemoveComponent restored');
+        }
+    }
+
     window.addEventListener('message', function (ev) {
         var data = ev.data;
         if (!data || data.__cshBulk !== true || data.source === 'page') return;
 
-        var mid = data.mid;
         function reply(payload) {
-            // source:'page' prevents this listener from re-triggering on its own
-            // replies (every reply goes through the same message event stream).
-            window.postMessage(Object.assign({ __cshBulk: true, source: 'page', mid: mid }, payload), '*');
+            window.postMessage(
+                Object.assign({ __cshBulk: true, source: 'page', mid: data.mid }, payload),
+                '*'
+            );
         }
 
         try {
             if (data.cmd === 'delete') {
-                if (typeof deleteComponent !== 'function') {
-                    throw new Error('deleteComponent is not defined in this frame');
+                silenceConfirm();
+                var link = document.getElementById(data.linkId);
+                if (!link) {
+                    throw new Error('remove link not in current DOM (may be on a different page): ' + data.linkId);
                 }
-                // deleteComponent(cid) triggers an A4J AJAX partial page update.
-                // Return immediately — our isolated-world caller uses a
-                // MutationObserver on the row to know when the update landed.
-                deleteComponent(data.cid);
+                console.log('[CSH bridge] clicking', data.linkId);
+                link.click();
                 reply({ ok: true });
                 return;
             }
-            // Unknown cmd — respond with an error so the caller doesn't hang.
+
+            if (data.cmd === 'bulk-end') {
+                restoreConfirm();
+                reply({ ok: true });
+                return;
+            }
+
+            if (data.cmd === 'ping') {
+                reply({
+                    ok: true,
+                    isMainWorld: true,
+                    isTopFrame: window === window.top,
+                    hasDeleteComponent: typeof deleteComponent === 'function',
+                    hasConfirmRemoveComponent: typeof confirmRemoveComponent === 'function',
+                    hasA4J: typeof A4J !== 'undefined',
+                    url: location.href.slice(0, 220)
+                });
+                return;
+            }
+
             reply({ ok: false, error: 'unknown cmd: ' + data.cmd });
         } catch (err) {
             reply({ ok: false, error: err && err.message ? err.message : String(err) });
         }
     });
+
+    console.log('[CSH bridge] MAIN-world bridge installed on', location.href.slice(0, 120));
 })();
