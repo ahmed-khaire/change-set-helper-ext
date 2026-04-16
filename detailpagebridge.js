@@ -100,5 +100,23 @@
         }
     });
 
+    // Expose a Console-callable diagnostic from MAIN world so the user can
+    // paste `cshDetailDiag()` into DevTools without switching execution
+    // context. Returns a plain object of health checks; no promises / no
+    // postMessage roundtrip needed — it's just a function on window.
+    window.cshDetailDiag = function () {
+        return {
+            isMainWorld: true,
+            isTopFrame: window === window.top,
+            hasDeleteComponent: typeof deleteComponent === 'function',
+            hasConfirmRemoveComponent: typeof confirmRemoveComponent === 'function',
+            hasA4J: typeof A4J !== 'undefined',
+            hasRowForms: document.querySelectorAll('form[id*="detail_form"]').length,
+            removeLinksOnPage: document.querySelectorAll('a[id*="removeLink"]').length,
+            bulkSilenced: _origConfirmRemove !== null,
+            url: location.href.slice(0, 220)
+        };
+    };
+
     console.log('[CSH bridge] MAIN-world bridge installed on', location.href.slice(0, 120));
 })();
