@@ -96,7 +96,8 @@
         "common.js",
         "cart.js",
         "metadatahelper.js",
-        "deployhelper.js"
+        "deployhelper.js",
+        "detailcomponents.js"
       ],
       "all_frames": true
     }

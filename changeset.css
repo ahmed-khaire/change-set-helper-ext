@@ -103,6 +103,146 @@ table.list tr.csh-diff-same > td:first-child {
     padding: 3px 10px;
 }
 
+/* Phase 7 — Detail page Components block: selection column + bulk remove.
+   Targets the inline components table on outboundChangeSetDetailPage.apexp.
+*/
+.csh-dc-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 14px;
+    margin: 8px 0;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 4px;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+    flex-wrap: wrap;
+}
+.csh-dc-toolbar .csh-dc-label {
+    font-weight: 600;
+    color: #706e6b;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.csh-dc-toolbar button {
+    padding: 5px 12px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-dc-toolbar button:hover:not(:disabled) {
+    background: #f4f6f9;
+    border-color: #a8b7c7;
+}
+.csh-dc-toolbar .csh-dc-remove-btn {
+    background: #ba0517;
+    color: #fff;
+    border-color: #8e0916;
+    font-weight: 600;
+}
+.csh-dc-toolbar .csh-dc-remove-btn:hover:not(:disabled) {
+    background: #8e0916;
+    border-color: #600610;
+}
+.csh-dc-toolbar button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.csh-dc-toolbar .csh-dc-count {
+    font-weight: 600;
+    color: #032d60;
+    margin-left: auto;
+}
+
+table.list td.csh-dc-select-col,
+table.list th.csh-dc-select-col {
+    width: 28px;
+    text-align: center;
+    padding: 0 4px !important;
+}
+
+.csh-dc-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+}
+.csh-dc-modal .csh-dc-modal-body {
+    background: #fff;
+    border-radius: 6px;
+    padding: 18px 22px 16px;
+    width: 92vw;
+    max-width: 560px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+.csh-dc-modal h3 {
+    margin: 0 0 10px;
+    color: #032d60;
+    font-size: 16px;
+}
+.csh-dc-modal .csh-dc-modal-bar {
+    height: 10px;
+    background: #e5e5e5;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+.csh-dc-modal .csh-dc-modal-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 200ms ease;
+}
+.csh-dc-modal .csh-dc-modal-count {
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #3e3e3c;
+}
+.csh-dc-modal .csh-dc-modal-log {
+    max-height: 260px;
+    overflow-y: auto;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-bottom: 10px;
+    font: 12px/1.4 Menlo, Consolas, monospace;
+}
+.csh-dc-modal .csh-dc-log-entry {
+    padding: 1px 2px;
+    border-bottom: 1px solid #eceded;
+    word-break: break-word;
+}
+.csh-dc-modal .csh-dc-log-entry:last-child { border-bottom: 0; }
+.csh-dc-modal .csh-dc-log-entry.ok   { color: #194e30; }
+.csh-dc-modal .csh-dc-log-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }
+.csh-dc-modal .csh-dc-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.csh-dc-modal .csh-dc-modal-actions button {
+    padding: 7px 14px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-dc-modal .csh-dc-modal-close {
+    background: #0176d3;
+    color: #fff;
+    border-color: #0176d3;
+    font-weight: 600;
+}
+
 /* Phase 7 — Components View: bulk-remove toolbar + progressive fetch UI */
 .csh-cv-note {
     background: #eef7ff;
