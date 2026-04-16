@@ -765,8 +765,7 @@ function createDataTable() {
             $(".clearFilters").click(clearFilters);
         }
         if ($('.cshExportCsv').length === 0) {
-            $('<input style="float: left;" value="Export TSV" class="cshExportCsv btn" name="Export TSV" title="Download the current table as a tab-separated file" type="button" />').prependTo('div.rolodex');
-            $(".cshExportCsv").click(cshExportTable);
+            cshInstallToolbarActions();
         }
         cshInstallModifiedByFilter();
 
@@ -866,8 +865,7 @@ function createDataTable() {
 
         $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
         $(".clearFilters").click(clearFilters);
-        $('<input style="float: left;" value="Export TSV" class="cshExportCsv btn" name="Export TSV" title="Download the current table as a tab-separated file" type="button" />').prependTo('div.rolodex');
-        $(".cshExportCsv").click(cshExportTable);
+        cshInstallToolbarActions();
         cshInstallModifiedByFilter();
         $("#editPage").submit(function (event) {
             clearFilters();
@@ -887,6 +885,55 @@ function clearFilters() {
         .columns().search('')
         .draw();
     $(".dtsearch").val('');
+}
+
+// Installs the "Actions" button group next to Reset Search Filters on the
+// Add Components toolbar. Groups together data-export (CSV / TSV) and
+// package.xml I/O so users don't have to open the cart drawer for
+// routine operations. Safe to call multiple times — idempotent.
+function cshInstallToolbarActions() {
+    if ($('.csh-toolbar-actions').length) return;
+    var $group = $(
+        '<span class="csh-toolbar-actions" style="float:left;display:inline-flex;gap:4px;margin-right:8px;">' +
+          '<input type="button" value="Export TSV"            class="cshExportCsv btn"     title="Download the currently-filtered table as a tab-separated file" />' +
+          '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
+          '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
+          '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
+        '</span>'
+    );
+    $group.prependTo('div.rolodex');
+
+    $group.find('.cshExportCsv').on('click', cshExportTable);
+    $group.find('.cshExportPkg').on('click', function () {
+        if (!window.cshCart || !window.cshCart.exportCartAsPackageXml) {
+            window.cshToast && window.cshToast.show('Cart is not ready yet — try again in a moment.', { type: 'info' });
+            return;
+        }
+        window.cshCart.exportCartAsPackageXml()
+            .catch(function (e) { window.cshToast && window.cshToast.show('Export failed: ' + e.message, { type: 'error' }); });
+    });
+    $group.find('.cshImportPkg').on('click', function () {
+        $group.find('.cshImportPkgFile').trigger('click');
+    });
+    $group.find('.cshImportPkgFile').on('change', async function (ev) {
+        var file = ev.target.files && ev.target.files[0];
+        if (!file) return;
+        try {
+            var text = await file.text();
+            if (!window.cshCart || !window.cshCart.importPackageXml) {
+                throw new Error('Cart module not loaded');
+            }
+            var added = await window.cshCart.importPackageXml(text);
+            window.cshToast && window.cshToast.show(
+                'Imported ' + added + ' item(s) from ' + file.name + '. ' +
+                'Items without a Salesforce Id will resolve when you visit each type.',
+                { type: 'success', duration: 6000 }
+            );
+        } catch (e) {
+            window.cshToast && window.cshToast.show('Import failed: ' + e.message, { type: 'error' });
+        }
+        ev.target.value = '';
+    });
 }
 
 // ---------------------------------------------------------------------------

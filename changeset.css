@@ -92,6 +92,17 @@ table.list tr.csh-diff-same > td:first-child {
 .csh-mod-filter input[type="text"]   { width: 200px; }
 .csh-mod-filter .btn { padding: 2px 10px; }
 
+/* Phase 6 — toolbar actions group on the Add Components page */
+.csh-toolbar-actions {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    margin-right: 8px;
+}
+.csh-toolbar-actions .btn {
+    padding: 3px 10px;
+}
+
 /* Phase 6 — live deploy progress panel (Outbound Change Set Detail) */
 #csh-deploy-progress {
     margin: 12px 0;

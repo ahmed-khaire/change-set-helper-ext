@@ -795,13 +795,21 @@
               '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
             '</div>' +
             '<div class="csh-cart-body"></div>' +
-            '<div class="csh-cart-presets">' +
-              '<select class="csh-cart-preset-select"><option value="">Load preset…</option></select>' +
-              '<button class="csh-cart-save-preset" title="Save current cart as preset">💾</button>' +
-              '<button class="csh-cart-delete-preset" title="Delete selected preset">🗑</button>' +
-              '<button class="csh-cart-export-pkg" title="Export cart as package.xml">⬇ pkg.xml</button>' +
-              '<button class="csh-cart-import-pkg" title="Import package.xml into cart">⬆ pkg.xml</button>' +
-              '<input type="file" class="csh-cart-pkg-file" accept=".xml,application/xml" style="display:none">' +
+            '<div class="csh-cart-section">' +
+              '<label class="csh-cart-section-label">Saved presets</label>' +
+              '<div class="csh-cart-section-row">' +
+                '<select class="csh-cart-preset-select"><option value="">Load preset…</option></select>' +
+                '<button class="csh-cart-save-preset" title="Save current cart as a named preset">Save</button>' +
+                '<button class="csh-cart-delete-preset" title="Delete selected preset">Delete</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="csh-cart-section">' +
+              '<label class="csh-cart-section-label">package.xml</label>' +
+              '<div class="csh-cart-section-row">' +
+                '<button class="csh-cart-export-pkg" title="Download the cart as a Salesforce package.xml file">Export</button>' +
+                '<button class="csh-cart-import-pkg" title="Load a package.xml file into the cart">Import</button>' +
+                '<input type="file" class="csh-cart-pkg-file" accept=".xml,application/xml" style="display:none">' +
+              '</div>' +
             '</div>' +
             '<div class="csh-cart-footer">' +
               '<button class="csh-cart-submit">Submit All</button>' +

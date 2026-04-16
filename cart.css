@@ -178,27 +178,40 @@
     padding: 2px 0;
 }
 
-#csh-cart-panel .csh-cart-presets {
-    display: flex;
-    gap: 4px;
-    padding: 6px 10px;
+#csh-cart-panel .csh-cart-section {
+    padding: 8px 12px 6px;
     border-top: 1px solid #e5e5e5;
-    flex-wrap: wrap;
+}
+
+#csh-cart-panel .csh-cart-section-label {
+    display: block;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #706e6b;
+    margin-bottom: 4px;
+}
+
+#csh-cart-panel .csh-cart-section-row {
+    display: flex;
+    gap: 6px;
     align-items: center;
 }
 
-#csh-cart-panel .csh-cart-presets select {
-    flex: 1 1 140px;
-    padding: 3px 6px;
+#csh-cart-panel .csh-cart-section-row select {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 4px 6px;
     font: inherit;
     border: 1px solid #c9c9c9;
     border-radius: 3px;
     background: #fff;
 }
 
-#csh-cart-panel .csh-cart-presets button {
+#csh-cart-panel .csh-cart-section-row button {
     flex: 0 0 auto;
-    padding: 3px 8px;
+    padding: 4px 10px;
     border: 1px solid #c9c9c9;
     background: #fff;
     border-radius: 3px;
@@ -207,26 +220,35 @@
     font-size: 12px;
 }
 
-#csh-cart-panel .csh-cart-presets button:hover {
+#csh-cart-panel .csh-cart-section-row button:hover {
     background: #f4f6f9;
+    border-color: #a8b7c7;
 }
 
 #csh-cart-panel .csh-cart-footer {
     display: flex;
     gap: 6px;
-    padding: 8px 10px;
+    padding: 10px 12px;
     border-top: 1px solid #e5e5e5;
     flex-wrap: wrap;
+    background: #fafbfc;
+    border-radius: 0 0 5px 5px;
 }
 
 #csh-cart-panel .csh-cart-footer button {
     flex: 1 1 auto;
-    padding: 6px 10px;
+    padding: 7px 12px;
     border-radius: 3px;
     border: 1px solid #c9c9c9;
     background: #fff;
     cursor: pointer;
     font: inherit;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+#csh-cart-panel .csh-cart-footer button:hover:not(:disabled) {
+    background: #f4f6f9;
+    border-color: #a8b7c7;
 }
 
 #csh-cart-panel .csh-cart-submit {

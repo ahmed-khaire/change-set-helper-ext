@@ -77,7 +77,8 @@
         "lib/select2.min.css",
         "lib/codemirror.css",
         "lib/dataTables.checkboxes.css",
-        "changeset.css"
+        "changeset.css",
+        "cart.css"
       ],
       "js": [
         "lib/jquery.min.js",
@@ -92,6 +93,7 @@
         "lib/FileSaver.js",
         "lib/jszip.js",
         "common.js",
+        "cart.js",
         "metadatahelper.js",
         "deployhelper.js"
       ],
