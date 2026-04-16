@@ -211,6 +211,83 @@
         return out;
     }
 
+    // Auto-save: the single most important persistence mechanism.
+    //
+    // Problem this solves: the Salesforce Classic page (including when
+    // embedded as a Lightning iframe) fires a form submit or navigation on
+    // dropdown change. Our jQuery change handler was losing the race against
+    // inline onchange handlers and native form submission, so the modal
+    // appeared for a fraction of a second and then the page refreshed, wiping
+    // in-memory state before anything got stored.
+    //
+    // Approach: save to chrome.storage.local on EVERY checkbox click. State
+    // is persisted before any navigation can happen, and the refreshed page
+    // re-hydrates checkboxes from storage on the next load via restoreFromCart.
+    // No modal, no race, no lost work.
+    //
+    // Cart semantics per type:
+    //   - Checking a box  -> item appears in cart as 'staged'
+    //   - Unchecking      -> item removed from cart (if still staged)
+    //   - 'submitting' / 'done' / 'failed' items are NEVER touched by auto-save
+    //     so in-flight batches aren't disturbed by the user continuing to click.
+    var autoSaveTimer = null;
+    function installCheckboxAutoSave(changeSetId, type) {
+        // Namespaced event so re-init doesn't stack handlers (Salesforce
+        // re-renders the table on type switch; our document-level delegate
+        // persists across renders).
+        $(document).off('change.cshAutoSave click.cshAutoSave')
+            .on('change.cshAutoSave click.cshAutoSave',
+                'table.list tr.dataRow input[type="checkbox"]',
+                function () {
+                    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+                    // Very short debounce — if the user is clicking a header
+                    // "select all" we coalesce the 50+ individual change events
+                    // into one storage write.
+                    autoSaveTimer = setTimeout(function () {
+                        syncCartFromCheckboxes(changeSetId, type).catch(function (e) {
+                            console.warn('cshCart auto-save failed:', e && e.message);
+                        });
+                    }, 180);
+                });
+    }
+
+    async function syncCartFromCheckboxes(changeSetId, type) {
+        if (!changeSetId || !type) return;
+        var checked = harvestChecked();
+        var byId = {};
+        checked.forEach(function (it) { byId[it.id] = it; });
+
+        var { all, cart } = await getCart(changeSetId);
+        var kept = [];
+        var seen = {};
+        cart.items.forEach(function (it) {
+            // Items for other types pass through untouched.
+            if (it.type !== type) { kept.push(it); return; }
+            // Items already in flight or terminal: protected.
+            if (it.status !== 'staged') { kept.push(it); seen[it.salesforceId] = true; return; }
+            // Staged items still represented by a ticked checkbox: keep.
+            if (it.salesforceId && byId[it.salesforceId]) {
+                kept.push(it);
+                seen[it.salesforceId] = true;
+            }
+            // Staged items whose box got unticked: drop.
+        });
+        // Add newly-checked items that weren't in cart.
+        checked.forEach(function (it) {
+            if (seen[it.id]) return;
+            kept.push({
+                uid: uid(),
+                type: type,
+                salesforceId: it.id,
+                name: it.name,
+                status: 'staged',
+                addedAt: Date.now()
+            });
+        });
+        cart.items = kept;
+        await saveCart(all);
+    }
+
     async function restoreFromCart(changeSetId, type) {
         var { cart } = await getCart(changeSetId);
         var wanted = {};
@@ -235,12 +312,54 @@
     // Worker — submits cart items in batches via chrome.runtime message to
     // the service worker, which does the actual fetch() against Salesforce.
     // -----------------------------------------------------------------------
+    // Cross-tab worker lock. workerRunning is only in-memory for THIS tab; if
+    // the user has the change set open on two Setup tabs and clicks Submit All
+    // in both, both in-memory flags start at false, both workers run, both
+    // read the same staged items, both POST. Salesforce's add-to-change-set
+    // endpoint is idempotent so the change set doesn't get duplicates, but we
+    // waste API quota and throw confusing toasts. The soft lock is a time-
+    // stamped record in chrome.storage.local; a fresh tab sees the existing
+    // lock and bails with a message. 30-second TTL is refreshed per batch so
+    // legitimately long runs don't expire mid-flight.
+    var LOCK_KEY = 'cshCartWorkerLock';
+    var LOCK_TTL_MS = 30 * 1000;
+
+    async function acquireWorkerLock(changeSetId) {
+        var s = await storageGet([LOCK_KEY]);
+        var existing = s[LOCK_KEY];
+        if (existing && existing.lockedAt && (Date.now() - existing.lockedAt) < LOCK_TTL_MS) {
+            return false;
+        }
+        await storageSet({ [LOCK_KEY]: { lockedAt: Date.now(), changeSetId: changeSetId } });
+        return true;
+    }
+
+    async function refreshWorkerLock(changeSetId) {
+        await storageSet({ [LOCK_KEY]: { lockedAt: Date.now(), changeSetId: changeSetId } });
+    }
+
+    async function releaseWorkerLock() {
+        await storageSet({ [LOCK_KEY]: null });
+    }
+
     var workerRunning = false;
     async function runWorker(changeSetId) {
         if (workerRunning) return;
+        var acquired = await acquireWorkerLock(changeSetId);
+        if (!acquired) {
+            window.cshToast && window.cshToast.show(
+                'Another Salesforce tab is already submitting cart items. ' +
+                'Wait for it to finish, then try again.',
+                { type: 'info', duration: 5000 }
+            );
+            return;
+        }
         workerRunning = true;
         try {
             while (true) {
+                // Refresh the lock at the start of every batch so other tabs
+                // see we're still alive even during long-running deploys.
+                await refreshWorkerLock(changeSetId);
                 var { cart } = await getCart(changeSetId);
                 // Only submit staged items that have a resolved salesforceId.
                 // Imported items without an Id stay staged until the user
@@ -330,6 +449,7 @@
             }
         } finally {
             workerRunning = false;
+            await releaseWorkerLock();
             renderPanel();
         }
     }
@@ -952,7 +1072,16 @@
             if (changes[CART_KEY]) renderPanel();
         });
 
-        installTypeSwitchGuard(opts.currentType);
+        // Install the auto-save delegate. This is the primary persistence
+        // mechanism for user selections — every checkbox click flushes to
+        // chrome.storage.local before any Salesforce-initiated navigation can
+        // run, so the cart survives refresh without relying on modal timing.
+        if (opts.currentType) {
+            installCheckboxAutoSave(_currentChangeSetId, opts.currentType);
+        }
+        // Type-switch guard kept as NO-OP: dropdown change now lets Salesforce
+        // navigate freely because state is already persisted on every click.
+        // (Previously a modal tried to intercept and lost the race.)
         renderPanel();
         // Populate the presets dropdown asynchronously; doesn't gate init.
         refreshPresetSelect().catch(function (e) {

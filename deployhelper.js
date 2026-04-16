@@ -74,9 +74,25 @@ function cshRenderDeployProgress(result) {
         if (isSuccess) okCount++; else failCount++;
         var key = (isSuccess ? 'ok|' : 'fail|') + ctype + '|' + fullName;
         if (cshDpSeen[key]) return;
+
+        // Salesforce can retry within a single deploy: a component that
+        // failed on poll N may succeed on poll N+1. When a success arrives
+        // for a component we previously flagged as failed, supersede the
+        // failure: remove its DOM row and forget the key so the summary
+        // counter stays honest.
+        if (isSuccess) {
+            var failKey = 'fail|' + ctype + '|' + fullName;
+            if (cshDpSeen[failKey]) {
+                var prior = logEl.querySelector('[data-csh-dp-key="' + cssEscape(failKey) + '"]');
+                if (prior && prior.parentNode) prior.parentNode.removeChild(prior);
+                delete cshDpSeen[failKey];
+            }
+        }
+
         cshDpSeen[key] = true;
         var entry = document.createElement('div');
         entry.className = 'csh-dp-entry ' + (isSuccess ? 'ok' : 'fail');
+        entry.setAttribute('data-csh-dp-key', key);
         if (onlyFail && isSuccess) entry.style.display = 'none';
         var prefix = isSuccess ? '✓' : '✗';
         var label = (ctype ? '[' + ctype + '] ' : '') + fullName;
@@ -84,6 +100,10 @@ function cshRenderDeployProgress(result) {
         var line = c.lineNumber ? (' (line ' + c.lineNumber + ')') : '';
         entry.textContent = prefix + ' ' + label + (problem ? ' — ' + problem + line : '');
         logEl.appendChild(entry);
+    }
+
+    function cssEscape(s) {
+        return String(s).replace(/["\\]/g, '\\$&');
     }
 
     successes.forEach(function (c) { render(c, true); });

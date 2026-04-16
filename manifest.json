@@ -64,7 +64,8 @@
         "lib/jquery.dataTables.js",
         "lib/moment.js",
         "changeview.js"
-      ]
+      ],
+      "all_frames": true
     },
     {
       "matches": [

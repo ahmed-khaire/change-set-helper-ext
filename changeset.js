@@ -604,27 +604,31 @@ function jq(myid) {
 // exist in the compare org but NOT in the current change set. Uses
 // DataTables' row.add API so they participate in sort / filter / export
 // naturally; styled via csh-diff-target-only (red).
+//
+// All textual cells are coerced to String so DataTables renders them via
+// textContent rather than innerHTML. Belt-and-braces against metadata
+// records with angle brackets in fullName (rare but a theoretical XSS
+// vector if an attacker controls a compare-org target).
 function cshAppendTargetOnlyRows(records, env) {
     if (!changeSetTable) return;
     var totalCols = changeSetTable.columns().count();
     records.forEach(function (rec) {
         var row = new Array(totalCols).fill('');
-        // Column 0 is the checkbox — put a disabled, explanatory placeholder
-        row[0] = '<span title="Exists in target org only" style="color:#8e0916;font-weight:600;">[target only]</span>';
-        // Column 1 is Name — use fullName as the display name
-        row[1] = rec.fullName || '';
-        // Compare cells
+        // Column 0 - plain-text badge. Styling comes from the row class
+        // csh-diff-target-only (see changeset.css) so no HTML is needed here.
+        row[0] = '[target only]';
+        row[1] = String(rec.fullName == null ? '' : rec.fullName);
         if (compareColumnIndices.compareDateMod >= 0 && rec.lastModifiedDate) {
             row[compareColumnIndices.compareDateMod] = convertDate(new Date(rec.lastModifiedDate));
         }
         if (compareColumnIndices.compareModBy >= 0) {
-            row[compareColumnIndices.compareModBy] = rec.lastModifiedByName || '';
+            row[compareColumnIndices.compareModBy] = String(rec.lastModifiedByName == null ? '' : rec.lastModifiedByName);
         }
         if (compareColumnIndices.fullName >= 0) {
-            row[compareColumnIndices.fullName] = rec.fullName || '';
+            row[compareColumnIndices.fullName] = String(rec.fullName == null ? '' : rec.fullName);
         }
         if (compareColumnIndices.folder >= 0 && rec.folder) {
-            row[compareColumnIndices.folder] = rec.folder;
+            row[compareColumnIndices.folder] = String(rec.folder);
         }
         var added = changeSetTable.row.add(row).draw(false);
         var node = added.node();
