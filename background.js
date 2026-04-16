@@ -243,6 +243,62 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.type == "cshCartSubmit") {
+        // Cart worker batch submission: POST to the native Add-Components
+        // endpoint using the scraped form shape, with our chosen ids replacing
+        // the user's checkbox selections. fetch() from the service worker
+        // includes cookies for any origin we have host_permissions for.
+        (async function () {
+            try {
+                var shape = request.formShape;
+                var ids = request.ids || [];
+                if (!shape || !shape.action) {
+                    sendResponse({ ok: false, error: 'No form shape available' });
+                    return;
+                }
+                var body = new URLSearchParams();
+                Object.keys(shape.hidden || {}).forEach(function (k) {
+                    body.append(k, shape.hidden[k]);
+                });
+                // The Salesforce form names its row checkboxes `ids`; appending
+                // one entry per selected id produces the same POST shape as a
+                // real user tick.
+                ids.forEach(function (id) { body.append('ids', id); });
+                // Include the submit button's own name/value so the server-side
+                // handler treats it as a Save (not a filter / search submission).
+                if (shape.submitName) body.append(shape.submitName, shape.submitValue || 'Save');
+
+                var resp = await fetch(shape.action, {
+                    method: shape.method || 'POST',
+                    credentials: 'include',
+                    body: body.toString(),
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        // Hint the server this is an async submission; Salesforce
+                        // tolerates it and it avoids full HTML shells in some cases.
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }
+                });
+                // Successful add-to-change-set usually returns a 302 redirect
+                // to the Outbound Change Set detail page. fetch follows redirects
+                // by default; a 200 on the detail URL is our success signal.
+                if (resp.ok || (resp.status >= 300 && resp.status < 400)) {
+                    sendResponse({ ok: true, finalUrl: resp.url });
+                    return;
+                }
+                var text = await resp.text().catch(function () { return ''; });
+                sendResponse({
+                    ok: false,
+                    error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
+                });
+            } catch (err) {
+                console.error('cshCartSubmit failed:', err);
+                sendResponse({ ok: false, error: err.message || String(err) });
+            }
+        })();
+        return true;
+    }
+
     if (request.type == "getSessionCookie") {
         // HttpOnly-cookie fallback: content scripts can't read the sid cookie
         // directly when the org has "Require HttpOnly attribute" enabled, but

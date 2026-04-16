@@ -28,7 +28,8 @@
         "lib/jquery-ui.structure.min.css",
         "lib/jquery-ui.theme.min.css",
         "lib/dataTables.checkboxes.css",
-        "changeset.css"
+        "changeset.css",
+        "cart.css"
       ],
       "js": [
         "lib/jquery.min.js",
@@ -45,6 +46,7 @@
         "lib/mergely.js",
         "lib/jszip.js",
         "common.js",
+        "cart.js",
         "changeset.js"
       ],
       "all_frames": true

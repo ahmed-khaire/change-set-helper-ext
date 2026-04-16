@@ -1578,6 +1578,16 @@ $(document).ready(function () {
             '</strong></span>'
         );
     }
+
+    // Kick off the cart module: caches the form shape for this type, restores
+    // staged checkboxes from any prior session, installs the type-switch
+    // guard, and renders the floating panel if there are pending items.
+    if (window.cshCart && window.cshCart.init) {
+        window.cshCart.init({
+            changeSetId: $('#id').val() || null,
+            currentType: selectedEntityType || null
+        });
+    }
 });
 
 //Find out if they are logged in already
