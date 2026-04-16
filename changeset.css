@@ -103,6 +103,198 @@ table.list tr.csh-diff-same > td:first-child {
     padding: 3px 10px;
 }
 
+/* Phase 7 — Components View: bulk-remove toolbar + progressive fetch UI */
+.csh-cv-note {
+    background: #eef7ff;
+    border-left: 3px solid #0176d3;
+    padding: 8px 14px;
+    margin: 8px 0;
+    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
+    color: #032d60;
+}
+
+.csh-cv-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 14px;
+    margin: 8px 0;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 4px;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+    flex-wrap: wrap;
+}
+.csh-cv-toolbar-label {
+    font-weight: 600;
+    color: #706e6b;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.csh-cv-toolbar button {
+    padding: 5px 12px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-cv-toolbar button:hover:not(:disabled) {
+    background: #f4f6f9;
+    border-color: #a8b7c7;
+}
+.csh-cv-toolbar button.csh-cv-remove {
+    background: #ba0517;
+    color: #fff;
+    border-color: #8e0916;
+    font-weight: 600;
+}
+.csh-cv-toolbar button.csh-cv-remove:hover:not(:disabled) {
+    background: #8e0916;
+    border-color: #600610;
+}
+.csh-cv-toolbar button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.csh-cv-selection-count {
+    font-weight: 600;
+    color: #032d60;
+    margin-left: auto;
+}
+
+table.list td.csh-cv-select-col,
+table.list th.csh-cv-select-col {
+    width: 28px;
+    text-align: center;
+    padding: 0 4px !important;
+}
+
+/* Live pagination progress pill — bottom-right of viewport */
+.csh-cv-progress {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 2147483645;
+    background: #fff;
+    border: 1px solid #c9c9c9;
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+    min-width: 320px;
+}
+.csh-cv-progress .csh-cv-progress-body {
+    padding: 10px 14px;
+}
+.csh-cv-progress .csh-cv-progress-label {
+    font-weight: 600;
+    color: #032d60;
+    margin-bottom: 6px;
+}
+.csh-cv-progress .csh-cv-progress-bar {
+    height: 8px;
+    background: #e5e5e5;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+.csh-cv-progress .csh-cv-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 240ms ease;
+}
+.csh-cv-progress .csh-cv-progress-cancel {
+    padding: 3px 10px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+}
+
+/* Bulk-remove modal */
+.csh-cv-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+}
+.csh-cv-modal .csh-cv-modal-body {
+    background: #fff;
+    border-radius: 6px;
+    padding: 18px 22px 16px;
+    width: 92vw;
+    max-width: 560px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+.csh-cv-modal h3 {
+    margin: 0 0 10px;
+    color: #032d60;
+    font-size: 16px;
+}
+.csh-cv-modal .csh-cv-modal-bar {
+    height: 10px;
+    background: #e5e5e5;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+.csh-cv-modal .csh-cv-modal-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 200ms ease;
+}
+.csh-cv-modal .csh-cv-modal-count {
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #3e3e3c;
+}
+.csh-cv-modal .csh-cv-modal-log {
+    max-height: 260px;
+    overflow-y: auto;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-bottom: 10px;
+    font: 12px/1.4 Menlo, Consolas, monospace;
+}
+.csh-cv-modal .csh-cv-log-entry {
+    padding: 1px 2px;
+    border-bottom: 1px solid #eceded;
+    word-break: break-word;
+}
+.csh-cv-modal .csh-cv-log-entry:last-child { border-bottom: 0; }
+.csh-cv-modal .csh-cv-log-entry.ok   { color: #194e30; }
+.csh-cv-modal .csh-cv-log-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }
+.csh-cv-modal .csh-cv-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.csh-cv-modal .csh-cv-modal-actions button {
+    padding: 7px 14px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-cv-modal .csh-cv-modal-close {
+    background: #0176d3;
+    color: #fff;
+    border-color: #0176d3;
+    font-weight: 600;
+}
+
 /* Phase 6 — live deploy progress panel (Outbound Change Set Detail) */
 #csh-deploy-progress {
     margin: 12px 0;

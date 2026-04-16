@@ -63,6 +63,7 @@
         "lib/jquery.min.js",
         "lib/jquery.dataTables.js",
         "lib/moment.js",
+        "common.js",
         "changeview.js"
       ],
       "all_frames": true
