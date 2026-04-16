@@ -627,11 +627,28 @@ function processCompareResults(results, env) {
             $(fullNameCell).off("click");
             $(fullNameCell).click(getContents);
 
-            // Compare dates and highlight if this org is newer than other org
+            // Phase 5: colour-code the whole row based on recency comparison.
+            //   csh-diff-newer-local  → local is newer (safe to deploy from here)
+            //   csh-diff-newer-target → target is newer (deploying would REGRESS)
+            //   csh-diff-same         → timestamps match (no-op deploy)
             if (compareColumnIndices.lastModifiedDate >= 0) {
                 var thisOrgDateMod = changeSetTable.cell(rowIdx, compareColumnIndices.lastModifiedDate).data();
-                if (moment(dateMod).diff(convertToMoment(thisOrgDateMod)) < 0) {
-                    // Other org is older, so this org is newer - highlight in green
+                var localMoment = convertToMoment(thisOrgDateMod);
+                var targetMoment = moment(dateMod);
+                var rowNode = changeSetTable.row(rowIdx).node();
+                if (rowNode) {
+                    rowNode.classList.remove('csh-diff-newer-local', 'csh-diff-newer-target', 'csh-diff-same');
+                    if (localMoment.isValid() && targetMoment.isValid()) {
+                        var delta = targetMoment.diff(localMoment);
+                        if (delta < 0) rowNode.classList.add('csh-diff-newer-local');
+                        else if (delta > 0) rowNode.classList.add('csh-diff-newer-target');
+                        else rowNode.classList.add('csh-diff-same');
+                    }
+                }
+                // Also keep the legacy inline-colour hint on the date cell for
+                // anyone with custom selectors; the row class is the source of
+                // truth for new users.
+                if (targetMoment.diff(localMoment) < 0) {
                     changeSetTable.cell(rowIdx, compareColumnIndices.lastModifiedDate).node().style.color = "green";
                 }
             }
@@ -673,12 +690,17 @@ function createDataTable() {
             console.log('createDataTable: WARNING - Filters are missing (this should not happen)');
         }
 
-        // Ensure clear filters button exists
+        // Ensure clear filters + CSV button exist
         if ($('.clearFilters').length === 0) {
             console.log('createDataTable: Adding Clear Filters button');
             $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
             $(".clearFilters").click(clearFilters);
         }
+        if ($('.cshExportCsv').length === 0) {
+            $('<input style="float: left;" value="Export TSV" class="cshExportCsv btn" name="Export TSV" title="Download the current table as a tab-separated file" type="button" />').prependTo('div.rolodex');
+            $(".cshExportCsv").click(cshExportTable);
+        }
+        cshInstallModifiedByFilter();
 
         return;
     }
@@ -776,6 +798,9 @@ function createDataTable() {
 
         $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
         $(".clearFilters").click(clearFilters);
+        $('<input style="float: left;" value="Export TSV" class="cshExportCsv btn" name="Export TSV" title="Download the current table as a tab-separated file" type="button" />').prependTo('div.rolodex');
+        $(".cshExportCsv").click(cshExportTable);
+        cshInstallModifiedByFilter();
         $("#editPage").submit(function (event) {
             clearFilters();
             return true;
@@ -794,6 +819,143 @@ function clearFilters() {
         .columns().search('')
         .draw();
     $(".dtsearch").val('');
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.1 — CSV / TSV export
+//
+// Dumps the currently-filtered DataTable rows as a tab-separated file so the
+// user can paste directly into Excel / Numbers / Sheets without worrying
+// about quoted-comma escaping. Respects visible columns and active search.
+// ---------------------------------------------------------------------------
+function cshCsvEscape(val) {
+    if (val == null) return '';
+    var s = String(val);
+    if (/[\t\r\n"]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+}
+
+function cshExportTable() {
+    if (!changeSetTable) {
+        window.cshToast && window.cshToast.show('Table not ready for export yet.', { type: 'info' });
+        return;
+    }
+    var visibleIdxs = changeSetTable.columns(':visible').indexes().toArray();
+    var headers = visibleIdxs.map(function (idx) {
+        return $.trim($(changeSetTable.column(idx).header()).text());
+    });
+    var lines = [];
+    lines.push(headers.map(cshCsvEscape).join('\t'));
+
+    var rowApi = changeSetTable.rows({ search: 'applied' });
+    var data = rowApi.data().toArray();
+    var nodes = rowApi.nodes();
+    for (var i = 0; i < data.length; i++) {
+        var rowData = data[i];
+        var rowNode = nodes[i];
+        var line = visibleIdxs.map(function (colIdx) {
+            // Prefer the rendered DOM text over raw cell data so we export
+            // exactly what the user sees (includes name links, date strings).
+            var cell = rowNode ? $(rowNode).children('td').eq(colIdx).text() : rowData[colIdx];
+            return cshCsvEscape(String(cell == null ? '' : cell).replace(/\s+/g, ' ').trim());
+        });
+        lines.push(line.join('\t'));
+    }
+
+    var entityType = $('#entityType').val() || 'change-set';
+    var stamp = new Date().toISOString().slice(0, 10);
+    var fname = 'csh-' + entityType + '-' + stamp + '.tsv';
+    var blob = new Blob([lines.join('\r\n')], { type: 'text/tab-separated-values;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {
+        a.remove();
+        URL.revokeObjectURL(url);
+    }, 500);
+    window.cshToast && window.cshToast.show(
+        'Exported ' + (lines.length - 1) + ' row(s) to ' + fname,
+        { type: 'success', duration: 3000 }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.2 — Modified-by-me / last N days filter
+//
+// Sits above the table, filters using DataTables' custom search hook against
+// lastModifiedBy and lastModifiedDate columns if they exist. Only registers
+// the hook once; toggle off when fields are empty.
+// ---------------------------------------------------------------------------
+var cshModFilterInstalled = false;
+var cshModFilterCtx = { byColIdx: -1, dateColIdx: -1 };
+
+function cshInstallModifiedByFilter() {
+    if (!changeSetTable || cshModFilterInstalled) return;
+    if (!dynamicColumns || dynamicColumns.length === 0) return;
+
+    var headerCount = (typeof cshOriginalHeaderCount === 'number' && cshOriginalHeaderCount > 0)
+        ? cshOriginalHeaderCount : (typeColumn.length > 0 ? 3 : 2);
+    cshModFilterCtx.byColIdx = -1;
+    cshModFilterCtx.dateColIdx = -1;
+    dynamicColumns.forEach(function (col, i) {
+        if (col.propertyName === 'lastModifiedByName') cshModFilterCtx.byColIdx = headerCount + i;
+        if (col.propertyName === 'lastModifiedDate')   cshModFilterCtx.dateColIdx = headerCount + i;
+    });
+    if (cshModFilterCtx.byColIdx === -1 && cshModFilterCtx.dateColIdx === -1) return;
+
+    // Best-effort: pull a display name from the Salesforce header so the
+    // "Modified by me" checkbox works out of the box. User can edit if wrong.
+    var me = $.trim(
+        $('.userProfile .uiOutputText').first().text() ||
+        $('.branding-userProfile-button').attr('title') ||
+        $('.userNav').text() || ''
+    );
+
+    var html =
+        '<div id="csh-mod-filter" class="csh-mod-filter">' +
+          '<strong>Quick filter:</strong> ' +
+          '<label><input type="checkbox" id="csh-mod-me"> Modified by me</label> ' +
+          '<input type="text" id="csh-mod-me-name" placeholder="my display name" value="' + $('<div>').text(me).html() + '" title="Your display name as it appears in Last Modified By">' +
+          ' <label>In the last <input type="number" id="csh-mod-days" min="0" max="365" placeholder="7"> days</label>' +
+          ' <button type="button" id="csh-mod-apply" class="btn">Apply</button>' +
+          ' <button type="button" id="csh-mod-clear" class="btn">Clear</button>' +
+        '</div>';
+    $(html).insertBefore('table.list');
+
+    $.fn.dataTable.ext.search.push(function (settings, rowData) {
+        if (settings.nTable !== changeSetTable.table().node()) return true;
+        var byMe = $('#csh-mod-me').prop('checked');
+        var days = parseInt($('#csh-mod-days').val(), 10);
+        var myName = $.trim(($('#csh-mod-me-name').val() || '')).toLowerCase();
+
+        if (byMe && myName && cshModFilterCtx.byColIdx !== -1) {
+            var name = String(rowData[cshModFilterCtx.byColIdx] || '').toLowerCase();
+            if (name.indexOf(myName) === -1) return false;
+        }
+        if (!isNaN(days) && days > 0 && cshModFilterCtx.dateColIdx !== -1) {
+            var dateStr = String(rowData[cshModFilterCtx.dateColIdx] || '').trim();
+            if (!dateStr) return false;
+            var d = moment(dateStr, 'DD MMM YYYY');
+            if (d.isValid()) {
+                var cutoff = moment().subtract(days, 'days').startOf('day');
+                if (d.isBefore(cutoff)) return false;
+            }
+        }
+        return true;
+    });
+
+    $(document).on('click', '#csh-mod-apply', function () { changeSetTable.draw(); });
+    $(document).on('click', '#csh-mod-clear', function () {
+        $('#csh-mod-me').prop('checked', false);
+        $('#csh-mod-days').val('');
+        changeSetTable.draw();
+    });
+    $(document).on('change', '#csh-mod-me', function () { changeSetTable.draw(); });
+
+    cshModFilterInstalled = true;
 }
 
 /**

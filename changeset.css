@@ -31,3 +31,53 @@ body .pbBody table.list tr.headerRow td, body .pbBody table.list tr.headerRow th
     border-width: 0 0 0 1px !important;
 
 }
+
+/* Phase 5.3 — Compare diff colour-coding
+   Applied on a row when the compare-with-org flow finishes; interprets the
+   timestamp comparison between THIS org and the target org.
+     csh-diff-newer-local   : local Last-Modified is newer -> safe to deploy
+     csh-diff-newer-target  : target is newer -> deploying would regress the target
+     csh-diff-same          : timestamps match -> no-op deploy
+*/
+table.list tr.csh-diff-newer-local > td {
+    background-color: #e6ffed !important;   /* soft green */
+    border-left: 3px solid #2e844a !important;
+}
+table.list tr.csh-diff-newer-target > td {
+    background-color: #fff3e0 !important;   /* soft orange */
+    border-left: 3px solid #b85c00 !important;
+}
+table.list tr.csh-diff-same > td {
+    background-color: #f4f6f9 !important;   /* soft grey */
+    border-left: 3px solid #706e6b !important;
+}
+table.list tr.csh-diff-newer-local > td:first-child,
+table.list tr.csh-diff-newer-target > td:first-child,
+table.list tr.csh-diff-same > td:first-child {
+    border-left-width: 3px !important;
+}
+
+/* Phase 5.2 — Modified-by-me / last N days filter bar */
+.csh-mod-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 12px;
+    margin: 6px 0;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
+}
+.csh-mod-filter label { display: inline-flex; align-items: center; gap: 4px; margin: 0; }
+.csh-mod-filter input[type="number"],
+.csh-mod-filter input[type="text"] {
+    padding: 3px 6px;
+    border: 1px solid #c9c9c9;
+    border-radius: 3px;
+    font: inherit;
+}
+.csh-mod-filter input[type="number"] { width: 64px; }
+.csh-mod-filter input[type="text"]   { width: 200px; }
+.csh-mod-filter .btn { padding: 2px 10px; }
