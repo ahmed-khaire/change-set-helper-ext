@@ -229,82 +229,132 @@
         return out;
     }
 
-    // Auto-save: the single most important persistence mechanism.
+    // Auto-save: persists every checkbox toggle to chrome.storage.local so
+    // cart state survives dropdown-triggered page reloads AND DataTable
+    // filter changes.
     //
-    // Problem this solves: the Salesforce Classic page (including when
-    // embedded as a Lightning iframe) fires a form submit or navigation on
-    // dropdown change. Our jQuery change handler was losing the race against
-    // inline onchange handlers and native form submission, so the modal
-    // appeared for a fraction of a second and then the page refreshed, wiping
-    // in-memory state before anything got stored.
+    // Why this was subtle: DataTable (with deferRender:true + filter-search)
+    // REMOVES non-matching rows from the DOM entirely rather than hiding
+    // them. A naive full-reconcile — "cart = all currently-checked rows" —
+    // would wipe out items whose row is filtered away, even though the user
+    // meant to keep them. So the reconcile below treats three cases per
+    // item:
     //
-    // Approach: save to chrome.storage.local on EVERY checkbox click. State
-    // is persisted before any navigation can happen, and the refreshed page
-    // re-hydrates checkboxes from storage on the next load via restoreFromCart.
-    // No modal, no race, no lost work.
+    //   row visible + checked    -> keep / add (staged)
+    //   row visible + unchecked  -> drop from cart (explicit untick)
+    //   row NOT in DOM           -> preserve existing cart state
     //
-    // Cart semantics per type:
-    //   - Checking a box  -> item appears in cart as 'staged'
-    //   - Unchecking      -> item removed from cart (if still staged)
-    //   - 'submitting' / 'done' / 'failed' items are NEVER touched by auto-save
-    //     so in-flight batches aren't disturbed by the user continuing to click.
+    // Combined with the draw.dt hook below that re-ticks cart items when
+    // their rows become visible again, the filter-then-select pattern now
+    // composes correctly across any number of cycles.
     var autoSaveTimer = null;
+    var _cartType = null;
     function installCheckboxAutoSave(changeSetId, type) {
-        // Namespaced event so re-init doesn't stack handlers (Salesforce
-        // re-renders the table on type switch; our document-level delegate
-        // persists across renders).
+        _cartType = type;
         $(document).off('change.cshAutoSave click.cshAutoSave')
             .on('change.cshAutoSave click.cshAutoSave',
                 'table.list tr.dataRow input[type="checkbox"]',
                 function () {
                     if (autoSaveTimer) clearTimeout(autoSaveTimer);
-                    // Very short debounce — if the user is clicking a header
-                    // "select all" we coalesce the 50+ individual change events
-                    // into one storage write.
+                    // Short debounce coalesces a native Select-All click that
+                    // toggles every visible checkbox at once.
                     autoSaveTimer = setTimeout(function () {
                         syncCartFromCheckboxes(changeSetId, type).catch(function (e) {
                             console.warn('cshCart auto-save failed:', e && e.message);
                         });
-                    }, 180);
+                    }, 60);
                 });
+
+        // When DataTable redraws (filter, sort, page change), re-tick any
+        // newly-visible row whose id is already in the cart. Without this
+        // the user loses visual confirmation of their prior selection after
+        // navigating the filter.
+        var $table = $('table.list');
+        $table.off('draw.cshAutoSave').on('draw.cshAutoSave', function () {
+            restoreVisibleTicksFromCart(changeSetId, type).catch(function () {});
+        });
     }
 
     async function syncCartFromCheckboxes(changeSetId, type) {
         if (!changeSetId || !type) return;
-        var checked = harvestChecked();
-        var byId = {};
-        checked.forEach(function (it) { byId[it.id] = it; });
+
+        // Partition every checkbox currently in the DOM into visible-checked
+        // and visible-unchecked. Anything NOT in this partition is a row
+        // that's been filtered out (not in DOM) and must not influence the
+        // cart decision.
+        var visibleChecked = {};   // id -> { name, fullName }
+        var visibleUnchecked = {}; // id -> true
+        findRowCheckboxes().each(function () {
+            var cb = this;
+            var id = idForRow(cb);
+            if (!id) return;
+            if (cb.checked) {
+                visibleChecked[id] = { name: nameForRow(cb), fullName: fullNameForRow(cb) };
+            } else {
+                visibleUnchecked[id] = true;
+            }
+        });
 
         var { all, cart } = await getCart(changeSetId);
         var kept = [];
         var seen = {};
         cart.items.forEach(function (it) {
-            // Items for other types pass through untouched.
+            // Items for other types untouched.
             if (it.type !== type) { kept.push(it); return; }
-            // Items already in flight or terminal: protected.
+            // In-flight / terminal items protected.
             if (it.status !== 'staged') { kept.push(it); seen[it.salesforceId] = true; return; }
-            // Staged items still represented by a ticked checkbox: keep.
-            if (it.salesforceId && byId[it.salesforceId]) {
+
+            if (visibleChecked[it.salesforceId]) {
+                // Row is visible and ticked — keep.
+                kept.push(it);
+                seen[it.salesforceId] = true;
+            } else if (visibleUnchecked[it.salesforceId]) {
+                // Row is visible and explicitly unticked — drop from cart.
+                // (Do nothing — item is intentionally omitted from `kept`.)
+            } else {
+                // Row isn't in the DOM at all (filtered / paged away). Preserve
+                // cart state; user hasn't interacted with this item in this view.
                 kept.push(it);
                 seen[it.salesforceId] = true;
             }
-            // Staged items whose box got unticked: drop.
         });
-        // Add newly-checked items that weren't in cart.
-        checked.forEach(function (it) {
-            if (seen[it.id]) return;
+
+        // Add newly-checked visible items not yet in the cart.
+        Object.keys(visibleChecked).forEach(function (id) {
+            if (seen[id]) return;
+            var info = visibleChecked[id];
             kept.push({
                 uid: uid(),
                 type: type,
-                salesforceId: it.id,
-                name: it.name,
-                fullName: it.fullName,     // carry the Metadata API canonical name if available
+                salesforceId: id,
+                name: info.name,
+                fullName: info.fullName,
                 status: 'staged',
                 addedAt: Date.now()
             });
         });
+
         cart.items = kept;
         await saveCart(all);
+    }
+
+    // After a DataTable draw (filter / sort / page), re-apply the cart's
+    // ticked state to the newly-rendered rows. Does NOT untick rows — only
+    // ticks rows that should be ticked per the cart. Doesn't trigger the
+    // change event (would cause recursive auto-save), just sets .checked.
+    async function restoreVisibleTicksFromCart(changeSetId, type) {
+        if (!changeSetId || !type) return;
+        var { cart } = await getCart(changeSetId);
+        var wanted = {};
+        cart.items.forEach(function (it) {
+            if (it.type !== type) return;
+            if (it.status === 'done') return;
+            wanted[it.salesforceId] = true;
+        });
+        findRowCheckboxes().each(function () {
+            var id = idForRow(this);
+            if (id && wanted[id] && !this.checked) this.checked = true;
+        });
     }
 
     async function restoreFromCart(changeSetId, type) {
