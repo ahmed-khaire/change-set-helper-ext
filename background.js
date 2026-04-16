@@ -43,12 +43,45 @@ chrome.storage.onChanged.addListener(function (changes, areaName) {
 const POLLTIMEOUT = 20*60*1000; // 20 minutes
 const POLLINTERVAL = 5000; //5 seconds
 
-var client_id = '3MVG97quAmFZJfVzlPO9kMeS90FBVJuF7x_gWYYRdhK9UAMWuk9WVaCMTqKAUEf2u4ge.OhGG_2vYl.EO3e.i';
+// Connected App Consumer Key. Default is the self-hosted Connected App
+// deployed to the Change Set Helper dev org (Metadata API; see
+// sfdx-connected-app/). Users can override via Options → Connected App
+// OAuth Diagnostic → "Save this client id", which writes to
+// chrome.storage.sync.cshOauthClientId. Reads below pick up overrides live.
+var CSH_DEFAULT_CLIENT_ID = '3MVG9rZjd7MXFdLiCOqMK.NJroKkk0E3Tj9yOfX3AeoqECaiXLKStAihsbnJFls44Ff70OVH4kbgYyihQZPTF';
+var cshClientId = CSH_DEFAULT_CLIENT_ID;
+
+chrome.storage.sync.get(['cshOauthClientId'], function (items) {
+    if (items && items.cshOauthClientId) {
+        cshClientId = items.cshOauthClientId;
+        console.log('Service Worker - OAuth client id: user override');
+    } else {
+        console.log('Service Worker - OAuth client id: default');
+    }
+});
+
+chrome.storage.onChanged.addListener(function (changes, area) {
+    if (area === 'sync' && changes.cshOauthClientId) {
+        cshClientId = changes.cshOauthClientId.newValue || CSH_DEFAULT_CLIENT_ID;
+        console.log('Service Worker - OAuth client id changed:',
+            changes.cshOauthClientId.newValue ? 'user override' : 'default');
+    }
+});
 
 var redirectUri = chrome.identity.getRedirectURL("sfdc");
 
-var sandbox_auth_url = "https://test.salesforce.com/services/oauth2/authorize?display=page&prompt=select_account&response_type=token&client_id=" + client_id + "&redirect_uri=" + redirectUri;
-var prod_auth_url = "https://login.salesforce.com/services/oauth2/authorize?display=page&response_type=token&prompt=select_account&client_id=" + client_id + "&redirect_uri=" + redirectUri;
+// Auth URLs are built lazily per request so the latest cshClientId is used.
+function buildAuthUrl(environment) {
+    var host = environment === 'prod'
+        ? 'https://login.salesforce.com'
+        : 'https://test.salesforce.com';
+    return host + '/services/oauth2/authorize' +
+        '?display=page' +
+        '&prompt=select_account' +
+        '&response_type=token' +
+        '&client_id=' + encodeURIComponent(cshClientId) +
+        '&redirect_uri=' + encodeURIComponent(redirectUri);
+}
 
 // Keep service worker alive during long-running operations
 let keepAliveInterval = null;
@@ -467,10 +500,7 @@ function connectToLocalOauth(sendResponse) {
 }
 
 function connectToOrg(sendResponse, environment, connType) {
-    var auth_url = sandbox_auth_url;
-    if (environment == "prod") {
-        auth_url = prod_auth_url;
-    }
+    var auth_url = buildAuthUrl(environment);
 
     chrome.identity.launchWebAuthFlow({'url': auth_url, 'interactive': true}, async function (redirect_url) {
         if (chrome.runtime.lastError) {

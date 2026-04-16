@@ -6,7 +6,9 @@
 //     BEFORE we commit to wiring the real PKCE auth fallback.
 // ---------------------------------------------------------------------------
 
-var DEFAULT_CLIENT_ID = '3MVG97quAmFZJfVzlPO9kMeS90FBVJuF7x_gWYYRdhK9UAMWuk9WVaCMTqKAUEf2u4ge.OhGG_2vYl.EO3e.i';
+// Must match CSH_DEFAULT_CLIENT_ID in background.js. When either is changed,
+// update both. User overrides go through chrome.storage.sync.cshOauthClientId.
+var DEFAULT_CLIENT_ID = '3MVG9rZjd7MXFdLiCOqMK.NJroKkk0E3Tj9yOfX3AeoqECaiXLKStAihsbnJFls44Ff70OVH4kbgYyihQZPTF';
 
 // -------------------------------------------------------------- API version
 function save_options(e) {
