@@ -1137,12 +1137,26 @@ function runEnhancedFlow() {
     $("#editPage").addClass("lowOpacity");
     $("#bodyCell").addClass("changesetloading");
 
-    // Fetch metadata FIRST
-    chrome.runtime.sendMessage({
-        "oauth": "connectToLocal",
-        "sessionId": sessionId,
-        "serverUrl": serverUrl
-    }, function (response) {
+    // Wait for the session id. On HttpOnly-on orgs the fast sync read is
+    // empty, but cshSession.ready resolves via the cookies API fallback.
+    window.cshSession.ready.then(function (sid) {
+        if (!sid) {
+            $('#csh-loading-overlay').remove();
+            window.cshToast && window.cshToast.show(
+                'Could not read your Salesforce session cookie. Ensure the Change Set Helper ' +
+                'has the "cookies" permission enabled, or uncheck Session Settings → Require HttpOnly.',
+                { type: 'error' }
+            );
+            $("#editPage").removeClass("lowOpacity");
+            $("#bodyCell").removeClass("changesetloading");
+            return;
+        }
+        // Fetch metadata FIRST
+        chrome.runtime.sendMessage({
+            "oauth": "connectToLocal",
+            "sessionId": sid,
+            "serverUrl": serverUrl
+        }, function (response) {
         // Check for Chrome runtime errors only
         if (chrome.runtime.lastError) {
             console.error('OAuth connection failed:', chrome.runtime.lastError);
@@ -1218,7 +1232,8 @@ function runEnhancedFlow() {
             $("#editPage").removeClass("lowOpacity");
             $("#bodyCell").removeClass("changesetloading");
         }
-    });
+        }); // end chrome.runtime.sendMessage connectToLocal
+    }); // end window.cshSession.ready.then
 }
 // End of runEnhancedFlow — the coverage-gap path is handled inside the
 // resolveEntityType .then() above.
@@ -1480,13 +1495,21 @@ function startMetadataLoading() {
         $("#editPage").addClass("lowOpacity");
         $("#bodyCell").addClass("changesetloading");
 
-        chrome.runtime.sendMessage({
-            "oauth": "connectToLocal",
-            "sessionId": sessionId,
-            "serverUrl": serverUrl
-        }, function (response) {
-            console.log('Fetching metadata to determine table columns for type:', selectedEntityType);
-            getMetaData(processListResults);
+        window.cshSession.ready.then(function (sid) {
+            if (!sid) {
+                console.warn('startMetadataLoading: no session id resolved');
+                $("#editPage").removeClass("lowOpacity");
+                $("#bodyCell").removeClass("changesetloading");
+                return;
+            }
+            chrome.runtime.sendMessage({
+                "oauth": "connectToLocal",
+                "sessionId": sid,
+                "serverUrl": serverUrl
+            }, function (response) {
+                console.log('Fetching metadata to determine table columns for type:', selectedEntityType);
+                getMetaData(processListResults);
+            });
         });
     } else {
         // Non-mapped entity types - setup basic table
@@ -1531,8 +1554,29 @@ $(document).ready(function () {
 
     $('input[name="cancel"]').parent().on('click','#compareorg' , oauthLogin);
 
-    if (!sessionId) {
-        $('.bDescription').append('<span style="background-color:yellow"><strong><br/> <br/>Sorry, currently for the Change Set Helper to work, please UNSET the Require HTTPOnly Attribute checkbox in Security -> Session Settings. Then logout and back in again.  </strong></span>')
+    // Only warn about HttpOnly after the cookies-API fallback has had a chance
+    // to resolve — on HttpOnly-on orgs the fast-path read fails but the
+    // background can still retrieve the session via chrome.cookies.get.
+    if (window.cshSession && window.cshSession.ready) {
+        window.cshSession.ready.then(function (sid) {
+            if (!sid) {
+                $('.bDescription').append(
+                    '<span style="background-color:yellow"><strong><br/> <br/>' +
+                    'The Change Set Helper could not read the Salesforce session cookie. ' +
+                    'Either grant the extension the "cookies" permission (usually automatic) ' +
+                    'or uncheck Setup → Session Settings → Require HttpOnly attribute.' +
+                    '</strong></span>'
+                );
+            }
+        });
+    } else if (!sessionId) {
+        $('.bDescription').append(
+            '<span style="background-color:yellow"><strong><br/> <br/>' +
+            'Sorry, currently for the Change Set Helper to work, please UNSET the Require ' +
+            'HTTPOnly Attribute checkbox in Security -&gt; Session Settings. Then logout ' +
+            'and back in again.' +
+            '</strong></span>'
+        );
     }
 });
 

@@ -1,5 +1,4 @@
-if (sessionId) {
-
+function cshRenderDeployHelper() {
 	$('.bDescription').append(`
     <div class='apexp'>
 	<div class="bPageBlock brandSecondaryBrd apexDefaultPageBlock secondaryPalette">
@@ -82,9 +81,10 @@ function testDeploy() {
 	$('#cancelDeploy').hide();
 	$('#json-renderer').jsonViewer();
 
+	var sid = (window.cshSession && window.cshSession.current && window.cshSession.current()) || sessionId;
 	var port = chrome.runtime.connect({name: "deployHandler"});
 
-	port.postMessage({'proxyFunction': "deploy", 'opts': opts, "changename": changename, "sessionId":sessionId, "serverUrl":serverUrl});
+	port.postMessage({'proxyFunction': "deploy", 'opts': opts, "changename": changename, "sessionId":sid, "serverUrl":serverUrl});
 	port.onMessage.addListener(function(msg) {
 		console.log('Listining!');
 		console.log(msg);
@@ -238,17 +238,26 @@ function quickDeploy() {
 }
 
 
-if (sessionId) {
+(function () {
+	function wireDeployHelper() {
+		cshRenderDeployHelper();
+		$("#deployLogin").click(deployLogin);
+		$("#deployTest").click(testDeploy);
+		$("#logoutLink").click(deployLogout);
+		$("#cancelDeploy").click(cancelDeploy);
+		$("#quickDeploy").click(quickDeploy);
 
-	$("#deployLogin").click(deployLogin);
-	$("#deployTest").click(testDeploy);
-	$("#logoutLink").click(deployLogout);
-	$("#cancelDeploy").click(cancelDeploy);
-	$("#quickDeploy").click(quickDeploy);
+		$("#validateSection").hide();
+		$("#quickDeploy").hide();
+		$("#cancelDeploy").hide();
+	}
 
-
-	$("#validateSection").hide();
-	$("#quickDeploy").hide();
-	$("#cancelDeploy").hide();
-}
+	if (window.cshSession && window.cshSession.ready) {
+		window.cshSession.ready.then(function (sid) {
+			if (sid) wireDeployHelper();
+		});
+	} else if (sessionId) {
+		wireDeployHelper();
+	}
+})();
 

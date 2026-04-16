@@ -98,14 +98,18 @@
   "permissions": [
     "identity",
     "storage",
-    "offscreen"
+    "offscreen",
+    "cookies"
   ],
   "host_permissions": [
     "https://*.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
     "https://*.com/p/mfpkg/AddToPackageUi*",
     "https://*.com/*tab=PackageComponents*",
     "https://*.com/changemgmt/outboundChangeSetDetailPage.apexp*",
-    "https://*.salesforce.com/services/*"
+    "https://*.salesforce.com/*",
+    "https://*.force.com/*",
+    "https://*.cloudforce.com/*",
+    "https://*.salesforce-setup.com/*"
   ],
   "background": {
     "service_worker": "background.js"

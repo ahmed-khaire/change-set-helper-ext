@@ -23,12 +23,49 @@ if (typeof window !== 'undefined' && window.jQuery && typeof window.jQuery.noCon
     }
 }
 
-// 2) Session context — unchanged from the original extension.
+// 2) Session context.
+//    Fast path: read sid from document.cookie (works when the org has
+//    HttpOnly off). Fallback path: ask the service worker to read via
+//    chrome.cookies.get, which sees HttpOnly cookies. Callers that run
+//    synchronously (the legacy `if (sessionId) { ... }` gates) use the
+//    fast-path value; anything that kicks off network work should await
+//    window.cshSession.ready to catch the async-resolved value.
 var sessionId = (function () {
     var m = document.cookie.match('sid=([^;]*)');
     return m ? m[1] : null;
 })();
 var serverUrl = window.location.protocol + '//' + window.location.host;
+
+window.cshSession = (function () {
+    function askBackgroundForCookie() {
+        return new Promise(function (resolve) {
+            if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return resolve(null);
+            chrome.runtime.sendMessage(
+                { type: 'getSessionCookie', url: window.location.href },
+                function (response) {
+                    if (chrome.runtime.lastError) {
+                        console.warn('cshSession: background fallback failed:', chrome.runtime.lastError.message);
+                        return resolve(null);
+                    }
+                    if (response && response.sid) {
+                        sessionId = response.sid; // update module-scoped var so legacy callers see it
+                        return resolve(response.sid);
+                    }
+                    resolve(null);
+                }
+            );
+        });
+    }
+
+    var readyPromise = sessionId ? Promise.resolve(sessionId) : askBackgroundForCookie();
+
+    return {
+        ready: readyPromise,
+        // Returns the current session id synchronously; may be null until
+        // ready resolves on HttpOnly-on orgs.
+        current: function () { return sessionId; }
+    };
+})();
 
 // 3) Lightweight SLDS-styled toast, used in place of alert().
 //    window.cshToast.show(message, { type: 'error' | 'warning' | 'success' | 'info', duration })

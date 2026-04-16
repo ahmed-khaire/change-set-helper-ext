@@ -17,9 +17,18 @@ var getUrlParameter = function getUrlParameter(sParam) {
 function downloadPackage() {
     setDownloading();
     console.log('Downloading package: ' + changename + ' Ensure that this package is uniquely named and contains no weird characters.')
+    window.cshSession.ready.then(function (sid) {
+    if (!sid) {
+        unSetDownloading();
+        window.cshToast && window.cshToast.show(
+            'Salesforce session not available. Please reload the page.',
+            { type: 'error' }
+        );
+        return;
+    }
     chrome.runtime.sendMessage({
             "oauth": "connectToLocal",
-            "sessionId": sessionId,
+            "sessionId": sid,
             "serverUrl": serverUrl
     }, function (response) {
         chrome.runtime.sendMessage({
@@ -47,6 +56,7 @@ function downloadPackage() {
                 }
             });
     } );
+    }); // end window.cshSession.ready.then
 }
 
 function setDownloading() {
@@ -59,9 +69,9 @@ function unSetDownloading() {
     $("#downloadButton").prop('disabled', false);
 }
 
-if (!sessionId) {
-    $('.bDescription').append('<span style="background-color:yellow"><strong><br/> <br/>Sorry, currently for the Change Set Helper to work, please UNSET the Require HTTPOnly Attribute checkbox in Security -> Session Settings. Then logout and back in again.  </strong></span>')
-} else {
+var changename;
+
+function cshRenderMetadataHelper() {
     $('.bDescription').append(`
     <div class='apexp'>
 	<div class="bPageBlock brandSecondaryBrd apexDefaultPageBlock secondaryPalette">
@@ -73,16 +83,38 @@ if (!sessionId) {
 	<td class="pbTitle"><h2 class="mainTitle">Metadata Helper</h2></td>
 	<td class="pbButton">
         <input id="downloadButton" value="Download metadata" class="btn" name="downloadall" title="Download all items in changeset for use in ant" type="button" />
-	&nbsp; Download metadata as zip package. 
+	&nbsp; Download metadata as zip package.
 	</td>
 	</tr>
 	</tbody>
 	</table>
 	</div>  `
-    )
-
+    );
     $("#downloadButton").click(downloadPackage);
-    var changename = $('h2.pageDescription').text();
+    changename = $('h2.pageDescription').text();
 }
+
+(function () {
+    function renderFallbackWarning() {
+        $('.bDescription').append(
+            '<span style="background-color:yellow"><strong><br/> <br/>' +
+            'The Change Set Helper could not read the Salesforce session cookie. ' +
+            'Either grant the extension the "cookies" permission (usually automatic) ' +
+            'or uncheck Setup → Session Settings → Require HttpOnly attribute.' +
+            '</strong></span>'
+        );
+    }
+
+    if (window.cshSession && window.cshSession.ready) {
+        window.cshSession.ready.then(function (sid) {
+            if (sid) cshRenderMetadataHelper();
+            else renderFallbackWarning();
+        });
+    } else if (sessionId) {
+        cshRenderMetadataHelper();
+    } else {
+        renderFallbackWarning();
+    }
+})();
 
 

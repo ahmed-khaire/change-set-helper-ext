@@ -243,6 +243,37 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.type == "getSessionCookie") {
+        // HttpOnly-cookie fallback: content scripts can't read the sid cookie
+        // directly when the org has "Require HttpOnly attribute" enabled, but
+        // the cookies API can. We search the most common Salesforce cookie
+        // stores and return the first hit. Falls back silently to null.
+        (async function () {
+            try {
+                var url = request.url || (sender && sender.tab && sender.tab.url);
+                if (!url) {
+                    sendResponse({ sid: null, reason: 'no-url' });
+                    return;
+                }
+                var storeId = sender && sender.tab && sender.tab.cookieStoreId;
+                var getOpts = storeId
+                    ? { url: url, name: 'sid', storeId: storeId }
+                    : { url: url, name: 'sid' };
+                chrome.cookies.get(getOpts, function (cookie) {
+                    if (chrome.runtime.lastError || !cookie || !cookie.value) {
+                        sendResponse({ sid: null, reason: 'not-found' });
+                        return;
+                    }
+                    sendResponse({ sid: cookie.value });
+                });
+            } catch (err) {
+                console.error('getSessionCookie failed:', err);
+                sendResponse({ sid: null, reason: 'exception', error: err.message });
+            }
+        })();
+        return true;
+    }
+
     if (request.oauth == "connectToDeploy") {
         connectToDeploy(sendResponse, request.environment);
         return true;

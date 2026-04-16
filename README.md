@@ -135,7 +135,9 @@ From the Outbound Change Set Detail page:
 
 ### Salesforce Configuration
 
-**Important**: For the extension to access session IDs, you must:
+**No longer required as of v3.0.3.** The extension reads the Salesforce session via the Chrome `cookies` permission, which works whether or not **Require HttpOnly attribute** is enabled in Session Settings. If you previously unchecked it for this extension and don't need it off for any other reason, you can safely re-enable it.
+
+If your org blocks the extension from the `cookies` permission, the old fallback still works:
 
 1. Go to **Setup** → **Session Settings**
 2. Find **"Require HttpOnly attribute"**
