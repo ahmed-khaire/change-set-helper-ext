@@ -83,6 +83,153 @@ function buildAuthUrl(environment) {
         '&redirect_uri=' + encodeURIComponent(redirectUri);
 }
 
+// ---------------------------------------------------------------------------
+// OAuth code + PKCE helpers — Phase 4 refresh-token auth fallback.
+//
+// Data path: when the content script's cshSession.ready cannot obtain a sid
+// via document.cookie or chrome.cookies.get, it asks the service worker for
+// an OAuth access token. We look up a stored {access_token, refresh_token}
+// per host in chrome.storage.local, refresh if stale, and either return the
+// token or a 'needs-login' signal so the content script can show a
+// "Sign in via OAuth" button which triggers cshAuthLogin.
+// ---------------------------------------------------------------------------
+
+var TOKEN_STORE_KEY = 'cshOauthTokens';
+var TOKEN_STALE_MS = 90 * 60 * 1000; // 90 min — Salesforce access tokens usually live 1-2h
+
+function cshB64Url(bytes) {
+    var str = '';
+    for (var i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+    return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function cshGeneratePkce() {
+    var rand = new Uint8Array(32);
+    crypto.getRandomValues(rand);
+    var verifier = cshB64Url(rand);
+    var hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    var challenge = cshB64Url(new Uint8Array(hash));
+    return { verifier: verifier, challenge: challenge };
+}
+
+function cshReadTokens() {
+    return new Promise(function (resolve) {
+        chrome.storage.local.get([TOKEN_STORE_KEY], function (items) {
+            resolve((items && items[TOKEN_STORE_KEY]) || {});
+        });
+    });
+}
+
+function cshWriteTokens(all) {
+    return new Promise(function (resolve) {
+        chrome.storage.local.set({ [TOKEN_STORE_KEY]: all }, function () { resolve(); });
+    });
+}
+
+async function cshGetTokenForHost(host) {
+    var all = await cshReadTokens();
+    return all[host] || null;
+}
+
+async function cshSaveTokenForHost(host, token) {
+    var all = await cshReadTokens();
+    all[host] = Object.assign({}, token, { host: host, savedAt: Date.now() });
+    await cshWriteTokens(all);
+}
+
+async function cshClearTokenForHost(host) {
+    var all = await cshReadTokens();
+    delete all[host];
+    await cshWriteTokens(all);
+}
+
+function cshHostFromUrl(urlStr) {
+    try {
+        var u = new URL(urlStr);
+        return u.protocol + '//' + u.host;
+    } catch (_) { return null; }
+}
+
+async function cshExchangeCodeForToken(host, code, codeVerifier) {
+    var body = new URLSearchParams();
+    body.append('grant_type', 'authorization_code');
+    body.append('code', code);
+    body.append('redirect_uri', redirectUri);
+    body.append('client_id', cshClientId);
+    body.append('code_verifier', codeVerifier);
+    var resp = await fetch(host + '/services/oauth2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+    });
+    var json = await resp.json();
+    if (!resp.ok || !json.access_token) {
+        throw new Error(json.error_description || json.error || 'Token exchange failed (HTTP ' + resp.status + ')');
+    }
+    return {
+        accessToken: json.access_token,
+        refreshToken: json.refresh_token || null,
+        instanceUrl: json.instance_url || host,
+        issuedAt: parseInt(json.issued_at, 10) || Date.now(),
+        scope: json.scope || ''
+    };
+}
+
+async function cshRefreshAccessToken(host, refreshToken) {
+    var body = new URLSearchParams();
+    body.append('grant_type', 'refresh_token');
+    body.append('client_id', cshClientId);
+    body.append('refresh_token', refreshToken);
+    var resp = await fetch(host + '/services/oauth2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+    });
+    var json = await resp.json();
+    if (!resp.ok || !json.access_token) {
+        throw new Error(json.error_description || json.error || 'Refresh failed (HTTP ' + resp.status + ')');
+    }
+    return {
+        accessToken: json.access_token,
+        refreshToken: json.refresh_token || refreshToken, // Salesforce may or may not rotate
+        instanceUrl: json.instance_url || host,
+        issuedAt: parseInt(json.issued_at, 10) || Date.now(),
+        scope: json.scope || ''
+    };
+}
+
+async function cshRunOauthLogin(host) {
+    var pkce = await cshGeneratePkce();
+    var state = Math.random().toString(36).slice(2);
+    var authUrl = host + '/services/oauth2/authorize' +
+        '?response_type=code' +
+        '&client_id=' + encodeURIComponent(cshClientId) +
+        '&redirect_uri=' + encodeURIComponent(redirectUri) +
+        '&scope=' + encodeURIComponent('api refresh_token id') +
+        '&code_challenge=' + encodeURIComponent(pkce.challenge) +
+        '&code_challenge_method=S256' +
+        '&state=' + state;
+    var redirectUrl = await new Promise(function (resolve, reject) {
+        chrome.identity.launchWebAuthFlow(
+            { url: authUrl, interactive: true },
+            function (url) {
+                if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                if (!url) return reject(new Error('No redirect URL returned'));
+                resolve(url);
+            }
+        );
+    });
+    var u = new URL(redirectUrl);
+    var params = new URLSearchParams(u.search);
+    if (params.get('error')) {
+        throw new Error(params.get('error') + (params.get('error_description') ? ': ' + params.get('error_description') : ''));
+    }
+    var code = params.get('code');
+    if (!code) throw new Error('No authorization code in redirect');
+    if (params.get('state') !== state) throw new Error('OAuth state mismatch — aborting');
+    return await cshExchangeCodeForToken(host, code, pkce.verifier);
+}
+
 // Keep service worker alive during long-running operations
 let keepAliveInterval = null;
 
@@ -276,6 +423,85 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.type == "cshAuthLogin") {
+        var loginHost = request.host || cshHostFromUrl(sender && sender.tab && sender.tab.url);
+        if (!loginHost) {
+            sendResponse({ ok: false, error: 'Unknown target host for OAuth login' });
+            return false;
+        }
+        cshRunOauthLogin(loginHost)
+            .then(function (tokens) {
+                return cshSaveTokenForHost(loginHost, tokens).then(function () {
+                    sendResponse({
+                        ok: true,
+                        accessToken: tokens.accessToken,
+                        instanceUrl: tokens.instanceUrl,
+                        hasRefreshToken: !!tokens.refreshToken,
+                        scope: tokens.scope
+                    });
+                });
+            })
+            .catch(function (err) {
+                console.error('cshAuthLogin failed:', err);
+                sendResponse({ ok: false, error: err.message });
+            });
+        return true;
+    }
+
+    if (request.type == "cshAuthGetToken") {
+        var getHost = request.host || cshHostFromUrl(sender && sender.tab && sender.tab.url);
+        if (!getHost) {
+            sendResponse({ ok: false, reason: 'no-host' });
+            return false;
+        }
+        (async function () {
+            try {
+                var stored = await cshGetTokenForHost(getHost);
+                if (!stored) { sendResponse({ ok: false, reason: 'no-token' }); return; }
+                var age = Date.now() - (stored.issuedAt || stored.savedAt || 0);
+                // If we have a refresh token and the access token is stale
+                // (or the caller explicitly asked for a fresh one), refresh.
+                if (stored.refreshToken && (age > TOKEN_STALE_MS || request.forceRefresh)) {
+                    try {
+                        var refreshed = await cshRefreshAccessToken(getHost, stored.refreshToken);
+                        await cshSaveTokenForHost(getHost, refreshed);
+                        sendResponse({
+                            ok: true,
+                            accessToken: refreshed.accessToken,
+                            instanceUrl: refreshed.instanceUrl,
+                            refreshed: true
+                        });
+                        return;
+                    } catch (e) {
+                        console.warn('cshAuthGetToken: refresh failed, returning stored token', e.message);
+                        // Fall through to the stored (possibly stale) token;
+                        // the caller will surface "please sign in again" if SF 401s.
+                    }
+                }
+                sendResponse({
+                    ok: true,
+                    accessToken: stored.accessToken,
+                    instanceUrl: stored.instanceUrl,
+                    refreshed: false,
+                    ageMs: age
+                });
+            } catch (err) {
+                sendResponse({ ok: false, error: err.message });
+            }
+        })();
+        return true;
+    }
+
+    if (request.type == "cshAuthLogout") {
+        var logoutHost = request.host || cshHostFromUrl(sender && sender.tab && sender.tab.url);
+        if (!logoutHost) {
+            sendResponse({ ok: false, reason: 'no-host' });
+            return false;
+        }
+        cshClearTokenForHost(logoutHost).then(function () { sendResponse({ ok: true }); });
+        return true;
+    }
+
     if (request.type == "cshCartSubmit") {
         // Cart worker batch submission: POST to the native Add-Components
         // endpoint using the scraped form shape, with our chosen ids replacing
@@ -369,7 +595,13 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 
     if (request.oauth == "connectToLocal") {
-        setLocalConn(sendResponse, request.sessionId, request.serverUrl);
+        setLocalConn(
+            sendResponse,
+            request.sessionId,
+            request.serverUrl,
+            request.authMode || 'sid',
+            request.instanceUrl || request.serverUrl
+        );
         return true;
     }
 
@@ -477,12 +709,15 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 });
 
-async function setLocalConn(sendResponse, sessionId, serverUrl) {
+async function setLocalConn(sendResponse, authValue, serverUrl, authMode, instanceUrl) {
     try {
         await sendToOffscreen({
             action: 'setLocalConn',
-            sessionId: sessionId,
-            serverUrl: serverUrl
+            sessionId: authValue,       // kept for legacy — offscreen decides by authMode
+            authValue: authValue,
+            authMode: authMode || 'sid',
+            serverUrl: serverUrl,
+            instanceUrl: instanceUrl || serverUrl
         });
         sendResponse();
     } catch (err) {

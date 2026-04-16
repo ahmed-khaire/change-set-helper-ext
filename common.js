@@ -37,6 +37,19 @@ var sessionId = (function () {
 var serverUrl = window.location.protocol + '//' + window.location.host;
 
 window.cshSession = (function () {
+    // Auth ladder:
+    //   1. document.cookie    (fast path, works when HttpOnly is off)
+    //   2. chrome.cookies.get (Phase 2.4, works even with HttpOnly on)
+    //   3. OAuth access token (Phase 4, runs when cookies are unavailable)
+    // Every Promise step resolves to an auth value (sid OR accessToken) or
+    // null when nothing is usable; final `null` triggers the content script's
+    // "Sign in via OAuth" banner.
+    var state = {
+        mode: sessionId ? 'sid' : null,
+        instanceUrl: serverUrl,
+        oauthRefreshed: false
+    };
+
     function askBackgroundForCookie() {
         return new Promise(function (resolve) {
             if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return resolve(null);
@@ -48,7 +61,8 @@ window.cshSession = (function () {
                         return resolve(null);
                     }
                     if (response && response.sid) {
-                        sessionId = response.sid; // update module-scoped var so legacy callers see it
+                        sessionId = response.sid;
+                        state.mode = 'sid';
                         return resolve(response.sid);
                     }
                     resolve(null);
@@ -57,13 +71,92 @@ window.cshSession = (function () {
         });
     }
 
-    var readyPromise = sessionId ? Promise.resolve(sessionId) : askBackgroundForCookie();
+    function askBackgroundForOauthToken() {
+        return new Promise(function (resolve) {
+            if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return resolve(null);
+            chrome.runtime.sendMessage(
+                { type: 'cshAuthGetToken', host: serverUrl },
+                function (response) {
+                    if (chrome.runtime.lastError) {
+                        console.warn('cshSession: OAuth fallback errored:', chrome.runtime.lastError.message);
+                        return resolve(null);
+                    }
+                    if (response && response.ok && response.accessToken) {
+                        sessionId = response.accessToken;
+                        state.mode = 'oauth';
+                        state.instanceUrl = response.instanceUrl || serverUrl;
+                        state.oauthRefreshed = !!response.refreshed;
+                        return resolve(response.accessToken);
+                    }
+                    resolve(null);
+                }
+            );
+        });
+    }
+
+    var readyPromise = sessionId
+        ? Promise.resolve(sessionId)
+        : askBackgroundForCookie().then(function (cookieSid) {
+            if (cookieSid) return cookieSid;
+            return askBackgroundForOauthToken();
+        });
 
     return {
         ready: readyPromise,
-        // Returns the current session id synchronously; may be null until
-        // ready resolves on HttpOnly-on orgs.
-        current: function () { return sessionId; }
+        // Returns the current session value synchronously; may be null until
+        // ready resolves. Works for sid and OAuth access-token modes alike.
+        current: function () { return sessionId; },
+        // 'sid' | 'oauth' | null — tells downstream connect() calls which
+        // JSforce configuration to use (sessionId+serverUrl vs accessToken+instanceUrl).
+        mode: function () { return state.mode; },
+        instanceUrl: function () { return state.instanceUrl; }
+    };
+})();
+
+// Phase 4: cshAuth — thin wrapper over the service worker's OAuth helpers.
+//   login()    -> launches PKCE flow, stores {accessToken, refreshToken}
+//   logout()   -> clears stored tokens for this host
+//   getAccessToken({forceRefresh}) -> returns fresh access token (may refresh)
+// All round-trip to chrome.runtime.sendMessage so interactive browser
+// auth (chrome.identity.launchWebAuthFlow) happens in the correct context.
+window.cshAuth = (function () {
+    function callBackground(payload) {
+        return new Promise(function (resolve) {
+            if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return resolve({ ok: false, error: 'No chrome.runtime' });
+            chrome.runtime.sendMessage(payload, function (response) {
+                if (chrome.runtime.lastError) return resolve({ ok: false, error: chrome.runtime.lastError.message });
+                resolve(response || { ok: false, error: 'No response' });
+            });
+        });
+    }
+
+    async function login() {
+        var resp = await callBackground({ type: 'cshAuthLogin', host: serverUrl });
+        if (resp && resp.ok && resp.accessToken) {
+            sessionId = resp.accessToken; // propagate so legacy readers see it
+        }
+        return resp;
+    }
+
+    async function logout() {
+        var resp = await callBackground({ type: 'cshAuthLogout', host: serverUrl });
+        return resp;
+    }
+
+    async function getAccessToken(opts) {
+        opts = opts || {};
+        var resp = await callBackground({
+            type: 'cshAuthGetToken',
+            host: serverUrl,
+            forceRefresh: !!opts.forceRefresh
+        });
+        return resp;
+    }
+
+    return {
+        login: login,
+        logout: logout,
+        getAccessToken: getAccessToken
     };
 })();
 

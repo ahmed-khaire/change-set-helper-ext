@@ -100,7 +100,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     switch(request.action) {
         case 'setLocalConn':
-            setLocalConn(request.sessionId, request.serverUrl);
+            setLocalConn(
+                request.authValue || request.sessionId,
+                request.serverUrl,
+                request.authMode || 'sid',
+                request.instanceUrl || request.serverUrl
+            );
             sendResponse({success: true});
             break;
 
@@ -170,14 +175,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 });
 
-function setLocalConn(sessionId, serverUrl) {
-    connLocal.conn = new jsforce.Connection({
-        'serverUrl': serverUrl,
-        'sessionId': sessionId,
-        'version': CSH_APIVERSION
-    });
+function setLocalConn(authValue, serverUrl, authMode, instanceUrl) {
+    // Two accepted auth shapes:
+    //   authMode = 'sid'   -> serverUrl + sessionId  (from browser cookie)
+    //   authMode = 'oauth' -> instanceUrl + accessToken  (from PKCE login)
+    var opts = { 'version': CSH_APIVERSION };
+    if (authMode === 'oauth') {
+        opts.instanceUrl = instanceUrl || serverUrl;
+        opts.accessToken = authValue;
+    } else {
+        opts.serverUrl = serverUrl;
+        opts.sessionId = authValue;
+    }
+    connLocal.conn = new jsforce.Connection(opts);
     connLocal.conn.metadata.pollTimeout = POLLTIMEOUT;
     connLocal.conn.metadata.pollInterval = POLLINTERVAL;
+    console.log('setLocalConn: authMode =', authMode || 'sid', ', host =', (opts.instanceUrl || opts.serverUrl));
 }
 
 async function connectToOrg(environment, connType, instanceUrl, accessToken) {

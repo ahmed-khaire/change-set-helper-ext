@@ -1151,11 +1151,15 @@ function runEnhancedFlow() {
             $("#bodyCell").removeClass("changesetloading");
             return;
         }
-        // Fetch metadata FIRST
+        // Fetch metadata FIRST. Pass the chosen auth mode so offscreen uses
+        // the right jsforce.Connection shape (sessionId+serverUrl vs
+        // accessToken+instanceUrl).
         chrome.runtime.sendMessage({
             "oauth": "connectToLocal",
             "sessionId": sid,
-            "serverUrl": serverUrl
+            "serverUrl": serverUrl,
+            "authMode": window.cshSession.mode ? window.cshSession.mode() : 'sid',
+            "instanceUrl": window.cshSession.instanceUrl ? window.cshSession.instanceUrl() : serverUrl
         }, function (response) {
         // Check for Chrome runtime errors only
         if (chrome.runtime.lastError) {
@@ -1505,7 +1509,9 @@ function startMetadataLoading() {
             chrome.runtime.sendMessage({
                 "oauth": "connectToLocal",
                 "sessionId": sid,
-                "serverUrl": serverUrl
+                "serverUrl": serverUrl,
+                "authMode": window.cshSession.mode ? window.cshSession.mode() : 'sid',
+                "instanceUrl": window.cshSession.instanceUrl ? window.cshSession.instanceUrl() : serverUrl
             }, function (response) {
                 console.log('Fetching metadata to determine table columns for type:', selectedEntityType);
                 getMetaData(processListResults);
@@ -1554,20 +1560,44 @@ $(document).ready(function () {
 
     $('input[name="cancel"]').parent().on('click','#compareorg' , oauthLogin);
 
-    // Only warn about HttpOnly after the cookies-API fallback has had a chance
-    // to resolve — on HttpOnly-on orgs the fast-path read fails but the
-    // background can still retrieve the session via chrome.cookies.get.
+    // Three-stage auth ladder: cookie → chrome.cookies → OAuth. If all three
+    // fail, show an actionable Sign In button that triggers the OAuth PKCE
+    // flow in a popup. Success reloads the page so the new token is picked
+    // up by cshSession.ready on next init.
     if (window.cshSession && window.cshSession.ready) {
         window.cshSession.ready.then(function (sid) {
-            if (!sid) {
-                $('.bDescription').append(
-                    '<span style="background-color:yellow"><strong><br/> <br/>' +
-                    'The Change Set Helper could not read the Salesforce session cookie. ' +
-                    'Either grant the extension the "cookies" permission (usually automatic) ' +
-                    'or uncheck Setup → Session Settings → Require HttpOnly attribute.' +
-                    '</strong></span>'
-                );
-            }
+            if (sid) return;
+            var banner = $(
+                '<div id="csh-signin-banner" style="background:#fff5d6;border:1px solid #d1c083;border-radius:4px;padding:12px 14px;margin:10px 0;display:flex;gap:10px;align-items:center;">' +
+                '<div style="flex:1 1 auto;">' +
+                  '<strong>Change Set Helper needs to sign in.</strong><br/>' +
+                  'Your Salesforce session cookie is not readable from this browser. ' +
+                  'Sign in via OAuth to let the extension call the Metadata API on your behalf. ' +
+                  'You can alternatively uncheck Setup → Session Settings → Require HttpOnly attribute.' +
+                '</div>' +
+                '<button id="csh-signin-btn" style="flex:0 0 auto;padding:8px 14px;background:#0176d3;color:#fff;border:0;border-radius:3px;cursor:pointer;font:inherit;font-weight:600;">Sign in via OAuth</button>' +
+                '</div>'
+            );
+            $('.bDescription').append(banner);
+            banner.find('#csh-signin-btn').on('click', async function () {
+                var btn = $(this);
+                btn.prop('disabled', true).text('Opening popup…');
+                var resp = await window.cshAuth.login();
+                if (resp && resp.ok && resp.accessToken) {
+                    window.cshToast && window.cshToast.show(
+                        'Signed in. Reloading to pick up the new session…',
+                        { type: 'success', duration: 2000 }
+                    );
+                    setTimeout(function () { location.reload(); }, 600);
+                } else {
+                    btn.prop('disabled', false).text('Sign in via OAuth');
+                    window.cshToast && window.cshToast.show(
+                        'Sign in failed: ' + ((resp && resp.error) || 'unknown error') +
+                        '. Use Options → OAuth Diagnostic to troubleshoot.',
+                        { type: 'error' }
+                    );
+                }
+            });
         });
     } else if (!sessionId) {
         $('.bDescription').append(

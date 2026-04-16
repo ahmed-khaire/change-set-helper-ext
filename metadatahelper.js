@@ -96,13 +96,30 @@ function cshRenderMetadataHelper() {
 
 (function () {
     function renderFallbackWarning() {
-        $('.bDescription').append(
-            '<span style="background-color:yellow"><strong><br/> <br/>' +
-            'The Change Set Helper could not read the Salesforce session cookie. ' +
-            'Either grant the extension the "cookies" permission (usually automatic) ' +
-            'or uncheck Setup → Session Settings → Require HttpOnly attribute.' +
-            '</strong></span>'
+        var banner = $(
+            '<div id="csh-signin-banner-md" style="background:#fff5d6;border:1px solid #d1c083;border-radius:4px;padding:12px 14px;margin:10px 0;display:flex;gap:10px;align-items:center;">' +
+            '<div style="flex:1 1 auto;">' +
+              '<strong>Change Set Helper needs to sign in.</strong><br/>' +
+              'Your Salesforce session cookie is not readable. Sign in via OAuth to enable the metadata download.' +
+            '</div>' +
+            '<button id="csh-signin-btn-md" style="flex:0 0 auto;padding:8px 14px;background:#0176d3;color:#fff;border:0;border-radius:3px;cursor:pointer;font:inherit;font-weight:600;">Sign in via OAuth</button>' +
+            '</div>'
         );
+        $('.bDescription').append(banner);
+        banner.find('#csh-signin-btn-md').on('click', async function () {
+            var btn = $(this);
+            btn.prop('disabled', true).text('Opening popup…');
+            var resp = window.cshAuth ? await window.cshAuth.login() : null;
+            if (resp && resp.ok && resp.accessToken) {
+                setTimeout(function () { location.reload(); }, 600);
+            } else {
+                btn.prop('disabled', false).text('Sign in via OAuth');
+                window.cshToast && window.cshToast.show(
+                    'Sign in failed: ' + ((resp && resp.error) || 'unknown error'),
+                    { type: 'error' }
+                );
+            }
+        });
     }
 
     if (window.cshSession && window.cshSession.ready) {
