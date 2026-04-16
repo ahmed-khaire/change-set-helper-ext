@@ -1,0 +1,102 @@
+name: Release Chrome Extension
+
+# Triggers:
+#   1. Pushing a tag of the form vX.Y.Z — the canonical release path.
+#   2. Manually via the Actions tab (workflow_dispatch) — useful for testing
+#      the packaging without publishing; the run still creates the release,
+#      so prefer tag-push in practice.
+#
+# The workflow refuses to proceed unless manifest.json's version matches the
+# tag, so we can't accidentally ship a mislabelled zip.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to package (e.g. 3.0.3). Tag v<version> must already exist, or will be created from the current branch.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version and tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            version="${{ github.event.inputs.version }}"
+            tag="v${version}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=${version}, tag=${tag}"
+
+      - name: Verify manifest version matches tag
+        run: |
+          set -euo pipefail
+          manifest_version=$(python3 -c "import json,sys;print(json.load(open('manifest.json'))['version'])")
+          expected="${{ steps.ver.outputs.version }}"
+          if [[ "${manifest_version}" != "${expected}" ]]; then
+            echo "::error::manifest.json version is '${manifest_version}' but the release is '${expected}'. Bump manifest.json before tagging."
+            exit 1
+          fi
+          echo "manifest.json version matches: ${manifest_version}"
+
+      - name: Package extension (whitelist only what ships)
+        id: pkg
+        run: |
+          set -euo pipefail
+          # Whitelist. Anything outside this list (screenshots, marketing PNGs,
+          # IDE config, *.md, .git, .github) stays out of the Chrome Web Store
+          # zip so reviewers don't see dev cruft.
+          zipname="change-set-helper-ext-${{ steps.ver.outputs.tag }}.zip"
+          zip -r "${zipname}" \
+            manifest.json \
+            background.js \
+            offscreen.html offscreen.js \
+            changeset.js changeview.js \
+            deployhelper.js metadatahelper.js \
+            common.js \
+            compare.js compare.html \
+            options.html options.js \
+            popup.html \
+            changeset.css \
+            lib \
+            brainbulb128.png brainbulb48.png braincloudsmall.png \
+            loading.gif
+          ls -lh "${zipname}"
+          echo "zipname=${zipname}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          zipname="${{ steps.pkg.outputs.zipname }}"
+          # If triggered via workflow_dispatch, the tag may not exist yet.
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            git tag "${tag}"
+            git push origin "${tag}"
+          fi
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${zipname}" --clobber
+          else
+            gh release create "${tag}" "${zipname}" \
+              --title "${tag}" \
+              --generate-notes
+          fi
