@@ -761,7 +761,7 @@ function createDataTable() {
         // Ensure clear filters + CSV button exist
         if ($('.clearFilters').length === 0) {
             console.log('createDataTable: Adding Clear Filters button');
-            $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo($('div.rolodex').first());
+            $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
             $(".clearFilters").click(clearFilters);
         }
         if ($('.cshExportCsv').length === 0) {
@@ -863,7 +863,7 @@ function createDataTable() {
             initComplete: tableInitComplete
         });
 
-        $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo($('div.rolodex').first());
+        $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
         $(".clearFilters").click(clearFilters);
         cshInstallToolbarActions();
         cshInstallModifiedByFilter();
@@ -901,7 +901,7 @@ function cshInstallToolbarActions() {
           '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
         '</span>'
     );
-    $group.prependTo($('div.rolodex').first());
+    $group.prependTo('div.rolodex');
 
     $group.find('.cshExportCsv').on('click', cshExportTable);
     $group.find('.cshExportPkg').on('click', function () {
@@ -1908,7 +1908,7 @@ function startMetadataLoading() {
         }
     );
 
-    $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo($('div.rolodex').first());
+    $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
     $('#editPage').append('<input type="hidden" name="rowsperpage" value="1000" /> ');
 
     var gotoloc2 = "'/" + $("#id").val() + "?tab=PackageComponents&rowsperpage=1000'";
