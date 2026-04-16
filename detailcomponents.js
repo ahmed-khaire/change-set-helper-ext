@@ -442,6 +442,119 @@
     // -----------------------------------------------------------------------
     // Bulk remove worker — sequential deletes with progress modal.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Tooling API bulk remove.
+    //
+    // Salesforce's Tooling API exposes every change-set member as a
+    // `PackageMember` record linking the OutboundChangeSet's underlying
+    // MetadataPackage (0A2 / 033 id) to the component (SubjectId = cid).
+    // DELETE on that PackageMember removes the component from the change
+    // set cleanly — no A4J dance, no synthetic click, no page navigation.
+    //
+    // Flow:
+    //   1. Scrape the MetadataPackage id (033-prefix) from any Add-link in
+    //      the page; we fall back to the URL's id= param (0A2-prefix) if
+    //      nothing else is available.
+    //   2. Query PackageMember for Id + SubjectId WHERE Package = <id>
+    //      AND SubjectId IN (<selected cids>).
+    //   3. Parallelise DELETE calls (5 at a time) for speed on big
+    //      selections.
+    //   4. On success, reload the page so Salesforce's own UI reflects the
+    //      new state.
+    // -----------------------------------------------------------------------
+    var TOOLING_PARALLEL = 5;
+
+    function currentApiVersion() {
+        if (window.cshApiVersion && window.cshApiVersion.resolved) return window.cshApiVersion.resolved;
+        if (window.cshApiVersion && window.cshApiVersion.fallback) return window.cshApiVersion.fallback;
+        return '62.0';
+    }
+
+    function currentSession() {
+        if (window.cshSession && typeof window.cshSession.current === 'function') {
+            return window.cshSession.current();
+        }
+        // Fallback to the document cookie directly.
+        var m = document.cookie.match('sid=([^;]*)');
+        return m ? m[1] : null;
+    }
+
+    // Returns the 033-prefix package id (or the 0A2-prefix change-set id as
+    // a fallback), whichever we can find on the rendered page. Tooling API's
+    // PackageMember.Package field accepts the underlying MetadataPackage id,
+    // which Salesforce lists in Add-link hrefs / onclicks.
+    function findPackageId() {
+        var scanned = new Set();
+        var candidates = document.querySelectorAll('a[href], a[onclick], input[onclick]');
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var text = (el.getAttribute('href') || '') + ' ' + (el.getAttribute('onclick') || '');
+            var matches = text.match(/(?:^|[?&])id=([0-9a-zA-Z]{15,18})/g) || [];
+            for (var j = 0; j < matches.length; j++) {
+                var m = matches[j].match(/id=([0-9a-zA-Z]{15,18})/);
+                if (m && m[1]) scanned.add(m[1]);
+            }
+        }
+        // Prefer 033-prefix MetadataPackage id; fall back to 0A2-prefix if that's all there is.
+        var ids = Array.from(scanned);
+        var pkg033 = ids.find(function (id) { return id.indexOf('033') === 0; });
+        if (pkg033) return pkg033;
+        var pkg0A2 = ids.find(function (id) { return id.indexOf('0A2') === 0; });
+        if (pkg0A2) return pkg0A2;
+        // Last-resort: the URL id= param (usually 0A2).
+        var u = new URL(location.href);
+        return u.searchParams.get('id');
+    }
+
+    async function toolingQueryPackageMembers(packageId, subjectIds) {
+        var session = currentSession();
+        if (!session) throw new Error('no Salesforce session cookie (is HttpOnly blocking?)');
+        var version = currentApiVersion();
+        var origin = location.origin;
+        // Query in chunks to avoid hitting the URL-length limit on big
+        // selections (SOQL IN (...) can get long).
+        var out = {};
+        var CHUNK = 150;
+        for (var i = 0; i < subjectIds.length; i += CHUNK) {
+            var chunk = subjectIds.slice(i, i + CHUNK);
+            var soql = "SELECT Id, SubjectId FROM PackageMember WHERE Package = '" + packageId +
+                       "' AND SubjectId IN ('" + chunk.join("','") + "')";
+            var url = origin + '/services/data/v' + version + '/tooling/query/?q=' + encodeURIComponent(soql);
+            var res = await fetch(url, {
+                method: 'GET',
+                credentials: 'include',
+                headers: {
+                    'Authorization': 'Bearer ' + session,
+                    'Accept': 'application/json'
+                }
+            });
+            if (!res.ok) {
+                var text = await res.text().catch(function () { return ''; });
+                throw new Error('PackageMember query failed (HTTP ' + res.status + '): ' + text.slice(0, 240));
+            }
+            var json = await res.json();
+            (json.records || []).forEach(function (r) { out[r.SubjectId] = r.Id; });
+        }
+        return out;
+    }
+
+    async function toolingDeletePackageMember(memberId) {
+        var session = currentSession();
+        if (!session) throw new Error('no Salesforce session');
+        var version = currentApiVersion();
+        var url = location.origin + '/services/data/v' + version + '/tooling/sobjects/PackageMember/' + memberId;
+        var res = await fetch(url, {
+            method: 'DELETE',
+            credentials: 'include',
+            headers: { 'Authorization': 'Bearer ' + session }
+        });
+        if (!res.ok) {
+            var text = await res.text().catch(function () { return ''; });
+            throw new Error('HTTP ' + res.status + ' ' + text.slice(0, 200));
+        }
+        return true;
+    }
+
     async function handleRemoveSelected() {
         var items = Array.from(selectedItems.values());
         if (items.length === 0) return;
@@ -449,87 +562,83 @@
 
         bulkCancelled = false;
         showProgressModal(items.length);
-        console.log('[CSH] bulk remove starting for', items.length, 'component(s)');
+        console.log('[CSH] bulk remove starting via Tooling API for', items.length, 'component(s)');
 
-        var done = 0, failed = 0;
-        for (var i = 0; i < items.length; i++) {
-            if (bulkCancelled) break;
-            var item = items[i];
+        var packageId = findPackageId();
+        if (!packageId) {
+            appendLog('✗ Could not determine change-set package id from the page.', 'fail');
+            finishProgressModal(0, items.length);
+            return;
+        }
+        console.log('[CSH] packageId =', packageId);
 
-            try {
-                if (!item.cid) throw new Error('No component ID');
-                // Re-resolve the current linkId from the DOM in case A4J has
-                // re-rendered. If the row isn't in the current view (e.g. user
-                // paginated past it), surface a clear error rather than
-                // timing out — Salesforce's removeLink id is page-scoped.
-                var freshLinkId = findLinkIdForCid(item.cid) || item.linkId;
-                if (!freshLinkId) {
-                    throw new Error('Not on current page — navigate to the page containing ' + item.name + ' and retry');
-                }
-
-                console.log('[CSH] remove', item.cid, '(' + item.name + ') via', freshLinkId);
-                await requestDeleteByClick(freshLinkId);
-                // Fixed delay so A4J has time to dispatch its AJAX request and
-                // start updating the DOM. 1s is conservative; bumps to 1.5s on
-                // the first delete (cold A4J state) when nothing's happened yet.
-                await delay(i === 0 ? 1500 : 1000);
-
-                // Remove from selection map (one-shot — if Salesforce rejects,
-                // the user will see it didn't disappear visually).
-                selectedItems.delete(item.cid);
-                done++;
-                appendLog('✓ ' + item.name, 'ok');
-            } catch (err) {
-                failed++;
-                appendLog('✗ ' + item.name + ' — ' + err.message, 'fail');
-                console.warn('[CSH] remove failed for', item.cid, err);
-            }
-            updateProgress(done + failed, items.length);
+        // Step 1: resolve SubjectId (cid) -> PackageMember.Id.
+        var subjectIds = items.map(function (i) { return i.cid; });
+        var idMap;
+        try {
+            idMap = await toolingQueryPackageMembers(packageId, subjectIds);
+            console.log('[CSH] resolved', Object.keys(idMap).length, 'of', subjectIds.length, 'PackageMember ids');
+        } catch (err) {
+            appendLog('✗ Tooling API query failed: ' + err.message, 'fail');
+            finishProgressModal(0, items.length);
+            return;
         }
 
-        // Release the bridge's confirm-dialog override once the batch ends.
-        try { await sendBridgeCmd({ cmd: 'bulk-end' }); } catch (_) {}
+        // Step 2: parallel DELETE with bounded concurrency.
+        var done = 0, failed = 0;
+        var queue = items.slice();
+
+        async function worker() {
+            while (queue.length && !bulkCancelled) {
+                var item = queue.shift();
+                var memberId = idMap[item.cid];
+                if (!memberId) {
+                    failed++;
+                    appendLog('✗ ' + item.name + ' — PackageMember not found (may already be removed)', 'fail');
+                    updateProgress(done + failed, items.length);
+                    continue;
+                }
+                try {
+                    await toolingDeletePackageMember(memberId);
+                    done++;
+                    selectedItems.delete(item.cid);
+                    appendLog('✓ ' + item.name, 'ok');
+                } catch (err) {
+                    failed++;
+                    appendLog('✗ ' + item.name + ' — ' + err.message, 'fail');
+                }
+                updateProgress(done + failed, items.length);
+            }
+        }
+
+        var workers = [];
+        for (var w = 0; w < Math.min(TOOLING_PARALLEL, items.length); w++) workers.push(worker());
+        await Promise.all(workers);
 
         finishProgressModal(done, failed);
         updateSelectionCount();
-    }
 
-    function findLinkIdForCid(cid) {
-        var cb = document.querySelector('.csh-dc-select-row[data-cid="' + cssEscape(cid) + '"]');
-        if (!cb) return null;
-        return cb.getAttribute('data-link-id') || null;
-    }
-
-    function cssEscape(s) {
-        // Minimal escape for values inside a CSS attribute selector: quotes
-        // and backslashes. Salesforce IDs are [a-zA-Z0-9]{15,18} so usually
-        // no escaping is actually needed; defensive anyway.
-        return String(s).replace(/["\\]/g, '\\$&');
-    }
-
-    function requestDeleteByClick(linkId) {
-        return sendBridgeCmd({ cmd: 'delete', linkId: linkId });
-    }
-
-    function sendBridgeCmd(payload) {
-        return new Promise(function (resolve, reject) {
-            var mid = 'csh-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-            pendingDeletes[mid] = { resolve: resolve, reject: reject };
-            setTimeout(function () {
-                if (pendingDeletes[mid]) {
-                    delete pendingDeletes[mid];
-                    reject(new Error('bridge timeout (MAIN-world script may not be loaded; check Chrome ≥ 111)'));
-                }
-            }, 8000);
-            window.postMessage(Object.assign({ __cshBulk: true, mid: mid }, payload), '*');
-        });
+        // Reload after a short pause so the user sees the final modal state
+        // (success counts) before Salesforce's own view refreshes.
+        if (done > 0) {
+            setTimeout(function () { location.reload(); }, 1200);
+        }
     }
 
     function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-    // Expose a diagnostic pinger on the module for DevTools use.
+    // Console-callable diagnostic. Reports the resolved packageId, API
+    // version, and whether cshSession is returning a token.
     window.cshDetailDiag = function () {
-        return sendBridgeCmd({ cmd: 'ping' });
+        return {
+            packageId: findPackageId(),
+            urlIdParam: new URL(location.href).searchParams.get('id'),
+            apiVersion: currentApiVersion(),
+            hasSession: !!currentSession(),
+            sessionPrefix: currentSession() ? (currentSession().slice(0, 15) + '…') : null,
+            selectedCount: selectedItems.size,
+            removeLinksOnPage: document.querySelectorAll('a[id*="removeLink"]').length
+        };
     };
 
     // -----------------------------------------------------------------------
