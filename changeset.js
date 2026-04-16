@@ -1457,6 +1457,31 @@ var ENABLE_PAGINATION_THRESHOLD = 1500; // Enable DataTables paging above this t
 //   3. null → type is not yet supported; we fall back to a plain DataTable
 // Describe-based resolution eliminates most of the need to hand-maintain the
 // override map as Salesforce adds new component types each release.
+
+// When the Add Components URL is loaded directly (not inside Lightning),
+// Salesforce wraps the Visualforce body in one or more nested iframes on a
+// sibling VF origin — both the top frame AND those iframes match our
+// manifest pattern, so all_frames:true injects our content script in each
+// and we end up rendering multiple spinners / carts / toolbars. Detect the
+// nested-duplicate case via document.referrer and short-circuit everything.
+// Lightning's wrapper top-frame URL doesn't match our pattern, so iframes
+// there still initialise correctly.
+var cshIsNestedDuplicate = (function () {
+    if (window === window.top) return false;
+    try {
+        var ref = document.referrer || '';
+        if (/\/p\/mfpkg\/AddToPackage(FromChangeMgmtUi|Ui)/i.test(ref)) {
+            console.log('csh: skipping init — nested frame whose parent is also AddToPackage');
+            return true;
+        }
+    } catch (_) {}
+    return false;
+})();
+
+if (cshIsNestedDuplicate) {
+    // Leave a tiny breadcrumb so DevTools inspection confirms the skip.
+    try { document.documentElement.setAttribute('data-csh-skipped', '1'); } catch (_) {}
+} else
 window.cshMetadata.getDescribe().then(function (describeCache) {
     resolvedMetadataType = window.cshMetadata.resolveEntityType(
         selectedEntityType, describeCache, entityTypeMap
@@ -1919,6 +1944,7 @@ function startMetadataLoading() {
 
 
 $(document).ready(function () {
+    if (cshIsNestedDuplicate) return;
     $(".clearFilters").on('click', clearFilters);
 	$( "#logoutLink" ).on('click', deployLogout);
 
