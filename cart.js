@@ -195,9 +195,23 @@
 
     function nameForRow(row) {
         var $row = $(row).closest('tr.dataRow');
-        return $.trim($row.children('td').eq(0).text()) ||
-               $.trim($row.children('td').eq(1).text()) ||
-               '(unnamed)';
+        // After applyMetadataToRows runs, td[0] carries data-fullName — the
+        // Metadata API's canonical name, which is preferable to the raw text
+        // (handles CustomField as "Account.MyField" etc.).
+        var fn = $row.children('td').eq(0).attr('data-fullName');
+        if (fn) return fn;
+        // Fall back to the first cell's text, stripped of any nested inputs
+        // / checkboxes that might be in the action column on some layouts.
+        var firstCell = $row.children('td').eq(0).clone();
+        firstCell.find('input, label, button, img').remove();
+        var text = $.trim(firstCell.text());
+        if (text) return text;
+        return $.trim($row.children('td').eq(1).text()) || '(unnamed)';
+    }
+
+    function fullNameForRow(row) {
+        var $row = $(row).closest('tr.dataRow');
+        return $row.children('td').eq(0).attr('data-fullName') || null;
     }
 
     function harvestChecked() {
@@ -206,7 +220,11 @@
             if (!this.checked) return;
             var id = idForRow(this);
             if (!id) return;
-            out.push({ id: id, name: nameForRow(this) });
+            out.push({
+                id: id,
+                name: nameForRow(this),
+                fullName: fullNameForRow(this) || undefined
+            });
         });
         return out;
     }
@@ -280,6 +298,7 @@
                 type: type,
                 salesforceId: it.id,
                 name: it.name,
+                fullName: it.fullName,     // carry the Metadata API canonical name if available
                 status: 'staged',
                 addedAt: Date.now()
             });
@@ -714,34 +733,52 @@
     // Rescans the current page for rows whose data-fullName matches an
     // unresolved cart item of this type; fills in salesforceId so the worker
     // can submit it. Called by changeset.js after applyMetadataToRows.
+    //
+    // Also walks the reverse direction: staged items that were auto-saved
+    // BEFORE metadata finished loading have only a plain DOM-text name. Now
+    // that metadata is live, look up their row by salesforceId and upgrade
+    // the cart item's display to the canonical fullName — makes the cart
+    // panel show "Account.MyField" instead of just "MyField" for custom
+    // fields, etc.
     async function rescanForFullNames(changeSetId, type) {
         var { all, cart } = await getCart(changeSetId);
         var unresolved = cart.items.filter(function (it) {
             return it.type === type && !it.salesforceId && it.fullName;
         });
-        if (unresolved.length === 0) return 0;
+        var needsFullName = cart.items.filter(function (it) {
+            return it.type === type && it.salesforceId && !it.fullName;
+        });
+        if (unresolved.length === 0 && needsFullName.length === 0) return 0;
 
         var byFullName = {};
         unresolved.forEach(function (it) { byFullName[it.fullName] = it; });
+        var byId = {};
+        needsFullName.forEach(function (it) { byId[it.salesforceId] = it; });
 
-        var resolved = 0;
+        var resolved = 0, enriched = 0;
         $('td[data-fullName]').each(function () {
             var fn = $(this).attr('data-fullName');
-            var target = byFullName[fn];
-            if (!target) return;
             var row = $(this).closest('tr.dataRow');
             var idInput = row.find('input[name="ids"]').first();
             var sfId = idInput.val();
-            if (sfId) {
+
+            // Backfill salesforceId on imported items.
+            var target = byFullName[fn];
+            if (target && sfId) {
                 target.salesforceId = sfId;
                 resolved++;
             }
+            // Backfill fullName on auto-saved items.
+            if (sfId && byId[sfId] && fn) {
+                byId[sfId].fullName = fn;
+                enriched++;
+            }
         });
-        if (resolved > 0) {
+        if (resolved > 0 || enriched > 0) {
             await saveCart(all);
-            console.log('cshCart: resolved ' + resolved + ' previously-unresolved cart items for type', type);
+            console.log('cshCart: resolved ' + resolved + ' id(s), enriched ' + enriched + ' fullName(s) for type', type);
         }
-        return resolved;
+        return resolved + enriched;
     }
 
     // -----------------------------------------------------------------------
@@ -915,12 +952,40 @@
                 '</div>';
             Object.keys(byType).sort().forEach(function (type) {
                 var list = byType[type];
+                // Summary shows a preview of the first few names so the user
+                // can scan the cart without having to expand every group.
+                var previewNames = list
+                    .slice(0, 3)
+                    .map(function (it) { return bestDisplayName(it); })
+                    .join(', ');
+                if (list.length > 3) previewNames += ', +' + (list.length - 3) + ' more';
+
                 html += '<details class="csh-cart-group" open>' +
-                        '<summary>' + escapeHtml(type) + ' <span class="csh-cart-type-count">(' + list.length + ')</span></summary>' +
+                        '<summary>' +
+                          '<span class="csh-cart-group-type">' + escapeHtml(type) + '</span> ' +
+                          '<span class="csh-cart-type-count">(' + list.length + ')</span>' +
+                          '<div class="csh-cart-group-preview" title="' + escapeAttr(previewNames) + '">' +
+                            escapeHtml(previewNames) +
+                          '</div>' +
+                        '</summary>' +
                         '<ul>';
                 list.slice(0, 50).forEach(function (it) {
-                    html += '<li class="csh-cart-item status-' + it.status + '" data-uid="' + escapeAttr(it.uid) + '">' +
-                              '<span class="csh-cart-item-name">' + escapeHtml(it.name) + '</span>' +
+                    var primary = bestDisplayName(it);
+                    // Secondary row: the alternative name (fullName vs short name)
+                    // only when they differ — e.g. CustomField "Account.MyField"
+                    // as primary with short name "MyField" as secondary.
+                    var secondary = '';
+                    if (it.fullName && it.name && it.fullName !== it.name && primary === it.fullName) {
+                        secondary = it.name;
+                    } else if (it.fullName && it.name && it.fullName !== it.name && primary === it.name) {
+                        secondary = it.fullName;
+                    }
+                    html += '<li class="csh-cart-item status-' + it.status + '" data-uid="' + escapeAttr(it.uid) + '"' +
+                              ' title="' + escapeAttr(primary + (secondary ? '\n' + secondary : '')) + '">' +
+                              '<div class="csh-cart-item-text">' +
+                                '<div class="csh-cart-item-name">' + escapeHtml(primary) + '</div>' +
+                                (secondary ? '<div class="csh-cart-item-subname">' + escapeHtml(secondary) + '</div>' : '') +
+                              '</div>' +
                               '<span class="csh-cart-item-status">' + statusLabel(it) + '</span>' +
                               (it.status === 'staged'
                                 ? '<button class="csh-cart-remove" title="Remove">×</button>'
@@ -953,6 +1018,17 @@
         if (it.status === 'done') return 'added ✓';
         if (it.status === 'failed') return 'failed — ' + (it.error || '');
         return it.status;
+    }
+
+    // Choose the most human-readable identifier for a cart item.
+    // Preference: fullName (e.g. "Account.MyField") > name (e.g. "MyField") > id.
+    // Falls back to "(unnamed)" so the UI never renders an empty row.
+    function bestDisplayName(it) {
+        if (!it) return '(unnamed)';
+        if (it.fullName && it.fullName !== '*') return String(it.fullName);
+        if (it.name && it.name !== '(unnamed)') return String(it.name);
+        if (it.salesforceId) return String(it.salesforceId);
+        return '(unnamed)';
     }
     function escapeHtml(s) {
         return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
