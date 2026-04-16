@@ -250,15 +250,30 @@ async function listMetadata(connType, types) {
 async function queryTooling(connType, soql) {
     const conn = connType === 'deploy' ? connDeploy.conn : connLocal.conn;
     if (!conn) throw new Error('Not connected');
-    // JSforce paginates transparently via query().autoFetch=true on a full scan.
-    // For up to a few thousand records the default single call suffices; if we
-    // hit Tooling query pagination later we can flip to queryMore chain.
-    return new Promise((resolve, reject) => {
-        conn.tooling.query(soql, function (err, result) {
+    // JSforce's tooling.query() returns only the first 2000 records by default
+    // on a one-shot call (standard Salesforce SOQL batch size). For orgs with
+    // >2000 Apex classes / LWC bundles, we MUST walk queryMore chains or the
+    // extension silently drops records from the table. The loop below follows
+    // nextRecordsUrl / done:false until Salesforce says all records are in.
+    var all = [];
+    var res = await new Promise((resolve, reject) => {
+        conn.tooling.query(soql, function (err, r) {
             if (err) return reject(err);
-            resolve(result && result.records ? result.records : []);
+            resolve(r);
         });
     });
+    if (res && Array.isArray(res.records)) all = all.concat(res.records);
+    while (res && res.done === false && res.nextRecordsUrl) {
+        res = await new Promise((resolve, reject) => {
+            conn.tooling.queryMore(res.nextRecordsUrl, function (err, r) {
+                if (err) return reject(err);
+                resolve(r);
+            });
+        });
+        if (res && Array.isArray(res.records)) all = all.concat(res.records);
+    }
+    console.log('queryTooling:', all.length, 'record(s) fetched for', soql.slice(0, 60) + '...');
+    return all;
 }
 
 async function describeMetadata(connType) {

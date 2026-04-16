@@ -525,7 +525,28 @@
 
             var memberEls = typesEl.getElementsByTagNameNS(ns, 'members');
             if (memberEls.length === 0) memberEls = typesEl.getElementsByTagName('members');
-            var members = Array.from(memberEls).map(function (m) { return m.textContent.trim(); }).filter(Boolean);
+            var members = Array.from(memberEls)
+                .map(function (m) { return m.textContent.trim(); })
+                .filter(Boolean);
+            // Strip wildcards. <members>*</members> in a real package.xml
+            // means "all components of this type" — but we can't add a
+            // literal "*" to the cart (the POST replay needs concrete ids).
+            // Surfacing a warning is more honest than silently adding a
+            // broken item.
+            var wildcards = members.filter(function (m) { return m === '*'; });
+            members = members.filter(function (m) { return m !== '*'; });
+            if (wildcards.length > 0) {
+                console.warn('cart: skipping wildcard <members>*</members> for type ' + type +
+                    ' — the cart needs concrete component names. Visit the ' + type +
+                    ' Add Components page once and stage the items you want, or list them explicitly in the package.xml.');
+                if (window.cshToast) {
+                    window.cshToast.show(
+                        'Skipped wildcard "*" for ' + type +
+                        '. Use explicit component names in package.xml, or stage that type manually.',
+                        { type: 'warning', duration: 7000 }
+                    );
+                }
+            }
             if (members.length === 0) continue;
 
             // addItems de-dupes by type+salesforceId, but our imported members

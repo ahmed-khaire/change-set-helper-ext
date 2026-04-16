@@ -232,25 +232,34 @@ async function cshRunOauthLogin(host) {
         '&code_challenge=' + encodeURIComponent(pkce.challenge) +
         '&code_challenge_method=S256' +
         '&state=' + state;
-    var redirectUrl = await new Promise(function (resolve, reject) {
-        chrome.identity.launchWebAuthFlow(
-            { url: authUrl, interactive: true },
-            function (url) {
-                if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-                if (!url) return reject(new Error('No redirect URL returned'));
-                resolve(url);
-            }
-        );
-    });
-    var u = new URL(redirectUrl);
-    var params = new URLSearchParams(u.search);
-    if (params.get('error')) {
-        throw new Error(params.get('error') + (params.get('error_description') ? ': ' + params.get('error_description') : ''));
+    // Hold the service worker awake for the duration of the OAuth popup.
+    // Users can take 30s+ to enter credentials / clear a 2FA prompt; without
+    // keep-alive the MV3 SW can idle and lose the pending launchWebAuthFlow
+    // callback, leaving the user stranded with a stale "Signing in..." button.
+    startKeepAlive();
+    try {
+        var redirectUrl = await new Promise(function (resolve, reject) {
+            chrome.identity.launchWebAuthFlow(
+                { url: authUrl, interactive: true },
+                function (url) {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    if (!url) return reject(new Error('No redirect URL returned'));
+                    resolve(url);
+                }
+            );
+        });
+        var u = new URL(redirectUrl);
+        var params = new URLSearchParams(u.search);
+        if (params.get('error')) {
+            throw new Error(params.get('error') + (params.get('error_description') ? ': ' + params.get('error_description') : ''));
+        }
+        var code = params.get('code');
+        if (!code) throw new Error('No authorization code in redirect');
+        if (params.get('state') !== state) throw new Error('OAuth state mismatch — aborting');
+        return await cshExchangeCodeForToken(host, code, pkce.verifier);
+    } finally {
+        stopKeepAlive();
     }
-    var code = params.get('code');
-    if (!code) throw new Error('No authorization code in redirect');
-    if (params.get('state') !== state) throw new Error('OAuth state mismatch — aborting');
-    return await cshExchangeCodeForToken(host, code, pkce.verifier);
 }
 
 // Keep service worker alive during long-running operations
@@ -774,34 +783,42 @@ function connectToLocalOauth(sendResponse) {
 function connectToOrg(sendResponse, environment, connType, customHost) {
     var auth_url = buildAuthUrl(environment, customHost);
 
+    // Keep the service worker alive while the user interacts with the OAuth
+    // popup. 30-second idle timers in MV3 can otherwise drop the pending
+    // callback if the user pauses for 2FA / password managers / SSO flows.
+    startKeepAlive();
     chrome.identity.launchWebAuthFlow({'url': auth_url, 'interactive': true}, async function (redirect_url) {
-        if (chrome.runtime.lastError) {
-            console.log(chrome.runtime.lastError.message);
-            sendResponse({'oauth': 'response', 'error': chrome.runtime.lastError.message});
-            return;
-        }
-
         try {
-            var oauthtoken = getAccessToken(redirect_url);
-            var instanceUrl = getInstanceUrl(redirect_url);
-
-            // Send credentials to offscreen document to create connection
-            const response = await sendToOffscreen({
-                action: 'connectToOrg',
-                environment: environment,
-                connType: connType,
-                instanceUrl: instanceUrl,
-                accessToken: oauthtoken
-            });
-
-            if (response.error) {
-                sendResponse({'oauth': 'response', 'error': response.error});
-            } else {
-                sendResponse({'oauth': 'response', 'username': response.username});
+            if (chrome.runtime.lastError) {
+                console.log(chrome.runtime.lastError.message);
+                sendResponse({'oauth': 'response', 'error': chrome.runtime.lastError.message});
+                return;
             }
-        } catch (err) {
-            console.error('Error in connectToOrg:', err);
-            sendResponse({'oauth': 'response', 'error': err.message});
+
+            try {
+                var oauthtoken = getAccessToken(redirect_url);
+                var instanceUrl = getInstanceUrl(redirect_url);
+
+                // Send credentials to offscreen document to create connection
+                const response = await sendToOffscreen({
+                    action: 'connectToOrg',
+                    environment: environment,
+                    connType: connType,
+                    instanceUrl: instanceUrl,
+                    accessToken: oauthtoken
+                });
+
+                if (response.error) {
+                    sendResponse({'oauth': 'response', 'error': response.error});
+                } else {
+                    sendResponse({'oauth': 'response', 'username': response.username});
+                }
+            } catch (err) {
+                console.error('Error in connectToOrg:', err);
+                sendResponse({'oauth': 'response', 'error': err.message});
+            }
+        } finally {
+            stopKeepAlive();
         }
     });
 }

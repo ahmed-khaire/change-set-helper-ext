@@ -929,7 +929,10 @@ function cshExportTable() {
     var entityType = $('#entityType').val() || 'change-set';
     var stamp = new Date().toISOString().slice(0, 10);
     var fname = 'csh-' + entityType + '-' + stamp + '.tsv';
-    var blob = new Blob([lines.join('\r\n')], { type: 'text/tab-separated-values;charset=utf-8' });
+    // UTF-8 BOM (U+FEFF) so Excel on Windows treats the file as UTF-8 and
+    // renders non-ASCII characters (e.g. curly apostrophes in component
+    // names) correctly instead of garbling them in the Windows-1252 guess.
+    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/tab-separated-values;charset=utf-8' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
