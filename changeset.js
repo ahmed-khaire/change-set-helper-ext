@@ -598,6 +598,42 @@ function jq(myid) {
     return "#" + myid.replace(/(:|\.|\[|\]|,)/g, "\\$1");
 }
 
+// Phase 6 — render ghost rows in the main DataTable for components that
+// exist in the compare org but NOT in the current change set. Uses
+// DataTables' row.add API so they participate in sort / filter / export
+// naturally; styled via csh-diff-target-only (red).
+function cshAppendTargetOnlyRows(records, env) {
+    if (!changeSetTable) return;
+    var totalCols = changeSetTable.columns().count();
+    records.forEach(function (rec) {
+        var row = new Array(totalCols).fill('');
+        // Column 0 is the checkbox — put a disabled, explanatory placeholder
+        row[0] = '<span title="Exists in target org only" style="color:#8e0916;font-weight:600;">[target only]</span>';
+        // Column 1 is Name — use fullName as the display name
+        row[1] = rec.fullName || '';
+        // Compare cells
+        if (compareColumnIndices.compareDateMod >= 0 && rec.lastModifiedDate) {
+            row[compareColumnIndices.compareDateMod] = convertDate(new Date(rec.lastModifiedDate));
+        }
+        if (compareColumnIndices.compareModBy >= 0) {
+            row[compareColumnIndices.compareModBy] = rec.lastModifiedByName || '';
+        }
+        if (compareColumnIndices.fullName >= 0) {
+            row[compareColumnIndices.fullName] = rec.fullName || '';
+        }
+        if (compareColumnIndices.folder >= 0 && rec.folder) {
+            row[compareColumnIndices.folder] = rec.folder;
+        }
+        var added = changeSetTable.row.add(row).draw(false);
+        var node = added.node();
+        if (node) {
+            node.classList.add('csh-diff-target-only');
+            node.setAttribute('data-csh-target-only', '1');
+        }
+    });
+    console.log('cshAppendTargetOnlyRows: added', records.length, 'ghost rows');
+}
+
 function processCompareResults(results, env) {
     console.log('processCompareResults: Processing', results.length, 'compare results');
     console.log('processCompareResults: Using column indices:', compareColumnIndices);
@@ -618,10 +654,19 @@ function processCompareResults(results, env) {
     // Update Full Name column header
     $(changeSetTable.column(compareColumnIndices.fullName).header()).text('Full name (Click for diff)');
 
+    // Phase 6: track target-only records. These exist in the compare org
+    // but not in the current change set / local listing. We surface them as
+    // "ghost" rows in red so the user can see what they might be missing.
+    var targetOnlyRecords = [];
+
     for (i = 0; i < results.length; i++) {
         var fullName = results[i].fullName;
         var matchingInput = $('td[data-fullName = "' + fullName + '"]');
 
+        if (matchingInput.length === 0) {
+            targetOnlyRecords.push(results[i]);
+            continue;
+        }
         if (matchingInput.length > 0) {
             var rowIdx = changeSetTable.cell('td[data-fullName = "' + fullName + '"]').index().row;
 
@@ -663,6 +708,13 @@ function processCompareResults(results, env) {
                 }
             }
         }
+    }
+
+    // Phase 6: append ghost rows for target-only records.
+    // These aren't in the local change set. They sort, filter, and export
+    // like regular rows, but get the fourth colour-diff state: red + [target only].
+    if (targetOnlyRecords.length > 0) {
+        cshAppendTargetOnlyRows(targetOnlyRecords, env);
     }
 
     // Hide folder column after processing

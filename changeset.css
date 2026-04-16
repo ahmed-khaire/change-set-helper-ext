@@ -51,6 +51,11 @@ table.list tr.csh-diff-same > td {
     background-color: #f4f6f9 !important;   /* soft grey */
     border-left: 3px solid #706e6b !important;
 }
+table.list tr.csh-diff-target-only > td {
+    background-color: #ffe4e1 !important;   /* soft red */
+    border-left: 3px solid #ba0517 !important;
+    font-style: italic;
+}
 table.list tr.csh-diff-newer-local > td:first-child,
 table.list tr.csh-diff-newer-target > td:first-child,
 table.list tr.csh-diff-same > td:first-child {
