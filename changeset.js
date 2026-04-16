@@ -429,6 +429,16 @@ function processListResults(response) {
     // Apply metadata to matching rows in the table
     applyMetadataToRows(results);
 
+    // Phase 6: lazy-resolve imported cart items now that rows carry
+    // data-fullName. Safe no-op when no imported items await resolution.
+    if (window.cshCart && window.cshCart.rescanForFullNames) {
+        var csId = $('#id').val();
+        if (csId && selectedEntityType) {
+            window.cshCart.rescanForFullNames(csId, selectedEntityType)
+                .catch(function (e) { console.warn('rescanForFullNames failed:', e && e.message); });
+        }
+    }
+
     numCallsInProgress--;
     console.log('numCallsInProgress:', numCallsInProgress);
 

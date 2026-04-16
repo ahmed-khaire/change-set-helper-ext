@@ -242,7 +242,12 @@
         try {
             while (true) {
                 var { cart } = await getCart(changeSetId);
-                var staged = cart.items.filter(function (it) { return it.status === 'staged'; });
+                // Only submit staged items that have a resolved salesforceId.
+                // Imported items without an Id stay staged until the user
+                // visits that type's page (rescanForFullNames fills them in).
+                var staged = cart.items.filter(function (it) {
+                    return it.status === 'staged' && it.salesforceId;
+                });
                 if (staged.length === 0) break;
 
                 // Group by type, pick the first type, take up to BATCH_SIZE ids.
@@ -339,6 +344,266 @@
     }
 
     // -----------------------------------------------------------------------
+    // Presets — named snapshots of cart items so the user can replay a known
+    // selection across deploys without re-picking everything. Stored in
+    // chrome.storage.local (sync's 8KB/item cap is easy to exceed on a
+    // 1000-item preset). Keyed by user-supplied name; scoped to the org host.
+    // -----------------------------------------------------------------------
+    var PRESETS_KEY = 'cshCartPresets';
+
+    async function listPresets() {
+        var s = await storageGet([PRESETS_KEY]);
+        var all = s[PRESETS_KEY] || {};
+        var host = serverUrl;
+        return Object.keys(all)
+            .filter(function (name) { return all[name] && all[name].host === host; })
+            .map(function (name) { return all[name]; })
+            .sort(function (a, b) { return (b.savedAt || 0) - (a.savedAt || 0); });
+    }
+
+    async function savePreset(name) {
+        name = (name || '').trim();
+        if (!name) throw new Error('Preset name is required');
+        var changeSetId = currentChangeSetId();
+        if (!changeSetId) throw new Error('No change-set context');
+        var { cart } = await getCart(changeSetId);
+        // Only snapshot items that represent a selection — staged or done —
+        // skip submitting/failed so presets stay consistent.
+        var items = cart.items
+            .filter(function (it) { return it.status === 'staged' || it.status === 'done'; })
+            .map(function (it) {
+                return { type: it.type, salesforceId: it.salesforceId, name: it.name, fullName: it.fullName || null };
+            });
+        if (items.length === 0) throw new Error('Cart is empty — nothing to save');
+
+        var s = await storageGet([PRESETS_KEY]);
+        var all = s[PRESETS_KEY] || {};
+        var host = serverUrl;
+        var key = host + '|' + name;
+        all[key] = {
+            name: name,
+            host: host,
+            savedAt: Date.now(),
+            itemCount: items.length,
+            items: items
+        };
+        await storageSet({ [PRESETS_KEY]: all });
+        return all[key];
+    }
+
+    async function loadPreset(name) {
+        var changeSetId = currentChangeSetId();
+        if (!changeSetId) throw new Error('No change-set context');
+        var s = await storageGet([PRESETS_KEY]);
+        var all = s[PRESETS_KEY] || {};
+        var key = serverUrl + '|' + name;
+        var preset = all[key];
+        if (!preset) throw new Error('Preset not found: ' + name);
+        // Group by type and add to cart
+        var byType = {};
+        preset.items.forEach(function (it) {
+            (byType[it.type] = byType[it.type] || []).push({ id: it.salesforceId, name: it.name });
+        });
+        var total = 0;
+        for (var type in byType) {
+            total += await addItems(changeSetId, type, byType[type]);
+        }
+        return { added: total, total: preset.items.length };
+    }
+
+    async function deletePreset(name) {
+        var s = await storageGet([PRESETS_KEY]);
+        var all = s[PRESETS_KEY] || {};
+        var key = serverUrl + '|' + name;
+        delete all[key];
+        await storageSet({ [PRESETS_KEY]: all });
+    }
+
+    // -----------------------------------------------------------------------
+    // package.xml I/O
+    //
+    // Export: build a Salesforce metadata package.xml from the current cart
+    // (staged + done items), download it.
+    //
+    // Import: parse a user-supplied package.xml, add items to the cart as
+    // "unresolved" (no salesforceId yet). When the user navigates to each
+    // type's Add Components page, rescanForFullNames matches stored fullNames
+    // to rendered rows and fills in the salesforceId so the cart worker can
+    // submit them.
+    // -----------------------------------------------------------------------
+    function escapeXml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&apos;');
+    }
+
+    async function exportCartAsPackageXml() {
+        var changeSetId = currentChangeSetId();
+        if (!changeSetId) throw new Error('No change-set context');
+        var { cart } = await getCart(changeSetId);
+        var eligible = cart.items.filter(function (it) {
+            return it.status === 'staged' || it.status === 'done';
+        });
+        if (eligible.length === 0) throw new Error('Cart has no staged or submitted items');
+
+        var byType = {};
+        eligible.forEach(function (it) {
+            var member = it.fullName || it.name;
+            if (!member) return;
+            (byType[it.type] = byType[it.type] || []).push(member);
+        });
+
+        var apiVersion = (window.cshApiVersion && window.cshApiVersion.resolved) ||
+                         (window.cshApiVersion && window.cshApiVersion.fallback) ||
+                         '60.0';
+        var xml = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+                  '<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n';
+        Object.keys(byType).sort().forEach(function (type) {
+            xml += '    <types>\n';
+            byType[type].sort().forEach(function (m) {
+                xml += '        <members>' + escapeXml(m) + '</members>\n';
+            });
+            xml += '        <name>' + escapeXml(type) + '</name>\n';
+            xml += '    </types>\n';
+        });
+        xml += '    <version>' + escapeXml(apiVersion) + '</version>\n';
+        xml += '</Package>\n';
+
+        var stamp = new Date().toISOString().slice(0, 10);
+        var fname = 'csh-cart-package-' + stamp + '.xml';
+        var blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () {
+            a.remove();
+            URL.revokeObjectURL(url);
+        }, 500);
+        window.cshToast && window.cshToast.show(
+            'Exported ' + eligible.length + ' cart item(s) to ' + fname,
+            { type: 'success' }
+        );
+    }
+
+    async function importPackageXml(xmlText) {
+        var changeSetId = currentChangeSetId();
+        if (!changeSetId) throw new Error('No change-set context');
+
+        var doc;
+        try {
+            doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+            if (doc.querySelector('parsererror')) throw new Error('Malformed XML');
+        } catch (e) {
+            throw new Error('Could not parse package.xml: ' + e.message);
+        }
+
+        // Salesforce package.xml default namespace is soap.sforce.com/2006/04/metadata.
+        // Use getElementsByTagNameNS on the namespace to be robust, with a
+        // fallback that ignores namespace for loose files.
+        var ns = 'http://soap.sforce.com/2006/04/metadata';
+        var typesNodes = Array.from(doc.getElementsByTagNameNS(ns, 'types'));
+        if (typesNodes.length === 0) {
+            typesNodes = Array.from(doc.getElementsByTagName('types'));
+        }
+        if (typesNodes.length === 0) {
+            throw new Error('No <types> blocks found in XML');
+        }
+
+        var addedCount = 0;
+        for (var i = 0; i < typesNodes.length; i++) {
+            var typesEl = typesNodes[i];
+            var nameEls = typesEl.getElementsByTagNameNS(ns, 'name');
+            if (nameEls.length === 0) nameEls = typesEl.getElementsByTagName('name');
+            var type = nameEls[0] ? nameEls[0].textContent.trim() : null;
+            if (!type) continue;
+
+            var memberEls = typesEl.getElementsByTagNameNS(ns, 'members');
+            if (memberEls.length === 0) memberEls = typesEl.getElementsByTagName('members');
+            var members = Array.from(memberEls).map(function (m) { return m.textContent.trim(); }).filter(Boolean);
+            if (members.length === 0) continue;
+
+            // addItems de-dupes by type+salesforceId, but our imported members
+            // don't have a salesforceId yet. We store them with salesforceId
+            // empty so restoreFromCart can resolve them lazily when the user
+            // navigates to that type. addItems's dedupe keys won't filter them
+            // since the key includes salesforceId — that's intentional.
+            var items = members.map(function (m) {
+                return { id: null, name: m, fullName: m };
+            });
+            var added = await addUnresolvedItems(changeSetId, type, items);
+            addedCount += added;
+        }
+        return addedCount;
+    }
+
+    // Specialised addItems for imports: stores fullName so rescanForFullNames
+    // can resolve salesforceId on page visit.
+    async function addUnresolvedItems(changeSetId, type, items) {
+        var { all, cart } = await getCart(changeSetId);
+        // Dedup by (type + fullName) among unresolved items to avoid double-import.
+        var seen = {};
+        cart.items.forEach(function (it) {
+            if (!it.salesforceId && it.fullName) seen[type + '||' + it.fullName] = true;
+        });
+        var added = 0;
+        items.forEach(function (it) {
+            if (!it.fullName) return;
+            if (seen[type + '||' + it.fullName]) return;
+            cart.items.push({
+                uid: 'u' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+                type: type,
+                salesforceId: null,
+                fullName: it.fullName,
+                name: it.name || it.fullName,
+                status: 'staged',
+                addedAt: Date.now()
+            });
+            added++;
+        });
+        await saveCart(all);
+        return added;
+    }
+
+    // Rescans the current page for rows whose data-fullName matches an
+    // unresolved cart item of this type; fills in salesforceId so the worker
+    // can submit it. Called by changeset.js after applyMetadataToRows.
+    async function rescanForFullNames(changeSetId, type) {
+        var { all, cart } = await getCart(changeSetId);
+        var unresolved = cart.items.filter(function (it) {
+            return it.type === type && !it.salesforceId && it.fullName;
+        });
+        if (unresolved.length === 0) return 0;
+
+        var byFullName = {};
+        unresolved.forEach(function (it) { byFullName[it.fullName] = it; });
+
+        var resolved = 0;
+        $('td[data-fullName]').each(function () {
+            var fn = $(this).attr('data-fullName');
+            var target = byFullName[fn];
+            if (!target) return;
+            var row = $(this).closest('tr.dataRow');
+            var idInput = row.find('input[name="ids"]').first();
+            var sfId = idInput.val();
+            if (sfId) {
+                target.salesforceId = sfId;
+                resolved++;
+            }
+        });
+        if (resolved > 0) {
+            await saveCart(all);
+            console.log('cshCart: resolved ' + resolved + ' previously-unresolved cart items for type', type);
+        }
+        return resolved;
+    }
+
+    // -----------------------------------------------------------------------
     // Floating panel UI
     // -----------------------------------------------------------------------
     function ensurePanel() {
@@ -352,6 +617,14 @@
               '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
             '</div>' +
             '<div class="csh-cart-body"></div>' +
+            '<div class="csh-cart-presets">' +
+              '<select class="csh-cart-preset-select"><option value="">Load preset…</option></select>' +
+              '<button class="csh-cart-save-preset" title="Save current cart as preset">💾</button>' +
+              '<button class="csh-cart-delete-preset" title="Delete selected preset">🗑</button>' +
+              '<button class="csh-cart-export-pkg" title="Export cart as package.xml">⬇ pkg.xml</button>' +
+              '<button class="csh-cart-import-pkg" title="Import package.xml into cart">⬆ pkg.xml</button>' +
+              '<input type="file" class="csh-cart-pkg-file" accept=".xml,application/xml" style="display:none">' +
+            '</div>' +
             '<div class="csh-cart-footer">' +
               '<button class="csh-cart-submit">Submit All</button>' +
               '<button class="csh-cart-retry" style="display:none">Retry failed</button>' +
@@ -378,7 +651,91 @@
                 await saveCart(all);
             }
         });
+
+        // Preset save
+        panel.querySelector('.csh-cart-save-preset').addEventListener('click', async function () {
+            var name = prompt('Save current cart as preset. Name?');
+            if (!name) return;
+            try {
+                var p = await savePreset(name);
+                window.cshToast && window.cshToast.show('Saved "' + p.name + '" (' + p.itemCount + ' item(s))', { type: 'success' });
+                await refreshPresetSelect();
+            } catch (e) {
+                window.cshToast && window.cshToast.show('Save preset failed: ' + e.message, { type: 'error' });
+            }
+        });
+
+        // Preset load
+        panel.querySelector('.csh-cart-preset-select').addEventListener('change', async function () {
+            var name = this.value;
+            if (!name) return;
+            try {
+                var res = await loadPreset(name);
+                window.cshToast && window.cshToast.show(
+                    'Loaded "' + name + '": added ' + res.added + ' new staged item(s). ' +
+                    (res.added < res.total ? (res.total - res.added) + ' were already in cart.' : ''),
+                    { type: 'success' }
+                );
+            } catch (e) {
+                window.cshToast && window.cshToast.show('Load preset failed: ' + e.message, { type: 'error' });
+            }
+            this.value = '';
+        });
+
+        // Preset delete
+        panel.querySelector('.csh-cart-delete-preset').addEventListener('click', async function () {
+            var select = panel.querySelector('.csh-cart-preset-select');
+            var name = select.value;
+            if (!name) {
+                alert('Pick a preset from the dropdown first.');
+                return;
+            }
+            if (!confirm('Delete preset "' + name + '"?')) return;
+            await deletePreset(name);
+            await refreshPresetSelect();
+        });
+
+        // Package.xml export
+        panel.querySelector('.csh-cart-export-pkg').addEventListener('click', async function () {
+            try { await exportCartAsPackageXml(); }
+            catch (e) { window.cshToast && window.cshToast.show('Export failed: ' + e.message, { type: 'error' }); }
+        });
+
+        // Package.xml import
+        var pkgFileInput = panel.querySelector('.csh-cart-pkg-file');
+        panel.querySelector('.csh-cart-import-pkg').addEventListener('click', function () {
+            pkgFileInput.click();
+        });
+        pkgFileInput.addEventListener('change', async function (ev) {
+            var file = ev.target.files && ev.target.files[0];
+            if (!file) return;
+            try {
+                var text = await file.text();
+                var added = await importPackageXml(text);
+                window.cshToast && window.cshToast.show(
+                    'Imported ' + added + ' item(s) from ' + file.name + '. ' +
+                    'Items without a Salesforce Id will resolve when you visit each type.',
+                    { type: 'success', duration: 6000 }
+                );
+            } catch (e) {
+                window.cshToast && window.cshToast.show('Import failed: ' + e.message, { type: 'error' });
+            }
+            pkgFileInput.value = '';
+        });
+
         return panel;
+    }
+
+    async function refreshPresetSelect() {
+        var panel = ensurePanel();
+        var select = panel.querySelector('.csh-cart-preset-select');
+        if (!select) return;
+        var presets = await listPresets();
+        select.innerHTML = '<option value="">Load preset…</option>' +
+            presets.map(function (p) {
+                var label = p.name + ' (' + p.itemCount + ')';
+                return '<option value="' + escapeAttr(p.name) + '">' + escapeHtml(label) + '</option>';
+            }).join('');
     }
 
     function togglePanel() {
@@ -576,6 +933,14 @@
 
         installTypeSwitchGuard(opts.currentType);
         renderPanel();
+        // Populate the presets dropdown asynchronously; doesn't gate init.
+        refreshPresetSelect().catch(function (e) {
+            console.warn('refreshPresetSelect failed:', e && e.message);
+        });
+        // Lazily resolve any imported-but-unresolved items for this type.
+        if (opts.currentType) {
+            rescanForFullNames(_currentChangeSetId, opts.currentType).catch(function () {});
+        }
 
         // Resume anything left in "submitting" from a prior session that was
         // interrupted — mark as staged so the worker retries.
@@ -597,6 +962,14 @@
         retryFailed: retryFailed,
         harvestChecked: harvestChecked,
         restoreFromCart: restoreFromCart,
-        getCart: getCart
+        getCart: getCart,
+        // Phase 6 additions
+        listPresets: listPresets,
+        savePreset: savePreset,
+        loadPreset: loadPreset,
+        deletePreset: deletePreset,
+        exportCartAsPackageXml: exportCartAsPackageXml,
+        importPackageXml: importPackageXml,
+        rescanForFullNames: rescanForFullNames
     };
 })();
