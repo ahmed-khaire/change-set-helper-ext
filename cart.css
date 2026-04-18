@@ -68,7 +68,8 @@
     to { transform: rotate(360deg); }
 }
 
-#csh-cart-panel .csh-cart-close {
+#csh-cart-panel .csh-cart-close,
+#csh-cart-panel .csh-cart-toggle-all {
     background: transparent;
     border: 0;
     color: #fff;
@@ -77,6 +78,14 @@
     padding: 0 4px;
     line-height: 1;
 }
+
+#csh-cart-panel .csh-cart-toggle-all {
+    font-size: 16px;
+    margin-right: 2px;
+    opacity: 0.85;
+}
+
+#csh-cart-panel .csh-cart-toggle-all:hover { opacity: 1; }
 
 #csh-cart-panel .csh-cart-body {
     padding: 8px 10px;
@@ -132,6 +141,22 @@
 #csh-cart-panel .chip-submitting { background: #f3e9ff; color: #501e83; }
 #csh-cart-panel .chip-done       { background: #dff0e2; color: #194e30; }
 #csh-cart-panel .chip-failed     { background: #ffe4e1; color: #8e0916; }
+
+#csh-cart-panel .chip[data-status-filter] {
+    cursor: pointer;
+    user-select: none;
+    border: 1px solid transparent;
+    transition: filter 0.1s ease, box-shadow 0.1s ease;
+}
+#csh-cart-panel .chip[data-status-filter]:hover { filter: brightness(0.95); }
+#csh-cart-panel .chip[data-status-filter]:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px #0176d3;
+}
+#csh-cart-panel .chip.chip-active {
+    border-color: #032d60;
+    box-shadow: inset 0 0 0 1px #032d60;
+}
 
 #csh-cart-panel .csh-cart-group {
     margin-bottom: 6px;

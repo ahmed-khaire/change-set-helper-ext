@@ -256,17 +256,57 @@
             return { inserted: 0, promoted: 0, kept: 0, pruned: 0 };
         }
         var { all, cart } = await getCart(changeSetId);
-        var key = function (t, id) { return t + '::' + id; };
-        var byKey = {};
-        cart.items.forEach(function (it) {
-            if (it.type && it.salesforceId) byKey[key(it.type, it.salesforceId)] = it;
+        // Salesforce exposes the same component as either a 15-char
+        // case-sensitive id or an 18-char case-insensitive id depending on
+        // which view generated the reference. The VF detail page's
+        // confirmRemoveComponent(cid) call and the classic components
+        // view's Del ?cid= query can disagree on which form they embed.
+        // We canonicalize to the 15-char prefix for all dedup keys so the
+        // same component collapses to one cart row regardless of which
+        // sync path populated it. Without this, navigating back and forth
+        // between the Add and Detail pages produced visible duplicates —
+        // each page's sync inserted its own form of the id as a "new" row.
+        function sfId15(id) { return id ? String(id).slice(0, 15) : ''; }
+        var key = function (t, id) { return t + '::' + sfId15(id); };
+        // Pre-pass: collapse any pre-existing 15/18-char duplicate rows in
+        // the stored cart. Prior sync rounds (before this canonicalization)
+        // may have left the cart with two entries for the same component.
+        // Normalize each row's salesforceId to 15 chars in place and merge
+        // collisions, preferring non-'done' rows (user has in-flight work)
+        // over 'done' ones. Idempotent on carts that already have no
+        // duplicates.
+        var seenKeys = {};
+        var dupesMerged = 0;
+        cart.items = cart.items.filter(function (it) {
+            if (it.salesforceId) it.salesforceId = sfId15(it.salesforceId);
+            if (!it.type || !it.salesforceId) return true;
+            var k = key(it.type, it.salesforceId);
+            var prev = seenKeys[k];
+            if (!prev) { seenKeys[k] = it; return true; }
+            dupesMerged++;
+            var preferThis = (prev.status === 'done' && it.status !== 'done');
+            if (preferThis) {
+                prev.status = it.status;
+                prev.source = it.source;
+                prev.addedAt = it.addedAt || prev.addedAt;
+                if (it.error) prev.error = it.error;
+                else delete prev.error;
+            }
+            if (!prev.name && it.name) prev.name = it.name;
+            if (!prev.fullName && it.fullName) prev.fullName = it.fullName;
+            return false;
         });
+        if (dupesMerged > 0) {
+            console.log('cshCart.syncItemsFromServer: merged', dupesMerged, 'pre-existing duplicate row(s)');
+        }
+        var byKey = seenKeys;
         var inputKeys = {};
         var inserted = 0, promoted = 0, kept = 0, pruned = 0;
         items.forEach(function (it) {
             if (!it.id || !it.type) return;
-            inputKeys[key(it.type, it.id)] = true;
-            var existing = byKey[key(it.type, it.id)];
+            var canonicalId = sfId15(it.id);
+            inputKeys[key(it.type, canonicalId)] = true;
+            var existing = byKey[key(it.type, canonicalId)];
             if (existing) {
                 if (existing.status === 'done') {
                     kept++;
@@ -293,8 +333,8 @@
             var row = {
                 uid: uid(),
                 type: it.type,
-                salesforceId: it.id,
-                name: it.name || it.id,
+                salesforceId: canonicalId,
+                name: it.name || canonicalId,
                 status: 'done',
                 source: 'server-sync',
                 addedAt: Date.now(),
@@ -320,8 +360,54 @@
 
     async function removeItem(changeSetId, uid) {
         var { all, cart } = await getCart(changeSetId);
-        cart.items = cart.items.filter(function (it) { return it.uid !== uid; });
+        var removed = null;
+        cart.items = cart.items.filter(function (it) {
+            if (it.uid === uid) { removed = it; return false; }
+            return true;
+        });
         await saveCart(all);
+        // On the Add page, mirror the cart removal to the row's checkbox so
+        // the table UI stops showing a ticked row for something the user
+        // just dropped from the cart. _cartType is populated by
+        // installCheckboxAutoSave — it's null on the Detail page and in
+        // frames without the selection table, in which case this is a
+        // no-op.
+        if (removed && _cartType && removed.type === _cartType) {
+            uncheckRowForSfId(removed.salesforceId);
+        }
+    }
+
+    function uncheckRowForSfId(sfId) {
+        if (!sfId) return;
+        var id15 = String(sfId).slice(0, 15);
+        findRowCheckboxes().each(function () {
+            var rowId = idForRow(this);
+            if (!rowId || String(rowId).slice(0, 15) !== id15) return;
+            if (!this.checked) return;
+            // Use a native click rather than setting .checked directly.
+            // Setting .checked silently bypasses DataTables-Checkboxes'
+            // internal state (which tracks selection via change events) —
+            // the checkbox flips visually but on the next DataTable draw
+            // the plugin restores it from its own tracked set. click()
+            // fires change, the plugin updates, and the cart auto-save
+            // delegate re-runs — harmless because the cart item we're
+            // responding to is already removed, so syncCartFromCheckboxes
+            // has nothing to add back.
+            this.click();
+        });
+    }
+
+    // Unticks every currently-rendered row checkbox. Used by the "Clear
+    // cart" paths that wipe staged items en masse — any checkbox visible
+    // in the current DataTable view corresponds to a staged (or paused)
+    // selection, so clearing the cart has to clear the DOM state too or
+    // the next auto-save would re-stage everything. No-op on the Detail
+    // page (no such table exists there).
+    function uncheckAllRowCheckboxes() {
+        if (!_cartType) return;
+        findRowCheckboxes().each(function () {
+            if (this.checked) this.click();
+        });
     }
 
     async function clearType(changeSetId, type) {
@@ -358,6 +444,7 @@
             return it.status !== 'staged' && it.status !== 'failed';
         });
         await saveCart(all);
+        uncheckAllRowCheckboxes();
     }
 
     async function cacheFormShape(changeSetId, type, formShape) {
@@ -1224,6 +1311,7 @@
         panel.innerHTML =
             '<div class="csh-cart-header">' +
               '<span class="csh-cart-title">Change Set Cart</span>' +
+              '<button class="csh-cart-toggle-all" title="Collapse/expand all groups" aria-label="Collapse or expand all groups">⇅</button>' +
               '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
             '</div>' +
             '<div class="csh-cart-search-row">' +
@@ -1272,6 +1360,30 @@
             renderPanel();
         });
         panel.querySelector('.csh-cart-close').addEventListener('click', togglePanel);
+        // Delegated chip click — chips live inside the body, which is
+        // re-rendered on every paint, so wire the listener on the stable
+        // panel element. Click toggles: same filter → clear; other → switch.
+        panel.addEventListener('click', function (ev) {
+            var chip = ev.target.closest && ev.target.closest('[data-status-filter]');
+            if (!chip || !panel.contains(chip)) return;
+            var f = chip.getAttribute('data-status-filter');
+            statusFilter = (statusFilter === f) ? '' : f;
+            renderPanel();
+        });
+        panel.querySelector('.csh-cart-toggle-all').addEventListener('click', function () {
+            // Mixed state (some open, some closed) → collapse-all wins so
+            // the click always produces a visibly uniform result. Pin the
+            // decision via expandOverride so the next render honours it.
+            var groups = panel.querySelectorAll('.csh-cart-body details.csh-cart-group');
+            if (!groups.length) return;
+            var anyOpen = Array.prototype.some.call(groups, function (d) { return d.open; });
+            var openAll = !anyOpen;
+            Array.prototype.forEach.call(groups, function (d) {
+                var key = d.getAttribute('data-group-key');
+                if (key) expandOverride.set(key, openAll);
+            });
+            renderPanel();
+        });
         panel.querySelector('.csh-cart-submit').addEventListener('click', function () {
             var changeSetId = currentChangeSetId();
             if (changeSetId) runWorker(changeSetId);
@@ -1302,6 +1414,7 @@
                     all[changeSetId].items = [];
                     await saveCart(all);
                 }
+                uncheckAllRowCheckboxes();
             }
         });
 
@@ -1447,6 +1560,10 @@
     // with substring matches. Empty string means no filter.
     var searchQuery = '';
 
+    // Status filter — click-to-toggle on the top chips. '' = no filter.
+    // Valid values: 'staged' | 'submitting' | 'done' | 'failed'.
+    var statusFilter = '';
+
     // Background-sync status. Updated by setSyncState() from callers like
     // detailcomponents.js while syncItemsFromServer is in flight. The render
     // layer reflects this in the header (adds "· Syncing…" and a spinner
@@ -1537,9 +1654,17 @@
                     (secondary && !virtualized ? '<div class="csh-cart-item-subname">' + escapeHtml(secondary) + '</div>' : '') +
                   '</div>' +
                   '<span class="csh-cart-item-status">' + statusLabel(it) + '</span>' +
-                  '<button class="csh-cart-remove" title="' + escapeAttr(removeTitle(it)) + '"' +
-                    (it.status === 'submitting' ? ' data-submitting="1"' : '') +
-                    '>×</button>' +
+                  // 'done' (= already added to the change set) rows have no
+                  // × button. Removing those locally doesn't delete them
+                  // server-side — the next background sync just re-inserts
+                  // them — so the button was misleading. Removal of added
+                  // components lives on the Detail page's bulk-remove
+                  // toolbar instead.
+                  (it.status === 'done'
+                    ? ''
+                    : '<button class="csh-cart-remove" title="' + escapeAttr(removeTitle(it)) + '"' +
+                        (it.status === 'submitting' ? ' data-submitting="1"' : '') +
+                        '>×</button>') +
                 '</' + tag + '>';
     }
 
@@ -1646,10 +1771,12 @@
                 return;
             }
             var q = searchQuery;
+            var sf = statusFilter;
             var byType = {};
             var visibleTotal = 0;
             items.forEach(function (it) {
                 if (!itemMatchesSearch(it, q)) return;
+                if (sf && (it.status || 'staged') !== sf) return;
                 (byType[it.type] = byType[it.type] || []).push(it);
                 visibleTotal++;
             });
@@ -1659,15 +1786,28 @@
             var counts = ensureCounts(cart);
             virtGroupState = new Map(); // reset per render; populated below
             var body = panel.querySelector('.csh-cart-body');
+            function statusChipHtml(filter, count, label, colorClass, alwaysShow) {
+                // Render when the chip has a count OR is the active filter —
+                // otherwise the user would lose the handle to clear a filter
+                // whose last matching item just changed state.
+                if (!count && !alwaysShow && sf !== filter) return '';
+                var active = sf === filter;
+                return '<span class="chip ' + colorClass +
+                    (active ? ' chip-active' : '') +
+                    '" data-status-filter="' + filter +
+                    '" role="button" tabindex="0" title="Click to ' +
+                    (active ? 'clear filter' : 'show only ' + label) +
+                    '">' + count + ' ' + label + '</span>';
+            }
             var html = '<div class="csh-cart-counts">' +
-                '<span class="chip chip-staged">' + counts.staged + ' staged</span>' +
-                (counts.submitting ? '<span class="chip chip-submitting">' + counts.submitting + ' submitting</span>' : '') +
-                (counts.done ? '<span class="chip chip-done">' + counts.done + ' added</span>' : '') +
-                (counts.failed ? '<span class="chip chip-failed">' + counts.failed + ' failed</span>' : '') +
+                statusChipHtml('staged', counts.staged, 'staged', 'chip-staged', true) +
+                statusChipHtml('submitting', counts.submitting, 'submitting', 'chip-submitting', false) +
+                statusChipHtml('done', counts.done, 'added', 'chip-done', false) +
+                statusChipHtml('failed', counts.failed, 'failed', 'chip-failed', false) +
                 (q ? '<span class="chip chip-filter">' + visibleTotal + ' matching “' + escapeHtml(q) + '”</span>' : '') +
                 '</div>';
-            if (q && visibleTotal === 0) {
-                html += '<div class="csh-cart-empty">No items match this search.</div>';
+            if ((q || sf) && visibleTotal === 0) {
+                html += '<div class="csh-cart-empty">No items match the current filter.</div>';
             }
             var virtualizedGroups = []; // {key, list} — wired post-innerHTML
             // With a search active, auto-expand every group so the user
