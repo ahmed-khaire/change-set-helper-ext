@@ -164,33 +164,47 @@
             // The classic view has different header names than the
             // Visualforce detail page; resolve per-page rather than reusing
             // this file's colIndex (which tracks the detail page DOM).
+            // Package Components view labels the name column "Component
+            // Name"; Outbound Change Set view labels it "Name".
             var header = table.querySelector('tr.headerRow');
             var idx = { name: -1, type: -1, fullName: -1 };
             if (header) {
                 Array.prototype.forEach.call(header.children, function (cell, i) {
                     var text = (cell.textContent || '').trim().toLowerCase();
-                    if (text === 'name' && idx.name === -1) idx.name = i;
+                    if ((text === 'name' || text === 'component name') && idx.name === -1) idx.name = i;
                     else if (text === 'type' && idx.type === -1) idx.type = i;
                     else if ((text === 'api name' || text === 'full name') && idx.fullName === -1) idx.fullName = i;
                 });
             }
             var rows = table.querySelectorAll('tr.dataRow');
+            var dropped = { noCid: 0, noType: 0 };
             rows.forEach(function (row) {
+                // Prefer Del link (its ?cid= query is the canonical component
+                // id). If no Del link — e.g., Package Components view has no
+                // remove affordance — fall back to SF-id-shaped anchor hrefs,
+                // preferring the Name column cell so we don't pick up any
+                // Parent Object / Included By cross-reference.
+                var cid = null;
                 var href = findDelLinkInRow(row);
-                if (!href) return;
-                var m = href.match(/[?&]cid=([^&]+)/i);
-                if (!m) return;
-                var cid = decodeURIComponent(m[1]);
+                if (href) {
+                    var m = href.match(/[?&]cid=([^&]+)/i);
+                    if (m) cid = decodeURIComponent(m[1]);
+                }
+                if (!cid) cid = findCidInRowAnchors(row, packageId, idx.name);
+                if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
                 var name = idx.name >= 0 && cells[idx.name] ? (cells[idx.name].textContent || '').trim() : '';
                 var fullName = idx.fullName >= 0 && cells[idx.fullName] ? (cells[idx.fullName].textContent || '').trim() : '';
-                if (!type) return;
+                if (!type) { dropped.noType++; return; }
                 var it = { id: cid, type: type, name: name || cid };
                 if (fullName) it.extra = { fullName: fullName };
                 items.push(it);
             });
-            console.log('[CSH] authoritative sync page', pageNum, ': rows=', rows.length);
+            console.log('[CSH] authoritative sync page', pageNum,
+                ': rows=', rows.length,
+                'kept=', rows.length - dropped.noCid - dropped.noType,
+                'dropped=', dropped, 'headerIdx=', idx);
             var nextHref = findNextPageHrefInDoc(doc);
             nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
         }
@@ -667,6 +681,34 @@
             if (/listComponentRemoveForPackage|outboundChangeSetComponentRemove/i.test(href)) return href;
         }
         return null;
+    }
+
+    // Fallback when the classic Package Components view has no Del link —
+    // extracts a 15/18-char Salesforce id from anchor hrefs in the row,
+    // preferring the Name column and skipping any anchor that points back at
+    // the enclosing package's own id.
+    function findCidInRowAnchors(rowEl, packageId, preferredCellIdx) {
+        var SF_ID_RE = /^\/?([0-9a-zA-Z]{15}(?:[0-9a-zA-Z]{3})?)(?:[?#\/]|$)/;
+        var pkgPrefix = packageId ? packageId.slice(0, 15) : null;
+        function extract(anchors) {
+            for (var i = 0; i < anchors.length; i++) {
+                var href = anchors[i].getAttribute('href') || '';
+                var m = href.match(SF_ID_RE);
+                if (!m) continue;
+                var id = m[1];
+                if (pkgPrefix && id.slice(0, 15) === pkgPrefix) continue;
+                return id;
+            }
+            return null;
+        }
+        if (preferredCellIdx != null && preferredCellIdx >= 0) {
+            var cell = rowEl.children[preferredCellIdx];
+            if (cell) {
+                var id = extract(cell.querySelectorAll('a[href]'));
+                if (id) return id;
+            }
+        }
+        return extract(rowEl.querySelectorAll('a[href]'));
     }
 
     function findNextPageHrefInDoc(doc) {
