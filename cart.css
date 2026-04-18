@@ -17,7 +17,9 @@
     color: #2b2826;
 }
 
+#csh-cart-panel.csh-cart-collapsed .csh-cart-search-row,
 #csh-cart-panel.csh-cart-collapsed .csh-cart-body,
+#csh-cart-panel.csh-cart-collapsed .csh-cart-section,
 #csh-cart-panel.csh-cart-collapsed .csh-cart-footer {
     display: none;
 }
@@ -36,6 +38,36 @@
 
 #csh-cart-panel .csh-cart-title { flex: 1 1 auto; }
 
+#csh-cart-panel .csh-cart-sync-badge {
+    font-size: 11px;
+    font-weight: 400;
+    opacity: 0.85;
+    margin-left: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+#csh-cart-panel .csh-cart-sync-badge-error {
+    color: #ffc0c0;
+    cursor: help;
+}
+
+#csh-cart-panel .csh-cart-sync-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(255, 255, 255, 0.45);
+    border-top-color: #fff;
+    animation: csh-cart-spin 0.8s linear infinite;
+    margin-left: 4px;
+}
+
+@keyframes csh-cart-spin {
+    to { transform: rotate(360deg); }
+}
+
 #csh-cart-panel .csh-cart-close {
     background: transparent;
     border: 0;
@@ -50,6 +82,35 @@
     padding: 8px 10px;
     overflow-y: auto;
     flex: 1 1 auto;
+}
+
+#csh-cart-panel .csh-cart-search-row {
+    padding: 8px 10px 0;
+}
+
+#csh-cart-panel .csh-cart-search-row .csh-cart-search {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 5px 8px;
+    font: inherit;
+    border: 1px solid #c9c9c9;
+    border-radius: 3px;
+    background: #fff;
+}
+
+#csh-cart-panel .csh-cart-search-row .csh-cart-search:focus {
+    outline: none;
+    border-color: #0176d3;
+    box-shadow: 0 0 0 1px #0176d3;
+}
+
+#csh-cart-panel .chip-filter { background: #fff4ce; color: #5a4300; }
+
+#csh-cart-panel .csh-cart-empty {
+    padding: 12px 4px;
+    color: #706e6b;
+    font-style: italic;
+    text-align: center;
 }
 
 #csh-cart-panel .csh-cart-counts {
@@ -176,6 +237,27 @@
     color: #706e6b;
     font-style: italic;
     padding: 2px 0;
+}
+
+/* Virtualized list: bounded scroll viewport with absolutely-positioned
+   rows on top of a spacer div. Rows are single-line with ellipsis; full
+   name/subname are preserved in the row's title attribute. */
+#csh-cart-panel .csh-cart-virt {
+    padding: 4px 0 0 0;
+    margin: 0;
+}
+
+#csh-cart-panel .csh-cart-item-virt {
+    box-sizing: border-box;
+    padding: 6px 0;
+    border-bottom: 1px solid #f4f4f4;
+    overflow: hidden;
+}
+
+#csh-cart-panel .csh-cart-item-virt .csh-cart-item-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 #csh-cart-panel .csh-cart-section {
