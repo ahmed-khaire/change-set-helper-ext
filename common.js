@@ -357,6 +357,47 @@ window.cshAuth = (function () {
     }).catch(function () { /* ignore — background falls back to 60.0 */ });
 })();
 
+// 5) ID mapping cache: 0A2 (outbound change set) ↔ 033 (metadata package).
+//    Captured on the Add page (where both ids are visible — 0A2 in the
+//    retURL parameter, 033 in <input id="id"> and the URL) and consumed
+//    on the Detail page (where only the 0A2 is in the URL and resolving
+//    the 033 otherwise requires loading the Add page in a hidden iframe —
+//    which Salesforce often refuses to render).
+//
+//    Persisted in chrome.storage.local so the mapping survives across
+//    tabs and sessions. Mappings never expire; the 0A2/033 pair is stable
+//    for the lifetime of the change set.
+(function () {
+    var KEY = 'cshIdMap';
+    function readMap() {
+        return new Promise(function (resolve) {
+            if (!chrome.storage || !chrome.storage.local) return resolve({});
+            chrome.storage.local.get([KEY], function (items) {
+                resolve((items && items[KEY]) || {});
+            });
+        });
+    }
+    function writeMap(map) {
+        return new Promise(function (resolve) {
+            if (!chrome.storage || !chrome.storage.local) return resolve();
+            chrome.storage.local.set({ [KEY]: map }, function () { resolve(); });
+        });
+    }
+    async function getPackageId(changeSetId) {
+        if (!changeSetId) return null;
+        var map = await readMap();
+        return map[changeSetId] || null;
+    }
+    async function putMapping(changeSetId, packageId) {
+        if (!changeSetId || !packageId) return;
+        var map = await readMap();
+        if (map[changeSetId] === packageId) return;
+        map[changeSetId] = packageId;
+        await writeMap(map);
+    }
+    window.cshIdMap = { getPackageId: getPackageId, putMapping: putMapping };
+})();
+
 // 5) describeMetadata cache + dynamic entity-type resolver.
 //    The Salesforce UI enumeration in the Component Type picker drifts between
 //    releases — every new release adds types we'd otherwise have to hard-code.
