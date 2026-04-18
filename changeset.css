@@ -1,17 +1,5 @@
 
 
-    .changesetloading {
-        display: block;
-        width: 100%;
-        height: 100%;
-        position: absolute;
-        z-index: 99999;/*puts on top of everything*/
-        background-image: url('chrome-extension://__MSG_@@extension_id__/loading.gif');
-        background-position: 250px 100px;
-        background-repeat: no-repeat;
-		opacity: .3;
-
-    }
 	.lowOpacity {
 		opacity: .3;
 
