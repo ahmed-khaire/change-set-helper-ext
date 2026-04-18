@@ -740,7 +740,6 @@ function processCompareResults(results, env) {
     });
 
     $("#editPage").removeClass("lowOpacity");
-    $("#bodyCell").removeClass("changesetloading");
 
     console.log('processCompareResults: Completed');
 }
@@ -876,7 +875,6 @@ function createDataTable() {
     }
 
     $("#editPage").removeClass("lowOpacity");
-    $("#bodyCell").removeClass("changesetloading");
 }
 
 function clearFilters() {
@@ -1390,7 +1388,6 @@ function oauthLogin(env) {
                     //do nothing else
                 }
                 $("#editPage").addClass("lowOpacity");
-                $("#bodyCell").addClass("changesetloading");
 
                 processCompareResults(results, env);
                 //console.log(results);
@@ -1529,7 +1526,6 @@ function runEnhancedFlow() {
     $('body').append(loadingHtml);
 
     $("#editPage").addClass("lowOpacity");
-    $("#bodyCell").addClass("changesetloading");
 
     // Wait for the session id. On HttpOnly-on orgs the fast sync read is
     // empty, but cshSession.ready resolves via the cookies API fallback.
@@ -1542,8 +1538,7 @@ function runEnhancedFlow() {
                 { type: 'error' }
             );
             $("#editPage").removeClass("lowOpacity");
-            $("#bodyCell").removeClass("changesetloading");
-            return;
+                    return;
         }
         // Fetch metadata FIRST. Pass the chosen auth mode so offscreen uses
         // the right jsforce.Connection shape (sessionId+serverUrl vs
@@ -1565,8 +1560,7 @@ function runEnhancedFlow() {
                 { type: 'error' }
             );
             $("#editPage").removeClass("lowOpacity");
-            $("#bodyCell").removeClass("changesetloading");
-            return;
+                    return;
         }
 
         // Check for explicit error in response
@@ -1578,8 +1572,7 @@ function runEnhancedFlow() {
                 { type: 'error' }
             );
             $("#editPage").removeClass("lowOpacity");
-            $("#bodyCell").removeClass("changesetloading");
-            return;
+                    return;
         }
 
         console.log('Fetching metadata before loading rows for type:', selectedEntityType);
@@ -1628,8 +1621,7 @@ function runEnhancedFlow() {
                 { type: 'error' }
             );
             $("#editPage").removeClass("lowOpacity");
-            $("#bodyCell").removeClass("changesetloading");
-        }
+                }
         }); // end chrome.runtime.sendMessage connectToLocal
     }); // end window.cshSession.ready.then
 }
@@ -1696,13 +1688,11 @@ function startPaginationWithMetadata() {
         $('#csh-pagination-progress').remove();
         $('#csh-pagination-overlay').remove();
         $("#editPage").removeClass("lowOpacity");
-        $("#bodyCell").removeClass("changesetloading");
-
+    
         console.log(`Pagination cancelled by user. Table finalized with ${totalComponentCount} rows.`);
     });
 
     $("#editPage").addClass("lowOpacity");
-    $("#bodyCell").addClass("changesetloading");
 
     // Async recursive function to fetch pages (metadata already loaded!)
     var totalRowsLoaded = 1000;
@@ -1743,8 +1733,7 @@ function startPaginationWithMetadata() {
             }
 
             $("#editPage").removeClass("lowOpacity");
-            $("#bodyCell").removeClass("changesetloading");
-
+        
             return;
         }
 
@@ -1882,7 +1871,6 @@ function initializeTableWithMetadata() {
     console.log(`Initializing table with ${totalComponentCount} rows with metadata (no pagination)...`);
     doTableInitialization();
     $("#editPage").removeClass("lowOpacity");
-    $("#bodyCell").removeClass("changesetloading");
 }
 
 // Function to start metadata loading after pagination is complete (or skipped)
@@ -1891,14 +1879,12 @@ function startMetadataLoading() {
         // Don't call setupTable yet - wait until first metadata batch returns
         // so we can determine dynamic columns from the metadata properties
         $("#editPage").addClass("lowOpacity");
-        $("#bodyCell").addClass("changesetloading");
 
         window.cshSession.ready.then(function (sid) {
             if (!sid) {
                 console.warn('startMetadataLoading: no session id resolved');
                 $("#editPage").removeClass("lowOpacity");
-                $("#bodyCell").removeClass("changesetloading");
-                return;
+                            return;
             }
             chrome.runtime.sendMessage({
                 "oauth": "connectToLocal",
@@ -2009,14 +1995,75 @@ $(document).ready(function () {
         );
     }
 
+    // Resolve the 0A2 outbound change-set id alongside the 033 package id so
+    // the cart sync can write to both storage keys the extension uses for
+    // the same change set (Add page keys by 033; Detail page keys by 0A2).
+    //
+    // Source ladder for the 0A2:
+    //   1. retURL parameter — present when the user navigated here from
+    //      the Detail page's "Add Components" link (carries the detail
+    //      URL whose ?id= is the 0A2).
+    //   2. DOM scan — Salesforce embeds many "View Change Set" links and
+    //      breadcrumbs back to the Detail page; the 0A2 appears in their
+    //      hrefs even when retURL is missing.
+    var __cshPkgId = $('#id').val() || null;
+    var __cshCsId = null;
+    var __cshRet = (location.search.match(/[?&]retURL=([^&]+)/) || [])[1];
+    if (__cshRet) {
+        try {
+            var __cshM = decodeURIComponent(__cshRet).match(/[?&]id=([^&]+)/);
+            if (__cshM) __cshCsId = decodeURIComponent(__cshM[1]);
+        } catch (_) { /* malformed retURL, fall through */ }
+    }
+    if (!__cshCsId) {
+        // DOM fallback: any anchor pointing at outboundChangeSetDetailPage
+        // carries the 0A2 in its ?id=.
+        var __cshAnchors = document.querySelectorAll('a[href*="outboundChangeSetDetailPage"]');
+        for (var __cshI = 0; __cshI < __cshAnchors.length; __cshI++) {
+            var __cshHref = __cshAnchors[__cshI].getAttribute('href') || '';
+            var __cshMatch = __cshHref.match(/0A2[A-Za-z0-9]{12,15}/);
+            if (__cshMatch) { __cshCsId = __cshMatch[0]; break; }
+        }
+    }
+
+    // Persist the 0A2 ↔ 033 mapping so the Detail page's authoritative cart
+    // sync can resolve the package id without bouncing through a hidden
+    // iframe (Salesforce often refuses to render the Add page in iframes
+    // and the resolver times out).
+    if (window.cshIdMap && __cshPkgId && __cshCsId) {
+        window.cshIdMap.putMapping(__cshCsId, __cshPkgId)
+            .catch(function (e) { console.warn('cshIdMap.putMapping failed:', e && e.message); });
+    }
+
     // Kick off the cart module: caches the form shape for this type, restores
     // staged checkboxes from any prior session, installs the type-switch
     // guard, and renders the floating panel if there are pending items.
     if (window.cshCart && window.cshCart.init) {
         window.cshCart.init({
-            changeSetId: $('#id').val() || null,
+            changeSetId: __cshPkgId,
             currentType: selectedEntityType || null
         });
+    }
+
+    // Populate the cart with components already in the change set so the
+    // panel reflects reality on first visit to the Add page (previously the
+    // panel stayed empty unless the user had already visited the Detail
+    // page AND its dual-key sync had happened to land on the 033 key).
+    //
+    // Writes to both the 033 (Add-page) and 0A2 (Detail-page) storage keys
+    // so the cart stays in sync across navigations.
+    if (window.cshCart && window.cshCart.syncFromChangeSetView && __cshPkgId) {
+        var __cshSetSync = window.cshCart.setSyncState || function () {};
+        __cshSetSync('syncing');
+        window.cshCart.syncFromChangeSetView(__cshCsId || __cshPkgId, __cshPkgId)
+            .then(function (r) {
+                console.log('[CSH] Add-page cart sync:', r);
+                __cshSetSync('idle');
+            })
+            .catch(function (e) {
+                console.warn('[CSH] Add-page cart sync failed:', e && e.message);
+                __cshSetSync('error', (e && e.message) || 'Sync failed');
+            });
     }
 });
 
