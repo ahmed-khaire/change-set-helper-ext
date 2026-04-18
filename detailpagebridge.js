@@ -1,55 +1,23 @@
 // ---------------------------------------------------------------------------
-// Change Set Helper — Detail page MAIN-world bridge.
+// Change Set Helper — Detail page MAIN-world bridge (diagnostic ping only).
 //
-// Registered with "world": "MAIN" in manifest.json so this script loads
-// directly into the page's JavaScript context — bypassing the CSP that
-// refuses inline <script textContent="..."> injection. Here we have access
-// to Salesforce's page-context globals: confirmRemoveComponent,
-// deleteComponent, A4J, and the actual DOM elements / event handlers.
+// The bulk-remove flow on outboundChangeSetDetailPage USED to go through
+// this bridge, clicking the per-row A4J Remove anchor then the confirmation
+// modal's OK button. That approach hit an unkillable full-page reload after
+// every delete (the A4J onclick path calls back into the form and triggers
+// a native form submit that no combination of type=button + submit-blocker
+// + form.submit override could prevent).
 //
-// Why we click the link rather than calling deleteComponent(cid) directly:
-//   The native Remove link's onclick is:
-//     confirmRemoveComponent(cid);
-//     if (window != window.top) { form.action += '?' or '&' }  // iframe fix
-//     A4J.AJAX.Submit(form, event, {...});
-//     return false;
-//
-//   Calling deleteComponent(cid) alone passes `null` as the A4J event
-//   argument. On some RichFaces builds that causes A4J to fall back to a
-//   synchronous form.submit() which triggers a full page reload instead of
-//   a partial AJAX update — which is exactly the bug the user hit (first
-//   item deletes, page hard-reloads, nothing else happens). Clicking the
-//   actual anchor element fires the real onclick with a real event, the
-//   iframe fix runs, A4J takes the AJAX path, and no navigation happens.
-//
-// Payload
-//   request  : { __cshBulk: true, cmd: 'delete', linkId: <anchor id>, mid: <id> }
-//   request  : { __cshBulk: true, cmd: 'bulk-end', mid: <id> }
-//   request  : { __cshBulk: true, cmd: 'ping', mid: <id> }
-//   response : { __cshBulk: true, source: 'page', mid: <id>, ok, ...extras }
+// Current bulk-remove path: detailcomponents.js issues classic-view Del
+// URLs via fetch() directly — no UI, no bridge needed. This bridge survives
+// only for the `ping` diagnostic so `cshDetailDiag()` still reports MAIN-
+// world status.
 // ---------------------------------------------------------------------------
 
 (function () {
     'use strict';
 
-    // Override confirmRemoveComponent once while a bulk run is in flight so
-    // each link.click() doesn't spawn a dialog. Restored via 'bulk-end'.
-    var _origConfirmRemove = null;
-    function silenceConfirm() {
-        if (_origConfirmRemove !== null) return;
-        if (typeof window.confirmRemoveComponent === 'function') {
-            _origConfirmRemove = window.confirmRemoveComponent;
-            window.confirmRemoveComponent = function () { /* no-op during bulk */ };
-            console.log('[CSH bridge] confirmRemoveComponent silenced');
-        }
-    }
-    function restoreConfirm() {
-        if (_origConfirmRemove !== null) {
-            window.confirmRemoveComponent = _origConfirmRemove;
-            _origConfirmRemove = null;
-            console.log('[CSH bridge] confirmRemoveComponent restored');
-        }
-    }
+    var OK_BUTTON_ID = 'simpleDialog0button0';
 
     window.addEventListener('message', function (ev) {
         var data = ev.data;
@@ -62,58 +30,29 @@
             );
         }
 
-        try {
-            if (data.cmd === 'delete') {
-                silenceConfirm();
-                var link = document.getElementById(data.linkId);
-                if (!link) {
-                    throw new Error('remove link not in current DOM (may be on a different page): ' + data.linkId);
-                }
-                console.log('[CSH bridge] clicking', data.linkId);
-                link.click();
-                reply({ ok: true });
-                return;
-            }
-
-            if (data.cmd === 'bulk-end') {
-                restoreConfirm();
-                reply({ ok: true });
-                return;
-            }
-
-            if (data.cmd === 'ping') {
-                reply({
-                    ok: true,
-                    isMainWorld: true,
-                    isTopFrame: window === window.top,
-                    hasDeleteComponent: typeof deleteComponent === 'function',
-                    hasConfirmRemoveComponent: typeof confirmRemoveComponent === 'function',
-                    hasA4J: typeof A4J !== 'undefined',
-                    url: location.href.slice(0, 220)
-                });
-                return;
-            }
-
-            reply({ ok: false, error: 'unknown cmd: ' + data.cmd });
-        } catch (err) {
-            reply({ ok: false, error: err && err.message ? err.message : String(err) });
+        if (data.cmd === 'ping') {
+            reply({
+                ok: true,
+                isMainWorld: true,
+                isTopFrame: window === window.top,
+                hasA4J: typeof A4J !== 'undefined',
+                hasOkButton: !!document.getElementById(OK_BUTTON_ID),
+                removeLinksOnPage: document.querySelectorAll('a[id*="removeLink"]').length,
+                url: location.href.slice(0, 220)
+            });
+            return;
         }
+
+        reply({ ok: false, error: 'unknown cmd: ' + data.cmd });
     });
 
-    // Expose a Console-callable diagnostic from MAIN world so the user can
-    // paste `cshDetailDiag()` into DevTools without switching execution
-    // context. Returns a plain object of health checks; no promises / no
-    // postMessage roundtrip needed — it's just a function on window.
     window.cshDetailDiag = function () {
         return {
             isMainWorld: true,
             isTopFrame: window === window.top,
-            hasDeleteComponent: typeof deleteComponent === 'function',
-            hasConfirmRemoveComponent: typeof confirmRemoveComponent === 'function',
             hasA4J: typeof A4J !== 'undefined',
-            hasRowForms: document.querySelectorAll('form[id*="detail_form"]').length,
+            hasOkButton: !!document.getElementById(OK_BUTTON_ID),
             removeLinksOnPage: document.querySelectorAll('a[id*="removeLink"]').length,
-            bulkSilenced: _origConfirmRemove !== null,
             url: location.href.slice(0, 220)
         };
     };
