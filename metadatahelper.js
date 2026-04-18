@@ -181,8 +181,6 @@ function cshRenderMetadataHelper() {
 	<td class="pbButton">
         <input id="downloadButton" value="Download metadata (zip)" class="btn" name="downloadall" title="Download this change set's full metadata as a zip" type="button" />
         <input id="exportPackageXmlButton" value="Export package.xml" class="btn" title="Download just the change set's package.xml manifest (no source files)" type="button" />
-        <input id="importPackageXmlButton" value="Import package.xml → cart" class="btn" title="Load a package.xml into the cart; visit Add Components to commit" type="button" />
-        <input id="importPackageXmlFile" type="file" accept=".xml,application/xml" style="display:none" />
 	</td>
 	</tr>
 	</tbody>
@@ -191,8 +189,6 @@ function cshRenderMetadataHelper() {
     );
     $("#downloadButton").click(downloadPackage);
     $("#exportPackageXmlButton").click(exportPackageXmlOnly);
-    $("#importPackageXmlButton").click(function () { $("#importPackageXmlFile").trigger('click'); });
-    $("#importPackageXmlFile").on('change', handleImportPackageXmlFile);
     changename = $('h2.pageDescription').text();
 
     // Initialise the cart module so window.cshCart.importPackageXml is

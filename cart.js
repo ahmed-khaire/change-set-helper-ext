@@ -1331,6 +1331,7 @@
               '<div class="csh-cart-section-row">' +
                 '<button class="csh-cart-export-pkg" title="Download the cart as a Salesforce package.xml file">Export</button>' +
                 '<button class="csh-cart-import-pkg" title="Load a package.xml file into the cart">Import</button>' +
+                '<button class="csh-cart-import-info" type="button" title="What does Import do?" aria-label="About Import">i</button>' +
                 '<input type="file" class="csh-cart-pkg-file" accept=".xml,application/xml" style="display:none">' +
               '</div>' +
             '</div>' +
@@ -1471,6 +1472,13 @@
         var pkgFileInput = panel.querySelector('.csh-cart-pkg-file');
         panel.querySelector('.csh-cart-import-pkg').addEventListener('click', function () {
             pkgFileInput.click();
+        });
+        panel.querySelector('.csh-cart-import-info').addEventListener('click', function () {
+            window.cshToast && window.cshToast.show(
+                'Import loads items from a package.xml into the cart as staged selections only. ' +
+                'They are not added to the change set yet — click "Submit All" to send them to Salesforce.',
+                { type: 'info', duration: 9000 }
+            );
         });
         pkgFileInput.addEventListener('change', async function (ev) {
             var file = ev.target.files && ev.target.files[0];
