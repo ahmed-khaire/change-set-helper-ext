@@ -613,13 +613,21 @@
     var _cartType = null;
     function installCheckboxAutoSave(changeSetId, type) {
         _cartType = type;
+        // Selector intentionally scoped to `table.list input[type="checkbox"]`
+        // rather than `tr.dataRow input[...]` so the header "Select All"
+        // checkbox in <thead> is also covered. Salesforce's inline
+        // onclick="clickAll(this)" on the header directly mutates .checked on
+        // every row without dispatching change/click events, so a row-scoped
+        // delegation never fires for those programmatic toggles and the cart
+        // would go stale after Select All. Matching on the header checkbox's
+        // own click bubble gives us one handler invocation per Select-All,
+        // and the 60ms debounce lets clickAll finish before syncCartFromCheckboxes
+        // reads the resulting .checked states.
         $(document).off('change.cshAutoSave click.cshAutoSave')
             .on('change.cshAutoSave click.cshAutoSave',
-                'table.list tr.dataRow input[type="checkbox"]',
+                'table.list input[type="checkbox"]',
                 function () {
                     if (autoSaveTimer) clearTimeout(autoSaveTimer);
-                    // Short debounce coalesces a native Select-All click that
-                    // toggles every visible checkbox at once.
                     autoSaveTimer = setTimeout(function () {
                         syncCartFromCheckboxes(changeSetId, type).catch(function (e) {
                             console.warn('cshCart auto-save failed:', e && e.message);
