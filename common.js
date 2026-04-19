@@ -269,9 +269,9 @@ window.cshAuth = (function () {
 // 4) Dynamic Salesforce API version discovery.
 //    Hits /services/data/ on the current host and picks the highest supported
 //    version. Cached per-host in chrome.storage.local for 24h so we don't
-//    round-trip every page load. Falls back to stored sync pref, then to 60.0.
+//    round-trip every page load. Falls back to stored sync pref, then to 66.0.
 (function () {
-    var FALLBACK = '60.0';
+    var FALLBACK = '66.0';
     var CACHE_KEY = 'cshApiVersionCache';
     var CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -354,7 +354,7 @@ window.cshAuth = (function () {
         window.cshApiVersion.resolved = version;
         if (!chrome.storage || !chrome.storage.local) return;
         chrome.storage.local.set({ cshResolvedApiVersion: version });
-    }).catch(function () { /* ignore — background falls back to 60.0 */ });
+    }).catch(function () { /* ignore — background falls back to 66.0 */ });
 })();
 
 // 5) ID mapping cache: 0A2 (outbound change set) ↔ 033 (metadata package).
@@ -489,13 +489,53 @@ window.cshAuth = (function () {
             return overrideMap[uiName];
         }
         if (describeData && Array.isArray(describeData.metadataObjects)) {
+            // First pass: exact xmlName / childXmlNames match (fast, common).
             for (var i = 0; i < describeData.metadataObjects.length; i++) {
                 var mo = describeData.metadataObjects[i];
                 if (mo && mo.xmlName === uiName) return uiName;
-                // Fold "children" (e.g. CustomField lives under CustomObject's childXmlNames)
                 if (mo && Array.isArray(mo.childXmlNames)) {
                     for (var j = 0; j < mo.childXmlNames.length; j++) {
                         if (mo.childXmlNames[j] === uiName) return uiName;
+                    }
+                }
+            }
+            // Fallback: Salesforce's change-set picker occasionally sends a
+            // display label ("Custom Metadata Type", "Auth. Provider",
+            // "S-Control", "Auto-Response Rule") in #entityType instead of
+            // the API name. Normalize by stripping every non-word character
+            // and tolerate trailing "Type"/"Types" and singular/plural s
+            // mismatches so new types Salesforce adds in label form resolve
+            // automatically against describeMetadata without needing an
+            // override-map entry.
+            var normalized = String(uiName).replace(/[^A-Za-z0-9]/g, '');
+            if (!normalized) return null;
+            var candidates = [normalized];
+            if (/Types?$/.test(normalized)) {
+                candidates.push(normalized.replace(/Types?$/, ''));
+            }
+            for (var k = 0; k < describeData.metadataObjects.length; k++) {
+                var mo2 = describeData.metadataObjects[k];
+                if (!mo2 || !mo2.xmlName) continue;
+                for (var c = 0; c < candidates.length; c++) {
+                    var cand = candidates[c];
+                    if (mo2.xmlName === cand) return mo2.xmlName;
+                    // Tolerate "Rule"/"Rules", "Setting"/"Settings" style
+                    // pluralization drift between label and xmlName either way.
+                    if (mo2.xmlName === cand + 's') return mo2.xmlName;
+                    if (mo2.xmlName + 's' === cand) return mo2.xmlName;
+                }
+                // Also walk childXmlNames with the same tolerances — covers
+                // nested types (CustomField, ValidationRule, FieldSet, …).
+                if (Array.isArray(mo2.childXmlNames)) {
+                    for (var cx = 0; cx < mo2.childXmlNames.length; cx++) {
+                        var child = mo2.childXmlNames[cx];
+                        if (!child) continue;
+                        for (var c2 = 0; c2 < candidates.length; c2++) {
+                            var cand2 = candidates[c2];
+                            if (child === cand2) return child;
+                            if (child === cand2 + 's') return child;
+                            if (child + 's' === cand2) return child;
+                        }
                     }
                 }
             }

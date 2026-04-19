@@ -25,7 +25,7 @@ function save_options(e) {
 function restore_options() {
     chrome.storage.sync.get(['salesforceApiVersion', 'cshOauthClientId'], function (items) {
         var versionPattern = new RegExp('^[0-9][0-9]\\.0$');
-        var apiversion = versionPattern.test(items.salesforceApiVersion) ? items.salesforceApiVersion : '60.0';
+        var apiversion = versionPattern.test(items.salesforceApiVersion) ? items.salesforceApiVersion : '66.0';
         document.getElementById('salesforceApiVersion').value = apiversion;
 
         var savedId = items.cshOauthClientId || DEFAULT_CLIENT_ID;

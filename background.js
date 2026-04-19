@@ -1,14 +1,14 @@
 // Manifest V3 service worker
 // JSforce operations are handled in offscreen.html/offscreen.js due to XMLHttpRequest requirement
 
-var CSH_APIVERSION = "60.0";
+var CSH_APIVERSION = "66.0";
 var CSH_APIVERSION_IS_USER_PREF = false;
 const versionPattern = RegExp('^[0-9][0-9]\.0$');
 
 // Priority:
 //   1. chrome.storage.sync.salesforceApiVersion  — user-set from options page
 //   2. chrome.storage.local.cshResolvedApiVersion — auto-discovered by common.js
-//   3. fallback "60.0"
+//   3. fallback "66.0" (Spring '26)
 function applyApiVersion(value, isUserPref) {
     if (value && versionPattern.test(value)) {
         CSH_APIVERSION = value;

@@ -1,6 +1,6 @@
 // Offscreen document for JSforce operations (has access to XMLHttpRequest)
 
-var CSH_APIVERSION = "60.0";
+var CSH_APIVERSION = "66.0";
 const versionPattern = RegExp('^[0-9][0-9]\.0$');
 
 const POLLTIMEOUT = 20*60*1000; // 20 minutes
@@ -28,7 +28,7 @@ function initializeOffscreen() {
     }
 
     // Initialize chrome.storage API calls after Chrome APIs are ready.
-    // Same priority ladder as background.js: sync user pref > local auto > 60.0.
+    // Same priority ladder as background.js: sync user pref > local auto > 66.0.
     var offscreenIsUserPref = false;
     try {
         if (chrome && chrome.storage && chrome.storage.sync) {

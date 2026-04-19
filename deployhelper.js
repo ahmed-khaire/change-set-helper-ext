@@ -27,6 +27,15 @@ var cshDpPollTimer = null;
 var cshDpPollState = null;              // {deployId, orgId, instanceUrl, accessToken, apiVersion}
 var cshDpPollInFlight = false;          // one poll at a time
 
+// Button label tracks the current deploy-mode selector so "Please wait..." →
+// reset always returns to a label that matches what will happen on the next
+// click. Falls back to "Validate" if the selector isn't rendered yet (before
+// cshRenderDeployHelper runs) so callers in error paths don't blow up.
+function cshDeployButtonLabel() {
+	var mode = $("#deployModeInput :selected").val() || 'validate';
+	return mode === 'deploy' ? 'Deploy' : 'Validate';
+}
+
 function cshFormatElapsed(ms) {
     if (!ms || ms < 0) return '0s';
     var s = Math.floor(ms / 1000);
@@ -103,7 +112,7 @@ function cshStartPageDeployPoll(handoff) {
         orgId: handoff.orgId,
         instanceUrl: String(handoff.instanceUrl || '').replace(/\/+$/, ''),
         accessToken: handoff.accessToken,
-        apiVersion: handoff.apiVersion || '60.0'
+        apiVersion: handoff.apiVersion || '66.0'
     };
     $('#currentDeployId').val(handoff.deployId);
     $('#cancelDeploy').show();
@@ -162,10 +171,16 @@ async function cshPollDeployOnce() {
         cshRenderDeployProgress(dr);
         if (dr.done) {
             cshStopPageDeployPoll();
-            $('#deployTest').prop('disabled', false).val('Go...');
+            $('#deployTest').prop('disabled', false).val(cshDeployButtonLabel());
             $('#cancelDeploy').hide();
             cshFinishDeployProgress(dr.status);
-            if (dr.status === 'Succeeded') {
+            // Quick Deploy only applies to a successful VALIDATION — it
+            // reuses the validated zip to do the real deploy without a
+            // re-retrieve. If this was already a direct deploy (checkOnly
+            // false) the change set is live in the target org and Quick
+            // Deploy would re-execute it redundantly. `dr.checkOnly` is
+            // reported by the REST endpoint verbatim from the async result.
+            if (dr.status === 'Succeeded' && dr.checkOnly) {
                 $('#currentDeployId').val(dr.id);
                 $('#quickDeploy').show();
             }
@@ -515,7 +530,7 @@ function cshRenderDeployHelper() {
 
 	<table border="0" cellpadding="0" cellspacing="0">
 	<tbody><tr>
-	<td class="pbTitle"><h2 class="mainTitle">Validate Helper (Updated!)</h2></td>
+	<td class="pbTitle"><h2 class="mainTitle">Validate &amp; Deploy</h2></td>
 	<td class="pbButton" id="loginSection">
 
 	<!-- Saved-orgs picker: shown when the user has connected at least one
@@ -544,6 +559,11 @@ function cshRenderDeployHelper() {
 
 	</td>
     <td class="pbButton" id="validateSection">
+        <select id='deployModeInput' name='Deploy Mode' title='Validate checks deployability without applying changes. Deploy applies the change set to the target org.'>
+    		<option value='validate'>Validate only</option>
+    		<option value='deploy'>Deploy to target</option>
+    	</select>
+
         <select id='testLevelInput' name='Test Level'>
     		<option value=''>Default test level</option>
     		<option value='NoTestRun'>NoTestRun</option>
@@ -555,7 +575,7 @@ function cshRenderDeployHelper() {
         <textarea id='specifiedTestsInput' rows='2' cols='46' style='display:none;vertical-align:middle;margin-left:6px;font-family:Menlo,Consolas,monospace;'
             placeholder='Test class names (comma- or space-separated): MyTest, MyOtherTest'></textarea>
 
-        <input value="Go..." class="btn" name="deployTest" id="deployTest" title="Go.." type="button" />
+        <input value="Validate" class="btn" name="deployTest" id="deployTest" title="Run the selected action against the connected target org." type="button" />
 
         <span id="loggedInUsername"></span> (<a id="logoutLink" href="#">Logout</a>)
     </td>
@@ -625,10 +645,22 @@ function cshRenderDeployHelper() {
 
 
 function testDeploy() {
-	var checkOnly = true;
+	// Mode controls whether this is a dry-run (checkOnly=true) or an actual
+	// deploy that applies the change set in the target org (checkOnly=false).
+	// The direct-deploy path lands changes irreversibly — hence the strong
+	// confirmation prompt that names the target org, the change set, and the
+	// test level so the user sees exactly what they're about to do.
+	var mode = $("#deployModeInput :selected").val() || 'validate';
+	var checkOnly = mode !== 'deploy';
 	if (!checkOnly) {
-		var isContinue = confirm("This will deploy the change set.  Are you sure?")
-		if (!isContinue) return;
+		var targetOrg = $.trim($("#loggedInUsername").text()) || 'the connected org';
+		var testLevelForPrompt = $("#testLevelInput :selected").val() || 'default';
+		var msg = 'Deploy "' + changename + '" to ' + targetOrg + '?\n\n' +
+			'Test level: ' + testLevelForPrompt + '\n\n' +
+			'This WILL apply the change set to the target org. Salesforce ' +
+			'does not support rollback of a succeeded deploy — you can only ' +
+			'undo it by deploying the previous state. Continue?';
+		if (!confirm(msg)) return;
 	}
 
 	var testLevel = $("#testLevelInput :selected").val();
@@ -694,7 +726,7 @@ function testDeploy() {
 			$('#deployContent').html('<pre><code>' + JSON.stringify(err, null, 2) + '</code></pre>');
 			cshStopPageDeployPoll();
 			cshFinishDeployProgress('Failed');
-			$('#deployTest').prop('disabled', false).val('Go...');
+			$('#deployTest').prop('disabled', false).val(cshDeployButtonLabel());
 			port.disconnect();
 		} else if (msg.handoff) {
 			// Background finished the retrieve + deploy kickoff and handed
@@ -1052,7 +1084,7 @@ function quickDeploy() {
 				$('#cancelDeploy').hide();
 				cshStopPageDeployPoll();
 				cshFinishDeployProgress('Failed');
-				$('#deployTest').prop('disabled', false).val('Go...');
+				$('#deployTest').prop('disabled', false).val(cshDeployButtonLabel());
 				port.disconnect();
 			} else if (msg.handoff) {
 				// Hand off to the page poller (same as validate flow).
@@ -1108,6 +1140,19 @@ function quickDeploy() {
 		$(document).on('change', '#testLevelInput', function () {
 			if ($(this).val() === 'RunSpecifiedTests') $('#specifiedTestsInput').show();
 			else $('#specifiedTestsInput').hide();
+		});
+
+		// Keep the button label in sync with the deploy-mode selector. Picking
+		// "Deploy to target" flips the button to "Deploy" so the user is never
+		// a click away from an irreversible deploy with a misleading label.
+		// Also paint the button red in deploy mode as a visual tripwire.
+		$(document).on('change', '#deployModeInput', function () {
+			var $btn = $('#deployTest');
+			// Only swap the label when the button is idle — if a run is in
+			// progress the button says "Please wait..." and must stay that way.
+			if (!$btn.prop('disabled')) $btn.val(cshDeployButtonLabel());
+			if ($(this).val() === 'deploy') $btn.addClass('csh-deploy-live');
+			else $btn.removeClass('csh-deploy-live');
 		});
 
 		// Reveal the My Domain URL input only when that option is picked.

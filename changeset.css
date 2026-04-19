@@ -82,31 +82,6 @@ table.list tr.csh-diff-same > td:first-child {
     background: #dbeaf7;
 }
 
-/* Phase 5.2 — Modified-by-me / last N days filter bar */
-.csh-mod-filter {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: center;
-    padding: 8px 12px;
-    margin: 6px 0;
-    background: #f4f6f9;
-    border: 1px solid #e5e5e5;
-    border-radius: 3px;
-    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
-}
-.csh-mod-filter label { display: inline-flex; align-items: center; gap: 4px; margin: 0; }
-.csh-mod-filter input[type="number"],
-.csh-mod-filter input[type="text"] {
-    padding: 3px 6px;
-    border: 1px solid #c9c9c9;
-    border-radius: 3px;
-    font: inherit;
-}
-.csh-mod-filter input[type="number"] { width: 64px; }
-.csh-mod-filter input[type="text"]   { width: 200px; }
-.csh-mod-filter .btn { padding: 2px 10px; }
-
 /* Phase 6 — toolbar actions group on the Add Components page */
 .csh-toolbar-actions {
     display: inline-flex;
@@ -116,6 +91,15 @@ table.list tr.csh-diff-same > td:first-child {
 }
 .csh-toolbar-actions .btn {
     padding: 3px 10px;
+}
+
+/* Hide Salesforce's alphabet quick-nav (A | B | C | ... | Other | All) from
+   the rolodex bar. The DataTables column-level search inputs we add to the
+   table footer supersede it, and leaving the alphabet visible just crowds
+   the row that now hosts the unified Actions group. */
+div.rolodex .listItem,
+div.rolodex .listItems {
+    display: none !important;
 }
 
 /* Phase 7 — Detail page Components block: selection column + bulk remove
@@ -677,4 +661,18 @@ table.list th.csh-cv-select-col {
     border: 1px solid #e5e8ed;
     border-radius: 3px;
     font: 12px/1.5 Menlo, Consolas, monospace;
+}
+
+/* Validate Helper — direct-deploy mode visual cue.
+   Salesforce's base .btn is grey; flipping it red when the deploy-mode
+   selector is on "Deploy to target" is a cheap tripwire that helps catch the
+   "I thought I was validating" mistake before the user clicks. */
+.csh-deploy-live#deployTest {
+    background: #c23934 !important;
+    color: #fff !important;
+    border-color: #8e1f1b !important;
+    font-weight: bold;
+}
+.csh-deploy-live#deployTest:hover {
+    background: #a61c1c !important;
 }

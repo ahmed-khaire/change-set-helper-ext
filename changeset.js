@@ -68,6 +68,40 @@ var entityTypeMap = {
     'ActionEmail': 'WorkflowAlert',
     'Report': 'Report',
     'ExternalString': 'CustomLabel',
+    // Salesforce's Add-to-Change-Set picker sometimes emits the display label
+    // (with spaces and a "Type" suffix) instead of the Metadata API xmlName,
+    // so describe identity-matching won't resolve these on its own.
+    //
+    // Custom Metadata Type picker lists __mdt TYPE DEFINITIONS (rows like
+    // "My_Config__mdt"), which are surfaced by the Metadata API as CustomObject,
+    // not CustomMetadata. CustomMetadata covers records (rows like
+    // "My_Config.Row_1") — mapping CMT picker to CustomMetadata made the compare
+    // fetch every record from the target org and treat them all as "[target
+    // only]" because local rows were keyed to the __mdt types. CSH_POST_FILTERS
+    // below trims the full CustomObject list down to just the __mdt entries.
+    'Custom Metadata Type': 'CustomObject',
+    'Custom Metadata Types': 'CustomObject',
+}
+
+// Per-picker post-filter applied to both local getMetaData results and the
+// compare-org result set. Used when the resolved Metadata API type is broader
+// than what the Salesforce change-set picker actually lists — e.g. the
+// "Custom Metadata Type" picker maps to CustomObject but only __mdt entries
+// are in scope. Keyed on selectedEntityType (picker value), returns a filter
+// function; callers default to pass-through when no entry exists.
+var CSH_POST_FILTERS = {
+    'Custom Metadata Type': function (rec) {
+        return rec && typeof rec.fullName === 'string' && /__mdt$/.test(rec.fullName);
+    },
+    'Custom Metadata Types': function (rec) {
+        return rec && typeof rec.fullName === 'string' && /__mdt$/.test(rec.fullName);
+    }
+};
+
+function cshApplyPostFilter(results) {
+    var f = CSH_POST_FILTERS[selectedEntityType];
+    if (!f || !Array.isArray(results)) return results;
+    return results.filter(f);
 }
 
 //as Dashboard, Document,
@@ -78,6 +112,39 @@ var entityFolderMap = {
     'EmailTemplate': 'EmailFolder',
     'Dashboard': 'DashboardFolder'
 }
+
+// Types where Salesforce renders the Label in the Name column and the real
+// API identifier lives in the fullName (Parent.Child, Parent-Name, or a
+// distinct *__c developer name). Showing a "Developer Name" column makes it
+// possible to disambiguate rows that would otherwise look identical — e.g.
+// a "Status" field that exists on both Account and Contact, or two "Active"
+// record types on different objects. Membership = true means we render the
+// extra column; types not listed keep the default layout.
+//
+// Curated rather than heuristic because (a) Salesforce changes the Name-cell
+// contents between releases, and (b) for types like ApexClass the rendered
+// Name already IS the API name, so adding the column would just be noise.
+var CSH_DEVELOPER_NAME_TYPES = {
+    'CustomField': true,
+    'ValidationRule': true,
+    'RecordType': true,
+    'FieldSet': true,
+    'CompactLayout': true,
+    'Layout': true,
+    'WorkflowRule': true,
+    'WorkflowFieldUpdate': true,
+    'WorkflowAlert': true,
+    'WorkflowTask': true,
+    'WorkflowOutboundMessage': true,
+    'QuickAction': true,
+    'ListView': true,
+    'CustomObject': true,
+    'CustomMetadata': true,
+    'CustomLabel': true,
+    'SharingRules': true,
+    'SharingCriteriaRule': true,
+    'SharingOwnerRule': true
+};
 
 
 // Remembered once in setupTable() so every row/column index is computed from
@@ -331,9 +398,36 @@ function determineMetadataColumns(metadataRecordOrArray) {
 
     var columns = [];
 
+    // Developer Name / API Name column. For component families where the
+    // "Name" cell Salesforce renders is really the Label (multiple rows can
+    // share it — CustomField most famously, where Account.MyField__c and
+    // Contact.MyField__c both show as "My Field"), we prepend a dedicated
+    // column showing the API name so users can tell duplicates apart, sort
+    // by it, and filter by it. For types whose Name already IS the API name
+    // (ApexClass, ApexTrigger, LWC bundles, …) the column is redundant and
+    // we skip adding it.
+    //
+    // filterType:'text' tells tableInitComplete to build a text-search input
+    // instead of the default dropdown — for CustomField with 5000 unique
+    // developer names a dropdown with 5000 options is useless.
+    // Key lookup on resolvedMetadataType (Metadata API name, e.g. "CustomField"),
+    // NOT selectedEntityType (Salesforce UI name, e.g. "CustomFieldDefinition").
+    // The CSH_DEVELOPER_NAME_TYPES map is authored against API names, so checking
+    // the UI name never matched — the column silently never appeared.
+    if (CSH_DEVELOPER_NAME_TYPES[resolvedMetadataType]) {
+        columns.push({
+            propertyName: 'fullName',
+            headerLabel: 'Developer Name',
+            isDate: false,
+            filterType: 'text'
+        });
+    }
+
     // Define which properties to include and in what order
     // Skip certain properties that aren't useful for display
-    // fullName is skipped because the table already has a "Name" column
+    // fullName is skipped in the generic union loop because we've already
+    // handled it as the Developer Name column above (types where it matters)
+    // or intentionally omitted it (types where it'd duplicate the Name cell).
     var skipProperties = ['id', 'type', 'fileName', 'manageableState', 'namespacePrefix', 'fullName'];
 
     // Preferred order for common properties
@@ -424,6 +518,10 @@ function processListResults(response) {
         results = response.results;
         console.log('Results is already array');
     }
+    // Narrow the result set to what the Salesforce picker actually lists
+    // (e.g. CustomObject → __mdt-only for "Custom Metadata Type"). No-op for
+    // picker types without a registered filter.
+    results = cshApplyPostFilter(results) || results;
     var len = results ? results.length : 0;
     console.log('Processing', len, 'metadata results from JSforce');
 
@@ -640,6 +738,12 @@ function jq(myid) {
 function cshAppendTargetOnlyRows(records, env) {
     if (!changeSetTable) return;
     var totalCols = changeSetTable.columns().count();
+    // Build every row array first, then batch-add via rows.add(). Calling
+    // row.add(...).draw() per record re-renders the whole table N times; for
+    // orgs with thousands of target-only ghosts that compounds with
+    // processCompareResults' own draw to freeze the tab. The caller redraws
+    // once after us.
+    var rowArrays = [];
     records.forEach(function (rec) {
         var row = new Array(totalCols).fill('');
         // Column 0 - plain-text badge. Styling comes from the row class
@@ -658,8 +762,11 @@ function cshAppendTargetOnlyRows(records, env) {
         if (compareColumnIndices.folder >= 0 && rec.folder) {
             row[compareColumnIndices.folder] = String(rec.folder);
         }
-        var added = changeSetTable.row.add(row).draw(false);
-        var node = added.node();
+        rowArrays.push(row);
+    });
+    var addedRows = changeSetTable.rows.add(rowArrays);
+    addedRows.every(function () {
+        var node = this.node();
         if (node) {
             node.classList.add('csh-diff-target-only');
             node.setAttribute('data-csh-target-only', '1');
@@ -709,6 +816,14 @@ function processCompareResults(results, env) {
         if (key && !(key in fullNameToRowIdx)) fullNameToRowIdx[key] = this.index();
     });
 
+    // Track rows we actually mutated so a single invalidate+draw at the end
+    // can re-sync DataTables' internal cache with what we wrote to the DOM.
+    // Writing via cell().data() per-cell triggers an internal invalidation
+    // each call — at 5000 matches × 3 cells that's 15k invalidations, which
+    // by itself adds several seconds even after Fix 3's join speedup. Direct
+    // DOM writes + one rows().invalidate('dom') is orders of magnitude faster.
+    var mutatedRowIdxs = [];
+
     for (i = 0; i < results.length; i++) {
         var fullName = results[i].fullName;
         var rowIdx = fullNameToRowIdx[fullName];
@@ -719,17 +834,23 @@ function processCompareResults(results, env) {
         }
 
         dateMod = new Date(results[i].lastModifiedDate);
+        mutatedRowIdxs.push(rowIdx);
 
-            // Update compare columns with data from other org (use dynamic indices)
-            changeSetTable.cell(rowIdx, compareColumnIndices.compareDateMod).data(convertDate(dateMod));
-            changeSetTable.cell(rowIdx, compareColumnIndices.compareModBy).data(results[i].lastModifiedByName);
-            changeSetTable.cell(rowIdx, compareColumnIndices.fullName).data('<a href="#">' + fullName + '</a>');
+            // Update compare columns with data from other org. Write to the
+            // cell nodes directly to avoid the per-call redraw that cell().data()
+            // triggers — we invalidate & redraw once after the loop.
+            var dateCellNode = changeSetTable.cell(rowIdx, compareColumnIndices.compareDateMod).node();
+            var modByCellNode = changeSetTable.cell(rowIdx, compareColumnIndices.compareModBy).node();
+            var fullNameCellNode = changeSetTable.cell(rowIdx, compareColumnIndices.fullName).node();
+            if (dateCellNode) dateCellNode.textContent = convertDate(dateMod);
+            if (modByCellNode) modByCellNode.textContent = results[i].lastModifiedByName || '';
+            if (fullNameCellNode) fullNameCellNode.innerHTML = '<a href="#">' + fullName + '</a>';
 
             // Make Full Name cell clickable for diff. Also stamp the cell
             // with data-fullName so the click handler can resolve the item
             // name directly off the clicked node (the historical bug was
             // reading data-fullName from a cell that never had it set).
-            var fullNameCell = changeSetTable.cell(rowIdx, compareColumnIndices.fullName).node();
+            var fullNameCell = fullNameCellNode;
             $(fullNameCell).attr('data-fullName', fullName);
             $(fullNameCell).off("click");
             $(fullNameCell).click(getContents);
@@ -789,6 +910,14 @@ function processCompareResults(results, env) {
             }
     }
 
+    // One-shot re-sync: pull the DOM changes we just made back into the
+    // DataTables internal cache so sort/filter/search see the new compare
+    // values, then redraw once. draw(false) preserves the current page so
+    // the user isn't bounced to page 1 after a refresh.
+    if (mutatedRowIdxs.length > 0) {
+        changeSetTable.rows(mutatedRowIdxs).invalidate('dom');
+    }
+
     // Phase 6: append ghost rows for target-only records.
     // These aren't in the local change set. They sort, filter, and export
     // like regular rows, but get the fourth colour-diff state: red + [target only].
@@ -798,6 +927,9 @@ function processCompareResults(results, env) {
 
     // Hide folder column after processing
     changeSetTable.column(compareColumnIndices.folder).visible(false);
+    // Final draw picks up the invalidated rows, column visibility changes,
+    // and any target-only rows appended above — in one pass.
+    changeSetTable.draw(false);
 
     // Populate Compare Modified By dropdown filter
     var column = changeSetTable.column(compareColumnIndices.compareModBy);
@@ -830,16 +962,11 @@ function createDataTable() {
             console.log('createDataTable: WARNING - Filters are missing (this should not happen)');
         }
 
-        // Ensure clear filters + CSV button exist
-        if ($('.clearFilters').length === 0) {
-            console.log('createDataTable: Adding Clear Filters button');
-            $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
-            $(".clearFilters").click(clearFilters);
-        }
-        if ($('.cshExportCsv').length === 0) {
+        // Ensure the unified toolbar group exists (Reset + Export CSV +
+        // Export/Import package.xml all live inside cshInstallToolbarActions).
+        if ($('.csh-toolbar-actions').length === 0) {
             cshInstallToolbarActions();
         }
-        cshInstallModifiedByFilter();
 
         return;
     }
@@ -935,10 +1062,7 @@ function createDataTable() {
             initComplete: tableInitComplete
         });
 
-        $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
-        $(".clearFilters").click(clearFilters);
         cshInstallToolbarActions();
-        cshInstallModifiedByFilter();
         $("#editPage").submit(function (event) {
             clearFilters();
             return true;
@@ -958,15 +1082,17 @@ function clearFilters() {
     $(".dtsearch").val('');
 }
 
-// Installs the "Actions" button group next to Reset Search Filters on the
-// Add Components toolbar. Groups together data-export (CSV / TSV) and
-// package.xml I/O so users don't have to open the cart drawer for
-// routine operations. Safe to call multiple times — idempotent.
+// Installs the unified toolbar actions group on the Add Components page.
+// Holds every button we add — Reset Search Filters, Export CSV, and
+// package.xml I/O — so all extension affordances sit together in one row
+// instead of being scattered around Salesforce's rolodex. Safe to call
+// multiple times — idempotent.
 function cshInstallToolbarActions() {
     if ($('.csh-toolbar-actions').length) return;
     var $group = $(
         '<span class="csh-toolbar-actions" style="float:left;display:inline-flex;gap:4px;margin-right:8px;">' +
-          '<input type="button" value="Export TSV"            class="cshExportCsv btn"     title="Download the currently-filtered table as a tab-separated file" />' +
+          '<input type="button" value="Reset Search Filters"   class="clearFilters btn"     title="Reset search filters" />' +
+          '<input type="button" value="Export CSV"             class="cshExportCsv btn"     title="Download the currently-filtered table as a CSV file" />' +
           '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
           '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
           '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
@@ -974,6 +1100,7 @@ function cshInstallToolbarActions() {
     );
     $group.prependTo('div.rolodex');
 
+    $group.find('.clearFilters').on('click', clearFilters);
     $group.find('.cshExportCsv').on('click', cshExportTable);
     $group.find('.cshExportPkg').on('click', function () {
         if (!window.cshCart || !window.cshCart.exportCartAsPackageXml) {
@@ -1008,16 +1135,16 @@ function cshInstallToolbarActions() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5.1 — CSV / TSV export
+// Phase 5.1 — CSV export
 //
-// Dumps the currently-filtered DataTable rows as a tab-separated file so the
-// user can paste directly into Excel / Numbers / Sheets without worrying
-// about quoted-comma escaping. Respects visible columns and active search.
+// Dumps the currently-filtered DataTable rows as a comma-separated file.
+// Respects visible columns and active search. Values containing a comma,
+// quote, or newline are wrapped in double quotes per RFC 4180.
 // ---------------------------------------------------------------------------
 function cshCsvEscape(val) {
     if (val == null) return '';
     var s = String(val);
-    if (/[\t\r\n"]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    if (/[,"\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
     return s;
 }
 
@@ -1031,7 +1158,7 @@ function cshExportTable() {
         return $.trim($(changeSetTable.column(idx).header()).text());
     });
     var lines = [];
-    lines.push(headers.map(cshCsvEscape).join('\t'));
+    lines.push(headers.map(cshCsvEscape).join(','));
 
     var rowApi = changeSetTable.rows({ search: 'applied' });
     var data = rowApi.data().toArray();
@@ -1045,16 +1172,16 @@ function cshExportTable() {
             var cell = rowNode ? $(rowNode).children('td').eq(colIdx).text() : rowData[colIdx];
             return cshCsvEscape(String(cell == null ? '' : cell).replace(/\s+/g, ' ').trim());
         });
-        lines.push(line.join('\t'));
+        lines.push(line.join(','));
     }
 
     var entityType = $('#entityType').val() || 'change-set';
     var stamp = new Date().toISOString().slice(0, 10);
-    var fname = 'csh-' + entityType + '-' + stamp + '.tsv';
+    var fname = 'csh-' + entityType + '-' + stamp + '.csv';
     // UTF-8 BOM (U+FEFF) so Excel on Windows treats the file as UTF-8 and
     // renders non-ASCII characters (e.g. curly apostrophes in component
     // names) correctly instead of garbling them in the Windows-1252 guess.
-    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/tab-separated-values;charset=utf-8' });
+    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
@@ -1069,82 +1196,6 @@ function cshExportTable() {
         'Exported ' + (lines.length - 1) + ' row(s) to ' + fname,
         { type: 'success', duration: 3000 }
     );
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5.2 — Modified-by-me / last N days filter
-//
-// Sits above the table, filters using DataTables' custom search hook against
-// lastModifiedBy and lastModifiedDate columns if they exist. Only registers
-// the hook once; toggle off when fields are empty.
-// ---------------------------------------------------------------------------
-var cshModFilterInstalled = false;
-var cshModFilterCtx = { byColIdx: -1, dateColIdx: -1 };
-
-function cshInstallModifiedByFilter() {
-    if (!changeSetTable || cshModFilterInstalled) return;
-    if (!dynamicColumns || dynamicColumns.length === 0) return;
-
-    var headerCount = (typeof cshOriginalHeaderCount === 'number' && cshOriginalHeaderCount > 0)
-        ? cshOriginalHeaderCount : (typeColumn.length > 0 ? 3 : 2);
-    cshModFilterCtx.byColIdx = -1;
-    cshModFilterCtx.dateColIdx = -1;
-    dynamicColumns.forEach(function (col, i) {
-        if (col.propertyName === 'lastModifiedByName') cshModFilterCtx.byColIdx = headerCount + i;
-        if (col.propertyName === 'lastModifiedDate')   cshModFilterCtx.dateColIdx = headerCount + i;
-    });
-    if (cshModFilterCtx.byColIdx === -1 && cshModFilterCtx.dateColIdx === -1) return;
-
-    // Best-effort: pull a display name from the Salesforce header so the
-    // "Modified by me" checkbox works out of the box. User can edit if wrong.
-    var me = $.trim(
-        $('.userProfile .uiOutputText').first().text() ||
-        $('.branding-userProfile-button').attr('title') ||
-        $('.userNav').text() || ''
-    );
-
-    var html =
-        '<div id="csh-mod-filter" class="csh-mod-filter">' +
-          '<strong>Quick filter:</strong> ' +
-          '<label><input type="checkbox" id="csh-mod-me"> Modified by me</label> ' +
-          '<input type="text" id="csh-mod-me-name" placeholder="my display name" value="' + $('<div>').text(me).html() + '" title="Your display name as it appears in Last Modified By">' +
-          ' <label>In the last <input type="number" id="csh-mod-days" min="0" max="365" placeholder="7"> days</label>' +
-          ' <button type="button" id="csh-mod-apply" class="btn">Apply</button>' +
-          ' <button type="button" id="csh-mod-clear" class="btn">Clear</button>' +
-        '</div>';
-    $(html).insertBefore('table.list');
-
-    $.fn.dataTable.ext.search.push(function (settings, rowData) {
-        if (settings.nTable !== changeSetTable.table().node()) return true;
-        var byMe = $('#csh-mod-me').prop('checked');
-        var days = parseInt($('#csh-mod-days').val(), 10);
-        var myName = $.trim(($('#csh-mod-me-name').val() || '')).toLowerCase();
-
-        if (byMe && myName && cshModFilterCtx.byColIdx !== -1) {
-            var name = String(rowData[cshModFilterCtx.byColIdx] || '').toLowerCase();
-            if (name.indexOf(myName) === -1) return false;
-        }
-        if (!isNaN(days) && days > 0 && cshModFilterCtx.dateColIdx !== -1) {
-            var dateStr = String(rowData[cshModFilterCtx.dateColIdx] || '').trim();
-            if (!dateStr) return false;
-            var d = moment(dateStr, 'DD MMM YYYY');
-            if (d.isValid()) {
-                var cutoff = moment().subtract(days, 'days').startOf('day');
-                if (d.isBefore(cutoff)) return false;
-            }
-        }
-        return true;
-    });
-
-    $(document).on('click', '#csh-mod-apply', function () { changeSetTable.draw(); });
-    $(document).on('click', '#csh-mod-clear', function () {
-        $('#csh-mod-me').prop('checked', false);
-        $('#csh-mod-days').val('');
-        changeSetTable.draw();
-    });
-    $(document).on('change', '#csh-mod-me', function () { changeSetTable.draw(); });
-
-    cshModFilterInstalled = true;
 }
 
 /**
@@ -1224,8 +1275,15 @@ function tableInitComplete() {
                 shouldAddFilter = true;
                 var colDef = dynamicColumns[dynamicColIndex];
 
-                // Date columns get text search, others get dropdown
-                if (colDef.isDate) {
+                // Explicit filterType hint wins (e.g. Developer Name column
+                // forces text search because a dropdown with thousands of
+                // unique API names is unusable). Otherwise fall back to the
+                // old rule: date columns → text, everything else → dropdown.
+                if (colDef.filterType === 'text') {
+                    useTextSearch = true;
+                } else if (colDef.filterType === 'dropdown') {
+                    useDropdown = true;
+                } else if (colDef.isDate) {
                     useTextSearch = true;
                 } else {
                     useDropdown = true;
@@ -1541,6 +1599,31 @@ function cshBuildToolingSoql(cfg) {
 function cshShouldIncludeManaged() {
     var el = document.getElementById('csh-include-managed');
     return !!(el && el.checked);
+}
+
+// Drop managed-package records from a result set. Used after listMetadata
+// calls (folder-scoped types, non-Tooling-queryable fallbacks) because
+// listMetadata offers no server-side way to filter by namespace — we have
+// to fetch everything and prune in JS. The Tooling fast path applies its
+// own SOQL-level `NamespacePrefix = null` clause and doesn't come through
+// here. No-op when the user has the toggle enabled.
+//
+// Signals checked:
+//   - namespacePrefix truthy → came from a namespaced package
+//   - manageableState === 'installed' → subscriber org can't redeploy it
+// Either match is enough. The two overlap heavily but neither strictly
+// subsumes the other across every metadata type, so checking both covers
+// edge cases like base-package-org records that have a namespace but are
+// "unmanaged" because the package is defined in this org.
+function cshFilterOutManaged(records) {
+    if (cshShouldIncludeManaged()) return records || [];
+    if (!Array.isArray(records)) return records;
+    return records.filter(function (r) {
+        if (!r) return false;
+        if (r.namespacePrefix) return false;
+        if (r.manageableState && r.manageableState !== 'unmanaged') return false;
+        return true;
+    });
 }
 
 // Stashed so the toggle-change handler can re-run the last compare listing
@@ -1927,7 +2010,7 @@ function cshCompareListFlatViaListMetadata(env) {
                     { type: 'warning', duration: 7000 }
                 );
             }
-            processCompareResults(results, env);
+            processCompareResults(cshFilterOutManaged(cshApplyPostFilter(results) || results), env);
         },
         false);
 }
@@ -1989,7 +2072,7 @@ function cshCompareListFolderScoped(folderType, env) {
                                 { type: 'warning', duration: 8000 }
                             );
                         }
-                        processCompareResults(allResults, env);
+                        processCompareResults(cshFilterOutManaged(allResults), env);
                     }
                 }
             );
@@ -2677,16 +2760,23 @@ function startMetadataLoading() {
         changeSetHead2.after('<tfoot><tr><td></td><td></td></tr></tfoot>');
     }
 
+    // Derive the initial sort column from the actual header th count.
+    // Salesforce usually renders Action+Type+Name (3 cols) or Action+Name (2),
+    // so index 1 is safe — but for edge-case renders with only 1 th, a
+    // hardcoded [[1,'asc']] makes DataTables throw inside _fnSortFlatten
+    // ("Cannot read properties of undefined (reading 'aDataSort')").
+    var colCount = changeSetHead2.find('th').length;
+    var initialOrder = colCount >= 2 ? [[1, 'asc']] : (colCount >= 1 ? [[0, 'asc']] : []);
     changeSetTable = $('table.list').DataTable({
             paging: false,
             dom: 'lrti',
-            "order": [[1, "asc"]],
+            order: initialOrder,
             "deferRender": true,  // Performance optimization for large datasets
             initComplete: basicTableInitComplete
         }
     );
 
-    $('<input style="float: left;"  value="Reset Search Filters" class="clearFilters btn" name="Reset Search Filters" title="Reset search filters" type="button" />').prependTo('div.rolodex');
+    cshInstallToolbarActions();
     $('#editPage').append('<input type="hidden" name="rowsperpage" value="1000" /> ');
 
     var gotoloc2 = "'/" + $("#id").val() + "?tab=PackageComponents&rowsperpage=1000'";
