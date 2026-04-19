@@ -1,20 +1,143 @@
 <!DOCTYPE html>
 <html>
-<head><title>Change Set Helper Options</title></head>
+<head>
+<title>Change Set Helper — Options</title>
+<meta charset="utf-8">
+<style>
+  body {
+    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
+    max-width: 760px;
+    margin: 24px auto;
+    padding: 0 16px;
+    color: #2b2826;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; color: #032d60; }
+  h2 { font-size: 15px; margin: 24px 0 8px; color: #032d60; border-bottom: 1px solid #e5e5e5; padding-bottom: 4px; }
+  .muted { color: #706e6b; }
+  label { display: block; margin-top: 6px; }
+  input[type="text"] { width: 100%; padding: 6px 8px; font: inherit; box-sizing: border-box; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input[type="text"] { flex: 1 1 auto; }
+  button, input[type="submit"] {
+    padding: 6px 14px; cursor: pointer; font: inherit;
+    background: #0176d3; color: #fff; border: 1px solid #0176d3; border-radius: 3px;
+  }
+  button.secondary { background: #fff; color: #032d60; border-color: #c9c9c9; }
+  fieldset { border: 1px solid #e5e5e5; border-radius: 4px; padding: 10px 14px; margin: 8px 0; }
+  legend { padding: 0 6px; font-weight: 600; }
+  #status { margin: 8px 0; padding: 4px 0; font-weight: 600; color: #194e30; }
+  pre {
+    background: #f4f6f9; padding: 10px 12px; border-radius: 4px;
+    font: 12px/1.4 Menlo, Consolas, monospace; max-height: 360px; overflow: auto;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .check-pass { color: #194e30; font-weight: 600; }
+  .check-fail { color: #8e0916; font-weight: 600; }
+  .check-info { color: #706e6b; }
+  .advice {
+    background: #fff5d6; border-left: 4px solid #d1c083; padding: 8px 12px; margin-top: 8px; border-radius: 2px;
+  }
+  .advice code { background: rgba(0,0,0,0.05); padding: 0 4px; border-radius: 2px; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; font-weight: 600; }
+  kbd {
+    background: #ecebea; border: 1px solid #c9c9c9; border-radius: 3px;
+    padding: 1px 4px; font: 11px Menlo, monospace;
+  }
+</style>
+</head>
 <body>
-<p>Please excuse how much this page looks like a developer built it.</p>
-<p></p>
+<h1>Change Set Helper — Options</h1>
+
+<h2>API Version</h2>
 <form id="form">
-<p>API Version of Salesforce.  Ensure this is in proper format (e.g. 46.0)</p>
-<label>
-  <input type="text" pattern="[0-9][0-9]\.0" id="salesforceApiVersion">
-  Enable Helper on Salesforce Pages
-</label>
-<br />
+<p class="muted">API Version of Salesforce (format: <kbd>60.0</kbd>). Leave blank to auto-detect.</p>
+<input type="text" pattern="[0-9][0-9]\.0" id="salesforceApiVersion" placeholder="60.0">
 <p></p>
 <div id="status"></div>
-<input type="submit" value="Save" id="save"></input>
+<input type="submit" value="Save">
 </form>
+
+<h2>Connected App &mdash; OAuth Diagnostic</h2>
+<p class="muted">
+  Test whether the connected app this extension uses can return <strong>refresh tokens</strong>
+  (needed for a session fallback that survives Salesforce session timeouts).
+  Runs a real OAuth 2.0 code + PKCE flow in a popup and prints exactly what Salesforce returns.
+  Nothing is stored unless you click <strong>Save this client id</strong> after a successful test.
+</p>
+
+<fieldset>
+  <legend>Test parameters</legend>
+  <label>Client ID
+    <div class="row">
+      <input type="text" id="diagClientId" placeholder="3MVG9...">
+      <button type="button" class="secondary" id="resetClientId">Reset to default</button>
+    </div>
+  </label>
+  <p class="muted" id="defaultClientIdHint"></p>
+
+  <label>Environment
+    <div class="row">
+      <select id="diagEnvKind">
+        <option value="prod">Production (login.salesforce.com)</option>
+        <option value="sandbox">Sandbox (test.salesforce.com)</option>
+        <option value="mydomain">My Domain URL</option>
+      </select>
+      <input type="text" id="diagMyDomain" placeholder="https://yourorg.my.salesforce.com" style="display:none">
+    </div>
+  </label>
+
+  <p style="margin-top:12px">
+    <button type="button" id="runDiag">Run Test</button>
+    <button type="button" class="secondary" id="saveClientId" style="display:none">Save this client id</button>
+  </p>
+</fieldset>
+
+<div id="diagResults"></div>
+
+<details>
+  <summary>Salesforce Connected App configuration checklist</summary>
+  <p class="muted">
+    If any test step fails, these are the exact Salesforce settings to check. Go to
+    <strong>Setup &rarr; App Manager</strong>, find your connected app, click <strong>Edit</strong>.
+  </p>
+  <fieldset>
+    <legend>1. Callback URL must include</legend>
+    <p>
+      <kbd id="redirectUriHint">https://&lt;extension-id&gt;.chromiumapp.org/sfdc</kbd>
+      &mdash; this extension's specific redirect URL is shown above once the page loads.
+      The connected app accepts multiple URLs; add this one alongside any existing ones.
+    </p>
+  </fieldset>
+  <fieldset>
+    <legend>2. Selected OAuth Scopes</legend>
+    <ul>
+      <li><strong>Manage user data via APIs</strong> (<code>api</code>) &mdash; required</li>
+      <li><strong>Access the identity URL service</strong> (<code>id, profile, email, address, phone</code>) &mdash; required</li>
+      <li><strong>Perform requests at any time</strong> (<code>refresh_token, offline_access</code>) &mdash; <u>required for refresh-token support</u></li>
+    </ul>
+  </fieldset>
+  <fieldset>
+    <legend>3. Web App Settings</legend>
+    <ul>
+      <li><strong>Require Secret for Web Server Flow</strong> &mdash; <u>UNCHECKED</u> (we have no client secret; browser extensions are public clients)</li>
+      <li><strong>Require Secret for Refresh Token Flow</strong> &mdash; <u>UNCHECKED</u></li>
+      <li><strong>Require Proof Key for Code Exchange (PKCE) Extension</strong> &mdash; recommended CHECKED</li>
+    </ul>
+  </fieldset>
+  <fieldset>
+    <legend>4. OAuth Policies (Manage Connected Apps &rarr; your app &rarr; Edit Policies)</legend>
+    <ul>
+      <li><strong>Permitted Users</strong>: <em>All users may self-authorize</em> (or pre-approve specific profiles)</li>
+      <li><strong>IP Relaxation</strong>: <em>Relax IP restrictions</em> (or whitelist your user IPs)</li>
+      <li><strong>Refresh Token Policy</strong>: <em>Refresh token is valid until revoked</em></li>
+    </ul>
+  </fieldset>
+  <p class="muted">
+    After editing any of the above, Salesforce can take up to 10 minutes to propagate changes before the token endpoint reflects them.
+  </p>
+</details>
+
 <script src="options.js"></script>
 </body>
 </html>

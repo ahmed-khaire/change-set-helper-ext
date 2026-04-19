@@ -4,7 +4,7 @@
   "manifest_version": 3,
   "name": "Salesforce Change Set Helper",
   "description": "Enhances the Salesforce change set. Adds last changed date and allows sorting, searching, validation and comparison with other orgs.",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "options_page": "options.html",
   "action": {
     "default_icon": "braincloudsmall.png",
@@ -28,7 +28,8 @@
         "lib/jquery-ui.structure.min.css",
         "lib/jquery-ui.theme.min.css",
         "lib/dataTables.checkboxes.css",
-        "changeset.css"
+        "changeset.css",
+        "cart.css"
       ],
       "js": [
         "lib/jquery.min.js",
@@ -45,6 +46,7 @@
         "lib/mergely.js",
         "lib/jszip.js",
         "common.js",
+        "cart.js",
         "changeset.js"
       ],
       "all_frames": true
@@ -61,8 +63,10 @@
         "lib/jquery.min.js",
         "lib/jquery.dataTables.js",
         "lib/moment.js",
+        "common.js",
         "changeview.js"
-      ]
+      ],
+      "all_frames": true
     },
     {
       "matches": [
@@ -74,7 +78,8 @@
         "lib/select2.min.css",
         "lib/codemirror.css",
         "lib/dataTables.checkboxes.css",
-        "changeset.css"
+        "changeset.css",
+        "cart.css"
       ],
       "js": [
         "lib/jquery.min.js",
@@ -89,23 +94,39 @@
         "lib/FileSaver.js",
         "lib/jszip.js",
         "common.js",
+        "cart.js",
         "metadatahelper.js",
-        "deployhelper.js"
+        "deployhelper.js",
+        "detailcomponents.js"
       ],
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://*/changemgmt/outboundChangeSetDetailPage.apexp*"
+      ],
+      "js": [
+        "detailpagebridge.js"
+      ],
+      "world": "MAIN",
       "all_frames": true
     }
   ],
   "permissions": [
     "identity",
     "storage",
-    "offscreen"
+    "offscreen",
+    "cookies"
   ],
   "host_permissions": [
     "https://*.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
     "https://*.com/p/mfpkg/AddToPackageUi*",
     "https://*.com/*tab=PackageComponents*",
     "https://*.com/changemgmt/outboundChangeSetDetailPage.apexp*",
-    "https://*.salesforce.com/services/*"
+    "https://*.salesforce.com/*",
+    "https://*.force.com/*",
+    "https://*.cloudforce.com/*",
+    "https://*.salesforce-setup.com/*"
   ],
   "background": {
     "service_worker": "background.js"

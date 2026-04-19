@@ -1,17 +1,5 @@
 
 
-    .changesetloading {
-        display: block;
-        width: 100%;
-        height: 100%;
-        position: absolute;
-        z-index: 99999;/*puts on top of everything*/
-        background-image: url('chrome-extension://__MSG_@@extension_id__/loading.gif');
-        background-position: 250px 100px;
-        background-repeat: no-repeat;
-		opacity: .3;
-
-    }
 	.lowOpacity {
 		opacity: .3;
 
@@ -30,4 +18,661 @@ body .pbBody table.list tr.headerRow td, body .pbBody table.list tr.headerRow th
 
     border-width: 0 0 0 1px !important;
 
+}
+
+/* Phase 5.3 — Compare diff colour-coding
+   Applied on a row when the compare-with-org flow finishes; interprets the
+   timestamp comparison between THIS org and the target org.
+     csh-diff-newer-local   : local Last-Modified is newer -> safe to deploy
+     csh-diff-newer-target  : target is newer -> deploying would regress the target
+     csh-diff-same          : timestamps match -> no-op deploy
+*/
+table.list tr.csh-diff-newer-local > td {
+    background-color: #e6ffed !important;   /* soft green */
+    border-left: 3px solid #2e844a !important;
+}
+table.list tr.csh-diff-newer-target > td {
+    background-color: #fff3e0 !important;   /* soft orange */
+    border-left: 3px solid #b85c00 !important;
+}
+table.list tr.csh-diff-same > td {
+    background-color: #f4f6f9 !important;   /* soft grey */
+    border-left: 3px solid #706e6b !important;
+}
+table.list tr.csh-diff-target-only > td {
+    background-color: #ffe4e1 !important;   /* soft red */
+    border-left: 3px solid #ba0517 !important;
+    font-style: italic;
+}
+table.list tr.csh-diff-target-only > td:first-child {
+    color: #8e0916;
+    font-weight: 600;
+    font-style: normal;
+}
+table.list tr.csh-diff-newer-local > td:first-child,
+table.list tr.csh-diff-newer-target > td:first-child,
+table.list tr.csh-diff-same > td:first-child {
+    border-left-width: 3px !important;
+}
+
+/* Per-row compare trigger. Injected into the Name cell (which sits right
+   after the Salesforce checkbox column) once a compare org has connected.
+   The ⇄ glyph is lightweight and renders consistently across platforms
+   without shipping an icon font. Hover + active states mirror the rest of
+   the link behaviour so the affordance reads as clickable. */
+.csh-compare-icon {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 4px;
+    font-size: 13px;
+    line-height: 1;
+    color: #0070d2;
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    user-select: none;
+    vertical-align: middle;
+}
+.csh-compare-icon:hover {
+    background: #eef4fb;
+    border-color: #cfe3f6;
+    color: #005fb2;
+}
+.csh-compare-icon:active {
+    background: #dbeaf7;
+}
+
+/* Phase 6 — toolbar actions group on the Add Components page */
+.csh-toolbar-actions {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    margin-right: 8px;
+}
+.csh-toolbar-actions .btn {
+    padding: 3px 10px;
+}
+
+/* Hide Salesforce's alphabet quick-nav (A | B | C | ... | Other | All) from
+   the rolodex bar. The DataTables column-level search inputs we add to the
+   table footer supersede it, and leaving the alphabet visible just crowds
+   the row that now hosts the unified Actions group. */
+div.rolodex .listItem,
+div.rolodex .listItems {
+    display: none !important;
+}
+
+/* Phase 7 — Detail page Components block: selection column + bulk remove
+   + filter/search. Targets the inline components table on
+   outboundChangeSetDetailPage.apexp. */
+.csh-dc-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 14px;
+    margin: 8px 0;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 4px;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+}
+.csh-dc-filter-row,
+.csh-dc-action-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.csh-dc-filter-row .csh-dc-search {
+    flex: 1 1 260px;
+    min-width: 200px;
+    padding: 6px 10px;
+    border: 1px solid #c9c9c9;
+    border-radius: 3px;
+    font: inherit;
+    background: #fff;
+}
+.csh-dc-filter-row .csh-dc-search:focus {
+    outline: none;
+    border-color: #0176d3;
+    box-shadow: 0 0 0 1px #0176d3;
+}
+.csh-dc-filter-row select {
+    flex: 0 0 auto;
+    min-width: 140px;
+    max-width: 220px;
+    padding: 6px 10px;
+    border: 1px solid #c9c9c9;
+    border-radius: 3px;
+    font: inherit;
+    background: #fff;
+}
+.csh-dc-filter-row .csh-dc-visible-count {
+    flex: 0 0 auto;
+    color: #706e6b;
+    font-size: 12px;
+    margin-left: auto;
+    font-style: italic;
+}
+.csh-dc-toolbar .csh-dc-label {
+    font-weight: 600;
+    color: #706e6b;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.csh-dc-toolbar button {
+    padding: 5px 12px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-dc-toolbar button:hover:not(:disabled) {
+    background: #f4f6f9;
+    border-color: #a8b7c7;
+}
+.csh-dc-toolbar .csh-dc-remove-btn {
+    background: #ba0517;
+    color: #fff;
+    border-color: #8e0916;
+    font-weight: 600;
+}
+.csh-dc-toolbar .csh-dc-remove-btn:hover:not(:disabled) {
+    background: #8e0916;
+    border-color: #600610;
+}
+.csh-dc-toolbar button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.csh-dc-toolbar .csh-dc-count {
+    font-weight: 600;
+    color: #032d60;
+    margin-left: auto;
+}
+
+table.list td.csh-dc-select-col,
+table.list th.csh-dc-select-col {
+    width: 28px;
+    text-align: center;
+    padding: 0 4px !important;
+}
+
+.csh-dc-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+}
+.csh-dc-modal .csh-dc-modal-body {
+    background: #fff;
+    border-radius: 6px;
+    padding: 18px 22px 16px;
+    width: 92vw;
+    max-width: 560px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+.csh-dc-modal h3 {
+    margin: 0 0 10px;
+    color: #032d60;
+    font-size: 16px;
+}
+.csh-dc-modal .csh-dc-modal-bar {
+    height: 10px;
+    background: #e5e5e5;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+.csh-dc-modal .csh-dc-modal-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 200ms ease;
+}
+.csh-dc-modal .csh-dc-modal-count {
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #3e3e3c;
+}
+.csh-dc-modal .csh-dc-modal-log {
+    max-height: 260px;
+    overflow-y: auto;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-bottom: 10px;
+    font: 12px/1.4 Menlo, Consolas, monospace;
+}
+.csh-dc-modal .csh-dc-log-entry {
+    padding: 1px 2px;
+    border-bottom: 1px solid #eceded;
+    word-break: break-word;
+}
+.csh-dc-modal .csh-dc-log-entry:last-child { border-bottom: 0; }
+.csh-dc-modal .csh-dc-log-entry.ok   { color: #194e30; }
+.csh-dc-modal .csh-dc-log-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }
+.csh-dc-modal .csh-dc-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.csh-dc-modal .csh-dc-modal-actions button {
+    padding: 7px 14px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-dc-modal .csh-dc-modal-close {
+    background: #0176d3;
+    color: #fff;
+    border-color: #0176d3;
+    font-weight: 600;
+}
+
+/* Phase 7 — Components View: bulk-remove toolbar + progressive fetch UI */
+.csh-cv-note {
+    background: #eef7ff;
+    border-left: 3px solid #0176d3;
+    padding: 8px 14px;
+    margin: 8px 0;
+    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
+    color: #032d60;
+}
+
+.csh-cv-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 14px;
+    margin: 8px 0;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 4px;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+    flex-wrap: wrap;
+}
+.csh-cv-toolbar-label {
+    font-weight: 600;
+    color: #706e6b;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.csh-cv-toolbar button {
+    padding: 5px 12px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-cv-toolbar button:hover:not(:disabled) {
+    background: #f4f6f9;
+    border-color: #a8b7c7;
+}
+.csh-cv-toolbar button.csh-cv-remove {
+    background: #ba0517;
+    color: #fff;
+    border-color: #8e0916;
+    font-weight: 600;
+}
+.csh-cv-toolbar button.csh-cv-remove:hover:not(:disabled) {
+    background: #8e0916;
+    border-color: #600610;
+}
+.csh-cv-toolbar button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.csh-cv-selection-count {
+    font-weight: 600;
+    color: #032d60;
+    margin-left: auto;
+}
+
+table.list td.csh-cv-select-col,
+table.list th.csh-cv-select-col {
+    width: 28px;
+    text-align: center;
+    padding: 0 4px !important;
+}
+
+/* Live pagination progress pill — bottom-right of viewport */
+.csh-cv-progress {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 2147483645;
+    background: #fff;
+    border: 1px solid #c9c9c9;
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+    min-width: 320px;
+}
+.csh-cv-progress .csh-cv-progress-body {
+    padding: 10px 14px;
+}
+.csh-cv-progress .csh-cv-progress-label {
+    font-weight: 600;
+    color: #032d60;
+    margin-bottom: 6px;
+}
+.csh-cv-progress .csh-cv-progress-bar {
+    height: 8px;
+    background: #e5e5e5;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+.csh-cv-progress .csh-cv-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 240ms ease;
+}
+.csh-cv-progress .csh-cv-progress-cancel {
+    padding: 3px 10px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+}
+
+/* Bulk-remove modal */
+.csh-cv-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 13px "Salesforce Sans", Arial, sans-serif;
+}
+.csh-cv-modal .csh-cv-modal-body {
+    background: #fff;
+    border-radius: 6px;
+    padding: 18px 22px 16px;
+    width: 92vw;
+    max-width: 560px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+.csh-cv-modal h3 {
+    margin: 0 0 10px;
+    color: #032d60;
+    font-size: 16px;
+}
+.csh-cv-modal .csh-cv-modal-bar {
+    height: 10px;
+    background: #e5e5e5;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+.csh-cv-modal .csh-cv-modal-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 200ms ease;
+}
+.csh-cv-modal .csh-cv-modal-count {
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #3e3e3c;
+}
+.csh-cv-modal .csh-cv-modal-log {
+    max-height: 260px;
+    overflow-y: auto;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-bottom: 10px;
+    font: 12px/1.4 Menlo, Consolas, monospace;
+}
+.csh-cv-modal .csh-cv-log-entry {
+    padding: 1px 2px;
+    border-bottom: 1px solid #eceded;
+    word-break: break-word;
+}
+.csh-cv-modal .csh-cv-log-entry:last-child { border-bottom: 0; }
+.csh-cv-modal .csh-cv-log-entry.ok   { color: #194e30; }
+.csh-cv-modal .csh-cv-log-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }
+.csh-cv-modal .csh-cv-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.csh-cv-modal .csh-cv-modal-actions button {
+    padding: 7px 14px;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.csh-cv-modal .csh-cv-modal-close {
+    background: #0176d3;
+    color: #fff;
+    border-color: #0176d3;
+    font-weight: 600;
+}
+
+/* Phase 6 — live deploy progress panel (Outbound Change Set Detail) */
+#csh-deploy-progress {
+    margin: 12px 0;
+    padding: 10px 12px;
+    background: #f4f6f9;
+    border: 1px solid #e5e5e5;
+    border-radius: 4px;
+    font: 13px/1.4 "Salesforce Sans", Arial, sans-serif;
+}
+#csh-deploy-progress .csh-dp-summary {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+#csh-deploy-progress .csh-dp-phasebar {
+    padding: 6px 10px;
+    background: #f3f3f3;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    margin-bottom: 8px;
+}
+#csh-deploy-progress .csh-dp-phase {
+    font-weight: 600;
+    color: #032d60;
+    padding: 1px 8px;
+    background: #eaf5fe;
+    border-radius: 10px;
+    font-size: 12px;
+}
+#csh-deploy-progress #csh-dp-setup-link {
+    font-size: 12px;
+    color: #0176d3;
+    text-decoration: underline;
+}
+#csh-deploy-progress .csh-dp-label {
+    font-weight: 600;
+    color: #706e6b;
+}
+#csh-deploy-progress .csh-dp-counts .csh-dp-ok,
+#csh-deploy-progress .csh-dp-counts .csh-dp-fail {
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #ecebea;
+    color: #706e6b;
+    font-weight: 600;
+    font-size: 11px;
+}
+#csh-deploy-progress .csh-dp-ok.csh-dp-count-nonzero {
+    background: #dff0e2;
+    color: #194e30;
+}
+#csh-deploy-progress .csh-dp-fail.csh-dp-count-nonzero {
+    background: #ffe4e1;
+    color: #8e0916;
+}
+#csh-deploy-progress .csh-dp-barwrap {
+    height: 10px;
+    background: #e5e5e5;
+    border-radius: 5px;
+    overflow: hidden;
+    margin: 8px 0;
+}
+#csh-deploy-progress .csh-dp-fill {
+    height: 100%;
+    width: 0%;
+    background: #0176d3;
+    transition: width 240ms ease;
+}
+#csh-deploy-progress .csh-dp-fill.csh-dp-done {
+    background: #2e844a;
+}
+#csh-deploy-progress .csh-dp-fill.csh-dp-fail {
+    background: #ba0517;
+}
+#csh-deploy-progress .csh-dp-toolbar {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #706e6b;
+}
+#csh-deploy-progress .csh-dp-log {
+    max-height: 260px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-top: 6px;
+    font: 12px/1.5 Menlo, Consolas, monospace;
+}
+#csh-deploy-progress .csh-dp-entry {
+    padding: 1px 2px;
+    border-bottom: 1px solid #f4f4f4;
+    word-break: break-word;
+}
+#csh-deploy-progress .csh-dp-entry.ok   { color: #194e30; }
+#csh-deploy-progress .csh-dp-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }
+#csh-deploy-progress .csh-dp-entry.warn { color: #8a5400; font-weight: 600; background: #fff6e8; }
+#csh-deploy-progress .csh-dp-stack {
+    margin: 4px 0 2px 14px;
+    padding: 4px 6px;
+    background: #fcebea;
+    border-left: 2px solid #c23934;
+    color: #5c0b14;
+    font: 11px/1.45 Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Collapsible raw-JSON panel under the Validate Helper */
+.csh-json-details {
+    margin-top: 10px;
+    border: 1px solid #d8dde6;
+    border-radius: 4px;
+    background: #fafbfc;
+}
+.csh-json-details > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #16325c;
+    user-select: none;
+}
+.csh-json-details > summary::-webkit-details-marker { display: none; }
+.csh-json-details > summary::before {
+    content: '▸';
+    display: inline-block;
+    width: 10px;
+    color: #706e6b;
+    transition: transform 0.15s ease;
+}
+.csh-json-details[open] > summary::before {
+    transform: rotate(90deg);
+}
+.csh-json-details .csh-json-label {
+    font-weight: 600;
+}
+.csh-json-details .csh-json-badge {
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    background: #eef1f6;
+    color: #3e3e3c;
+    border: 1px solid #d8dde6;
+    letter-spacing: 0.02em;
+}
+.csh-json-details .csh-json-badge.ok   { background: #e4f5ea; color: #194e30; border-color: #b6e0c4; }
+.csh-json-details .csh-json-badge.fail { background: #fcebea; color: #8e0916; border-color: #f0c2c0; }
+.csh-json-details .csh-json-badge.warn { background: #fff6e8; color: #8a5400; border-color: #f0d9a8; }
+.csh-json-details .csh-json-hint {
+    color: #706e6b;
+    font-size: 11px;
+    margin-left: auto;
+}
+.csh-json-details[open] .csh-json-hint { display: none; }
+.csh-json-body {
+    padding: 0 10px 10px 10px;
+    border-top: 1px solid #e5e8ed;
+    background: #fff;
+}
+.csh-json-toolbar {
+    padding: 6px 0;
+    display: flex;
+    justify-content: flex-end;
+}
+.csh-json-btn {
+    padding: 3px 10px;
+    font-size: 11px;
+    background: #fff;
+    border: 1px solid #d8dde6;
+    border-radius: 3px;
+    cursor: pointer;
+    color: #16325c;
+}
+.csh-json-btn:hover { background: #f4f6f9; }
+#json-renderer {
+    max-height: 360px;
+    overflow: auto;
+    margin: 0;
+    padding: 8px 10px;
+    background: #f8f9fb;
+    border: 1px solid #e5e8ed;
+    border-radius: 3px;
+    font: 12px/1.5 Menlo, Consolas, monospace;
+}
+
+/* Validate Helper — direct-deploy mode visual cue.
+   Salesforce's base .btn is grey; flipping it red when the deploy-mode
+   selector is on "Deploy to target" is a cheap tripwire that helps catch the
+   "I thought I was validating" mistake before the user clicks. */
+.csh-deploy-live#deployTest {
+    background: #c23934 !important;
+    color: #fff !important;
+    border-color: #8e1f1b !important;
+    font-weight: bold;
+}
+.csh-deploy-live#deployTest:hover {
+    background: #a61c1c !important;
 }

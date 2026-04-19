@@ -1,3 +1,10 @@
 # Claude Code files
 CLAUDE.md
 .claude/
+.remember/
+
+# Local build output
+change-set-helper-ext-*.zip
+
+# Local SFDX scratch project for deploying the Connected App
+sfdx-connected-app/

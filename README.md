@@ -1,6 +1,6 @@
 # Salesforce Change Set Helper Reloaded
 
-![Version](https://img.shields.io/badge/version-3.0.1-blue.svg)
+![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)
 ![Manifest](https://img.shields.io/badge/manifest-v3-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 
@@ -135,7 +135,9 @@ From the Outbound Change Set Detail page:
 
 ### Salesforce Configuration
 
-**Important**: For the extension to access session IDs, you must:
+**No longer required as of v3.0.3.** The extension reads the Salesforce session via the Chrome `cookies` permission, which works whether or not **Require HttpOnly attribute** is enabled in Session Settings. If you previously unchecked it for this extension and don't need it off for any other reason, you can safely re-enable it.
+
+If your org blocks the extension from the `cookies` permission, the old fallback still works:
 
 1. Go to **Setup** → **Session Settings**
 2. Find **"Require HttpOnly attribute"**
