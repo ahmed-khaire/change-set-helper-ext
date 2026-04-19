@@ -57,23 +57,36 @@
         }
     }, 200);
 
-    // Bulk remove is disabled while we work out a reliable delete path that
-    // doesn't full-page-reload (A4J) and doesn't depend on being able to
-    // resolve the 033 MetadataPackage id from the detail page (classic Del
-    // URL). Search + filters still ship; only the selection column and the
-    // "Remove selected" toolbar row are hidden.
-    var BULK_REMOVE_ENABLED = false;
+    // Bulk remove uses the same classic Del URL fetch path the single-row
+    // Remove hijack already ships on — no A4J, no page reloads. The 033
+    // MetadataPackage id needed for that path is resolved via resolvePackageId
+    // with three fallbacks (current-page DOM, cshIdMap cache, hidden Add-page
+    // iframe), so the hard dependency that originally gated this flag is gone.
+    // Selections persist across native A4J pagination via selectedItems +
+    // annotateRow's re-tick on partial refresh, so users can accumulate across
+    // pages before hitting "Remove selected".
+    var BULK_REMOVE_ENABLED = true;
+
+    // Filter toolbar is disabled until we implement cross-page client-side
+    // filter+sort. The current implementation only filters the currently-
+    // rendered A4J page (applyFilters iterates table.querySelectorAll on
+    // the live DOM), which misleads users into thinking hidden rows are
+    // excluded from the change set when they're just on a different page.
+    // Better to show nothing than to show a filter that lies. Next session
+    // will replace this with a DataTables-backed full-dataset view fed by
+    // fetchAllChangeSetComponents.
+    var FILTER_TOOLBAR_ENABLED = false;
 
     function setupPage(table) {
         injectPageBridge();
         if (BULK_REMOVE_ENABLED) injectSelectionColumn(table);
         resolveColumnIndices(table);
-        injectToolbar(table);
-        populateFilterDropdowns(table);
+        if (FILTER_TOOLBAR_ENABLED || BULK_REMOVE_ENABLED) injectToolbar(table);
+        if (FILTER_TOOLBAR_ENABLED) populateFilterDropdowns(table);
         hijackRemoveLinks(table);
         observeTableChanges(table);
         wireDelegatedEvents(table);
-        applyFilters(table); // populates the "N components" counter
+        if (FILTER_TOOLBAR_ENABLED) applyFilters(table); // populates the "N components" counter
         backgroundSyncCart(table);
         console.log('detailcomponents: initialized on', table);
     }
@@ -440,8 +453,17 @@
     // -----------------------------------------------------------------------
     function injectToolbar(table) {
         if (document.querySelector('.csh-dc-toolbar')) return;
-        var toolbar = document.createElement('div');
-        toolbar.className = 'csh-dc-toolbar';
+        // Filter row and bulk action row are independently gated. Either or
+        // both may render; when neither flag is on, the toolbar itself is
+        // skipped in setupPage, so no empty container appears.
+        var filterRow = FILTER_TOOLBAR_ENABLED
+            ? '<div class="csh-dc-filter-row">' +
+                '<input type="search" class="csh-dc-search" placeholder="Search name or full name…" aria-label="Search components">' +
+                '<select class="csh-dc-filter-type"><option value="">All types</option></select>' +
+                '<select class="csh-dc-filter-parent"><option value="">All parent objects</option></select>' +
+                '<span class="csh-dc-visible-count"></span>' +
+              '</div>'
+            : '';
         var actionRow = BULK_REMOVE_ENABLED
             ? '<div class="csh-dc-action-row">' +
                 '<span class="csh-dc-label">Bulk:</span>' +
@@ -451,14 +473,9 @@
                 '<button type="button" class="csh-dc-remove-btn" disabled>Remove selected</button>' +
               '</div>'
             : '';
-        toolbar.innerHTML =
-            '<div class="csh-dc-filter-row">' +
-              '<input type="search" class="csh-dc-search" placeholder="Search name or full name…" aria-label="Search components">' +
-              '<select class="csh-dc-filter-type"><option value="">All types</option></select>' +
-              '<select class="csh-dc-filter-parent"><option value="">All parent objects</option></select>' +
-              '<span class="csh-dc-visible-count"></span>' +
-            '</div>' +
-            actionRow;
+        var toolbar = document.createElement('div');
+        toolbar.className = 'csh-dc-toolbar';
+        toolbar.innerHTML = filterRow + actionRow;
         table.parentNode.insertBefore(toolbar, table);
     }
 
@@ -683,8 +700,10 @@
             setTimeout(function () {
                 refreshPending = false;
                 resolveColumnIndices(table);
-                populateFilterDropdowns(table);
-                applyFilters(table);
+                if (FILTER_TOOLBAR_ENABLED) {
+                    populateFilterDropdowns(table);
+                    applyFilters(table);
+                }
             }, 80);
         }
 

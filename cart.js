@@ -916,7 +916,15 @@
     // selection across deploys without re-picking everything. Stored in
     // chrome.storage.local (sync's 8KB/item cap is easy to exceed on a
     // 1000-item preset). Keyed by user-supplied name; scoped to the org host.
+    //
+    // UI is currently hidden (CART_PRESETS_ENABLED = false) — the feature
+    // works but we're suppressing the "Saved presets" row from the cart panel
+    // until we revisit the UX. All storage-facing functions (listPresets /
+    // savePreset / loadPreset / deletePreset) remain intact so any saved
+    // presets survive a round-trip through this disabled state, and so the
+    // public API on window.cshCart stays stable.
     // -----------------------------------------------------------------------
+    var CART_PRESETS_ENABLED = false;
     var PRESETS_KEY = 'cshCartPresets';
 
     async function listPresets() {
@@ -1384,14 +1392,16 @@
               '<input type="search" class="csh-cart-search" placeholder="Search cart…" aria-label="Search cart items">' +
             '</div>' +
             '<div class="csh-cart-body"></div>' +
-            '<div class="csh-cart-section">' +
-              '<label class="csh-cart-section-label">Saved presets</label>' +
-              '<div class="csh-cart-section-row">' +
-                '<select class="csh-cart-preset-select"><option value="">Load preset…</option></select>' +
-                '<button class="csh-cart-save-preset" title="Save current cart as a named preset">Save</button>' +
-                '<button class="csh-cart-delete-preset" title="Delete selected preset">Delete</button>' +
-              '</div>' +
-            '</div>' +
+            (CART_PRESETS_ENABLED
+                ? '<div class="csh-cart-section">' +
+                    '<label class="csh-cart-section-label">Saved presets</label>' +
+                    '<div class="csh-cart-section-row">' +
+                      '<select class="csh-cart-preset-select"><option value="">Load preset…</option></select>' +
+                      '<button class="csh-cart-save-preset" title="Save current cart as a named preset">Save</button>' +
+                      '<button class="csh-cart-delete-preset" title="Delete selected preset">Delete</button>' +
+                    '</div>' +
+                  '</div>'
+                : '') +
             '<div class="csh-cart-section">' +
               '<label class="csh-cart-section-label">package.xml</label>' +
               '<div class="csh-cart-section-row">' +
@@ -1485,48 +1495,50 @@
             }
         });
 
-        // Preset save
-        panel.querySelector('.csh-cart-save-preset').addEventListener('click', async function () {
-            var name = prompt('Save current cart as preset. Name?');
-            if (!name) return;
-            try {
-                var p = await savePreset(name);
-                window.cshToast && window.cshToast.show('Saved "' + p.name + '" (' + p.itemCount + ' item(s))', { type: 'success' });
+        // Preset save/load/delete handlers are only wired when the presets UI
+        // is enabled — otherwise the querySelectors below return null and
+        // addEventListener throws on page init.
+        if (CART_PRESETS_ENABLED) {
+            panel.querySelector('.csh-cart-save-preset').addEventListener('click', async function () {
+                var name = prompt('Save current cart as preset. Name?');
+                if (!name) return;
+                try {
+                    var p = await savePreset(name);
+                    window.cshToast && window.cshToast.show('Saved "' + p.name + '" (' + p.itemCount + ' item(s))', { type: 'success' });
+                    await refreshPresetSelect();
+                } catch (e) {
+                    window.cshToast && window.cshToast.show('Save preset failed: ' + e.message, { type: 'error' });
+                }
+            });
+
+            panel.querySelector('.csh-cart-preset-select').addEventListener('change', async function () {
+                var name = this.value;
+                if (!name) return;
+                try {
+                    var res = await loadPreset(name);
+                    window.cshToast && window.cshToast.show(
+                        'Loaded "' + name + '": added ' + res.added + ' new staged item(s). ' +
+                        (res.added < res.total ? (res.total - res.added) + ' were already in cart.' : ''),
+                        { type: 'success' }
+                    );
+                } catch (e) {
+                    window.cshToast && window.cshToast.show('Load preset failed: ' + e.message, { type: 'error' });
+                }
+                this.value = '';
+            });
+
+            panel.querySelector('.csh-cart-delete-preset').addEventListener('click', async function () {
+                var select = panel.querySelector('.csh-cart-preset-select');
+                var name = select.value;
+                if (!name) {
+                    alert('Pick a preset from the dropdown first.');
+                    return;
+                }
+                if (!confirm('Delete preset "' + name + '"?')) return;
+                await deletePreset(name);
                 await refreshPresetSelect();
-            } catch (e) {
-                window.cshToast && window.cshToast.show('Save preset failed: ' + e.message, { type: 'error' });
-            }
-        });
-
-        // Preset load
-        panel.querySelector('.csh-cart-preset-select').addEventListener('change', async function () {
-            var name = this.value;
-            if (!name) return;
-            try {
-                var res = await loadPreset(name);
-                window.cshToast && window.cshToast.show(
-                    'Loaded "' + name + '": added ' + res.added + ' new staged item(s). ' +
-                    (res.added < res.total ? (res.total - res.added) + ' were already in cart.' : ''),
-                    { type: 'success' }
-                );
-            } catch (e) {
-                window.cshToast && window.cshToast.show('Load preset failed: ' + e.message, { type: 'error' });
-            }
-            this.value = '';
-        });
-
-        // Preset delete
-        panel.querySelector('.csh-cart-delete-preset').addEventListener('click', async function () {
-            var select = panel.querySelector('.csh-cart-preset-select');
-            var name = select.value;
-            if (!name) {
-                alert('Pick a preset from the dropdown first.');
-                return;
-            }
-            if (!confirm('Delete preset "' + name + '"?')) return;
-            await deletePreset(name);
-            await refreshPresetSelect();
-        });
+            });
+        }
 
         // Package.xml export
         panel.querySelector('.csh-cart-export-pkg').addEventListener('click', async function () {
