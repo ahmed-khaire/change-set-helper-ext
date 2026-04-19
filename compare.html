@@ -15,6 +15,13 @@
 </head>
 <body>
 <div id="filename"></div>
+<div id="csh-compare-progress" style="position:fixed;top:8px;right:12px;z-index:100;background:#fff;border:1px solid #c9c9c9;border-radius:4px;padding:8px 12px;font:12px/1.4 Arial,sans-serif;color:#2b2826;box-shadow:0 2px 6px rgba(0,0,0,0.12);min-width:220px;">
+	<div><strong>Retrieving metadata</strong></div>
+	<div class="csh-compare-progress-phase" style="margin-top:2px;color:#545454;">This org: waiting · Other org: waiting</div>
+	<div class="csh-compare-progress-elapsed" style="margin-top:2px;color:#545454;">Elapsed: 0s</div>
+	<div class="csh-compare-progress-tip" style="margin-top:6px;color:#a55b00;display:none;">Still working — large components (thousands of classes, big LWC bundles) can take several minutes. You can close this window and try again later via Setup → Monitor Deployments → Retrieve Status.</div>
+	<button type="button" id="csh-compare-cancel" style="margin-top:6px;padding:3px 10px;border:1px solid #c9c9c9;border-radius:3px;background:#fff;cursor:pointer;">Abandon</button>
+</div>
 <div id="compare"></div>
 </body>
 </html>

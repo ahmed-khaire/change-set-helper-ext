@@ -40,16 +40,56 @@
     var RETRY_BASE_MS = 2000;
 
     // -----------------------------------------------------------------------
+    // Extension-alive guard
+    //
+    // When the user updates/reloads the extension, every content script on
+    // every tab becomes orphaned: chrome.runtime.id turns undefined and every
+    // subsequent chrome.* call throws "Extension context invalidated". Before
+    // this guard, runRender would surface that error hundreds of times (once
+    // per mutation/scroll/render tick) and the cart UI silently froze.
+    //
+    // We now check cshExtAlive() before touching chrome.*, flip extDead once
+    // when it first reports false, and let runRender show a one-time refresh
+    // banner instead of re-throwing.
+    // -----------------------------------------------------------------------
+    var extDead = false;
+    function cshExtAlive() {
+        try {
+            return typeof chrome !== 'undefined' && !!chrome.runtime && !!chrome.runtime.id;
+        } catch (_) { return false; }
+    }
+    function markExtDead() {
+        if (extDead) return;
+        extDead = true;
+        // Wake the render pipeline so the refresh banner paints even if no
+        // other mutation is queued (e.g., user just opened the page on a
+        // stale content script).
+        try { renderPanel(); } catch (_) {}
+    }
+
+    // -----------------------------------------------------------------------
     // Storage primitives
     // -----------------------------------------------------------------------
     function storageGet(keys) {
         return new Promise(function (resolve) {
-            chrome.storage.local.get(keys, function (items) { resolve(items || {}); });
+            if (!cshExtAlive()) { markExtDead(); resolve({}); return; }
+            try {
+                chrome.storage.local.get(keys, function (items) {
+                    if (chrome.runtime.lastError) { markExtDead(); resolve({}); return; }
+                    resolve(items || {});
+                });
+            } catch (_) { markExtDead(); resolve({}); }
         });
     }
     function storageSet(obj) {
         return new Promise(function (resolve) {
-            chrome.storage.local.set(obj, function () { resolve(); });
+            if (!cshExtAlive()) { markExtDead(); resolve(); return; }
+            try {
+                chrome.storage.local.set(obj, function () {
+                    if (chrome.runtime.lastError) markExtDead();
+                    resolve();
+                });
+            } catch (_) { markExtDead(); resolve(); }
         });
     }
 
@@ -85,7 +125,7 @@
     // write even after the tab is gone. Good enough for typical navigation;
     // we accept losing the last 150ms of changes on a hard crash.
     window.addEventListener('beforeunload', function () {
-        if (pendingAll) {
+        if (pendingAll && cshExtAlive()) {
             try { chrome.storage.local.set({ [CART_KEY]: pendingAll }); } catch (_) {}
         }
     });
@@ -796,6 +836,11 @@
                 var lastError = '';
                 while (attempt < MAX_ATTEMPTS && !success) {
                     attempt++;
+                    if (!cshExtAlive()) {
+                        markExtDead();
+                        lastError = 'Extension was reloaded — refresh this page to continue.';
+                        break;
+                    }
                     try {
                         var resp = await chrome.runtime.sendMessage({
                             type: 'cshCartSubmit',
@@ -809,6 +854,10 @@
                         }
                     } catch (e) {
                         lastError = e && e.message ? e.message : String(e);
+                        if (/Extension context invalidated/i.test(lastError)) {
+                            markExtDead();
+                            break;
+                        }
                     }
                     if (!success && attempt < MAX_ATTEMPTS) {
                         await new Promise(function (r) { setTimeout(r, RETRY_BASE_MS * Math.pow(2, attempt - 1)); });
@@ -1308,6 +1357,15 @@
         if (panel) return panel;
         panel = document.createElement('div');
         panel.id = 'csh-cart-panel';
+        // On the Change Set Detail page the user isn't actively adding items,
+        // they're reviewing an already-populated cart — default to collapsed
+        // so the panel doesn't cover the component table on load. The header
+        // bar stays visible and one click on "–" expands it. The Add
+        // Components pages keep the default expanded state because that's
+        // where cart-building actually happens.
+        if (/\/changemgmt\/outboundChangeSetDetailPage\.apexp/i.test(location.pathname)) {
+            panel.classList.add('csh-cart-collapsed');
+        }
         panel.innerHTML =
             '<div class="csh-cart-header">' +
               '<span class="csh-cart-title">Change Set Cart</span>' +
@@ -1534,13 +1592,61 @@
     async function runRender() {
         renderPending = false;
         try {
-            await doRender();
+            if (extDead || !cshExtAlive()) {
+                if (!extDead) markExtDead();
+                renderExtDeadBanner();
+            } else {
+                await doRender();
+            }
         } catch (e) {
-            console.warn('cshCart render failed:', e && e.message);
+            var msg = e && e.message ? e.message : String(e);
+            if (/Extension context invalidated/i.test(msg)) {
+                markExtDead();
+                try { renderExtDeadBanner(); } catch (_) {}
+            } else {
+                console.warn('cshCart render failed:', msg);
+            }
         } finally {
             renderScheduled = false;
-            if (renderPending) renderPanel();
+            if (renderPending && !extDead) renderPanel();
         }
+    }
+
+    // Shown in place of the cart when the content script is orphaned by an
+    // extension reload/update. We render once, make the panel visible (even
+    // when the normal render would have hidden it because items were empty),
+    // and give the user a single Reload button — the only real remedy.
+    function renderExtDeadBanner() {
+        var panel = document.getElementById('csh-cart-panel');
+        if (!panel) {
+            // Can't use ensurePanel() here because its handlers touch chrome.*
+            // indirectly. Build a minimal standalone panel.
+            panel = document.createElement('div');
+            panel.id = 'csh-cart-panel';
+            panel.className = 'csh-cart-ext-dead';
+            document.body.appendChild(panel);
+        }
+        panel.classList.add('csh-cart-ext-dead');
+        panel.style.display = '';
+        panel.innerHTML =
+            '<div class="csh-cart-header">' +
+              '<span class="csh-cart-title">Change Set Cart</span>' +
+            '</div>' +
+            '<div class="csh-cart-body">' +
+              '<div class="csh-cart-empty" style="padding:14px 12px;line-height:1.4;">' +
+                '<strong>Extension was reloaded.</strong><br/>' +
+                'This tab is running a stale copy and can no longer talk to ' +
+                'the extension. Refresh the page to continue.' +
+                '<div style="margin-top:10px;text-align:right;">' +
+                  '<button type="button" id="csh-cart-ext-dead-reload" ' +
+                    'style="padding:6px 12px;background:#0176d3;color:#fff;border:0;border-radius:3px;cursor:pointer;font:inherit;">' +
+                    'Reload this page' +
+                  '</button>' +
+                '</div>' +
+              '</div>' +
+            '</div>';
+        var btn = panel.querySelector('#csh-cart-ext-dead-reload');
+        if (btn) btn.addEventListener('click', function () { location.reload(); });
     }
     // -----------------------------------------------------------------------
     // Virtualization — per-group windowed rendering.
@@ -2126,10 +2232,14 @@
         }
 
         // Watch for new storage writes from other tabs or from the worker.
-        chrome.storage.onChanged.addListener(function (changes, area) {
-            if (area !== 'local') return;
-            if (changes[CART_KEY]) renderPanel();
-        });
+        if (cshExtAlive()) {
+            try {
+                chrome.storage.onChanged.addListener(function (changes, area) {
+                    if (area !== 'local') return;
+                    if (changes[CART_KEY]) renderPanel();
+                });
+            } catch (_) { markExtDead(); }
+        }
 
         // Install the auto-save delegate. This is the primary persistence
         // mechanism for user selections — every checkbox click flushes to

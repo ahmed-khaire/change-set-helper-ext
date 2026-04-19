@@ -55,6 +55,33 @@ table.list tr.csh-diff-same > td:first-child {
     border-left-width: 3px !important;
 }
 
+/* Per-row compare trigger. Injected into the Name cell (which sits right
+   after the Salesforce checkbox column) once a compare org has connected.
+   The ⇄ glyph is lightweight and renders consistently across platforms
+   without shipping an icon font. Hover + active states mirror the rest of
+   the link behaviour so the affordance reads as clickable. */
+.csh-compare-icon {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 4px;
+    font-size: 13px;
+    line-height: 1;
+    color: #0070d2;
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    user-select: none;
+    vertical-align: middle;
+}
+.csh-compare-icon:hover {
+    background: #eef4fb;
+    border-color: #cfe3f6;
+    color: #005fb2;
+}
+.csh-compare-icon:active {
+    background: #dbeaf7;
+}
+
 /* Phase 5.2 — Modified-by-me / last N days filter bar */
 .csh-mod-filter {
     display: flex;
@@ -476,6 +503,26 @@ table.list th.csh-cv-select-col {
     flex-wrap: wrap;
     margin-bottom: 6px;
 }
+#csh-deploy-progress .csh-dp-phasebar {
+    padding: 6px 10px;
+    background: #f3f3f3;
+    border: 1px solid #e5e5e5;
+    border-radius: 3px;
+    margin-bottom: 8px;
+}
+#csh-deploy-progress .csh-dp-phase {
+    font-weight: 600;
+    color: #032d60;
+    padding: 1px 8px;
+    background: #eaf5fe;
+    border-radius: 10px;
+    font-size: 12px;
+}
+#csh-deploy-progress #csh-dp-setup-link {
+    font-size: 12px;
+    color: #0176d3;
+    text-decoration: underline;
+}
 #csh-deploy-progress .csh-dp-label {
     font-weight: 600;
     color: #706e6b;
@@ -538,3 +585,96 @@ table.list th.csh-cv-select-col {
 }
 #csh-deploy-progress .csh-dp-entry.ok   { color: #194e30; }
 #csh-deploy-progress .csh-dp-entry.fail { color: #8e0916; font-weight: 600; background: #fff4f3; }
+#csh-deploy-progress .csh-dp-entry.warn { color: #8a5400; font-weight: 600; background: #fff6e8; }
+#csh-deploy-progress .csh-dp-stack {
+    margin: 4px 0 2px 14px;
+    padding: 4px 6px;
+    background: #fcebea;
+    border-left: 2px solid #c23934;
+    color: #5c0b14;
+    font: 11px/1.45 Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Collapsible raw-JSON panel under the Validate Helper */
+.csh-json-details {
+    margin-top: 10px;
+    border: 1px solid #d8dde6;
+    border-radius: 4px;
+    background: #fafbfc;
+}
+.csh-json-details > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #16325c;
+    user-select: none;
+}
+.csh-json-details > summary::-webkit-details-marker { display: none; }
+.csh-json-details > summary::before {
+    content: '▸';
+    display: inline-block;
+    width: 10px;
+    color: #706e6b;
+    transition: transform 0.15s ease;
+}
+.csh-json-details[open] > summary::before {
+    transform: rotate(90deg);
+}
+.csh-json-details .csh-json-label {
+    font-weight: 600;
+}
+.csh-json-details .csh-json-badge {
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    background: #eef1f6;
+    color: #3e3e3c;
+    border: 1px solid #d8dde6;
+    letter-spacing: 0.02em;
+}
+.csh-json-details .csh-json-badge.ok   { background: #e4f5ea; color: #194e30; border-color: #b6e0c4; }
+.csh-json-details .csh-json-badge.fail { background: #fcebea; color: #8e0916; border-color: #f0c2c0; }
+.csh-json-details .csh-json-badge.warn { background: #fff6e8; color: #8a5400; border-color: #f0d9a8; }
+.csh-json-details .csh-json-hint {
+    color: #706e6b;
+    font-size: 11px;
+    margin-left: auto;
+}
+.csh-json-details[open] .csh-json-hint { display: none; }
+.csh-json-body {
+    padding: 0 10px 10px 10px;
+    border-top: 1px solid #e5e8ed;
+    background: #fff;
+}
+.csh-json-toolbar {
+    padding: 6px 0;
+    display: flex;
+    justify-content: flex-end;
+}
+.csh-json-btn {
+    padding: 3px 10px;
+    font-size: 11px;
+    background: #fff;
+    border: 1px solid #d8dde6;
+    border-radius: 3px;
+    cursor: pointer;
+    color: #16325c;
+}
+.csh-json-btn:hover { background: #f4f6f9; }
+#json-renderer {
+    max-height: 360px;
+    overflow: auto;
+    margin: 0;
+    padding: 8px 10px;
+    background: #f8f9fb;
+    border: 1px solid #e5e8ed;
+    border-radius: 3px;
+    font: 12px/1.5 Menlo, Consolas, monospace;
+}

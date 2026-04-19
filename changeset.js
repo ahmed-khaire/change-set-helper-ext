@@ -230,18 +230,38 @@ function setupTable() {
     var gotoloc1 = "'/" + $("#id").val() + "?tab=PackageComponents&rowsperpage=5000'";
     $('input[name="cancel"]')
         .before('<input value="View change set" class="btn" name="viewall" title="View all items in changeset in new window" type="button" onclick="window.open(' + gotoloc1 +',\'_blank\');" />')
-        .after(`<br /><input value="Compare with org" class="btn compareorg" name="compareorg" id="compareorg"
-					title="Compare wtih another org. A login box will be displayed." type="button" />
-		<select id='compareEnv' name='Compare Environment'>
-			<option value='sandbox'>Sandbox</option>
-			<option value='prod'>Prod/Dev</option>
-			<option value='mydomain'>My Domain URL…</option>
-		</select>
-		<input type='text' id='compareMyDomain' placeholder='https://yourorg.my.salesforce.com' style='display:none;margin-left:6px;padding:3px 6px;min-width:240px;' />
+        .after(`<br />
+		<!-- Saved-orgs picker: populated at load time from the cross-page
+		     org registry. Reuses the refresh token stored at last login so
+		     the user doesn't have to OAuth again unless it was revoked. -->
+		<span id="compareSavedOrgsGroup" style="display:none;">
+			<select id="compareSavedOrgsSelect" title="Target org" style="max-width:320px;vertical-align:middle;"></select>
+			<input value="Compare with this org" class="btn" id="compareSavedOrgConnect" type="button" />
+			<button id="compareSavedOrgDelete" type="button" title="Forget this saved org" style="margin-left:4px;padding:2px 8px;border:1px solid #c9c9c9;background:#fff;border-radius:3px;cursor:pointer;">✕</button>
+			<a href="#" id="compareAddAnotherOrgLink" style="margin-left:8px;font-size:12px;">+ Add another org</a>
+		</span>
+		<span id="compareNewOrgGroup">
+			<input value="Compare with org" class="btn compareorg" name="compareorg" id="compareorg"
+						title="Compare with another org. A login box will be displayed." type="button" />
+			<select id='compareEnv' name='Compare Environment'>
+				<option value='sandbox'>Sandbox</option>
+				<option value='prod'>Prod/Dev</option>
+				<option value='mydomain'>My Domain URL…</option>
+			</select>
+			<input type='text' id='compareMyDomain' placeholder='https://yourorg.my.salesforce.com' style='display:none;margin-left:6px;padding:3px 6px;min-width:240px;' />
+			<a href="#" id="compareBackToSavedOrgsLink" style="display:none;margin-left:8px;font-size:12px;">Back to saved orgs</a>
+		</span>
 	<span id="loggedInUsername"></span>  <span id="logout">(<a id="logoutLink" href="#">Logout</a>)</span>
 `);
 
     $('#editPage').append('<input type="hidden" name="rowsperpage" value="5000" /> ');
+
+    // Populate the saved-orgs dropdown now that its select exists. Safe to
+    // call again later (the wiring block also invokes it) — the function
+    // just re-reads storage and re-renders the dropdown.
+    if (typeof cshCompareRefreshSavedOrgsUI === 'function') {
+        cshCompareRefreshSavedOrgsUI().catch(function () {});
+    }
 }
 
 function convertDate(dateToconvert) {
@@ -683,10 +703,34 @@ function processCompareResults(results, env) {
             changeSetTable.cell(rowIdx, compareColumnIndices.compareModBy).data(results[i].lastModifiedByName);
             changeSetTable.cell(rowIdx, compareColumnIndices.fullName).data('<a href="#">' + fullName + '</a>');
 
-            // Make Full Name cell clickable for diff
+            // Make Full Name cell clickable for diff. Also stamp the cell
+            // with data-fullName so the click handler can resolve the item
+            // name directly off the clicked node (the historical bug was
+            // reading data-fullName from a cell that never had it set).
             var fullNameCell = changeSetTable.cell(rowIdx, compareColumnIndices.fullName).node();
+            $(fullNameCell).attr('data-fullName', fullName);
             $(fullNameCell).off("click");
             $(fullNameCell).click(getContents);
+
+            // Inject a compact compare icon into the Name cell (which sits
+            // immediately after the checkbox visually) so users can kick off
+            // a diff without hunting for the appended column at the far right.
+            // Only added once compare is live — before connect the icon would
+            // just error out. The icon stops propagation so it doesn't toggle
+            // the row selection under it.
+            var nameCellNode = changeSetTable.row(rowIdx).node();
+            if (nameCellNode) {
+                var $nameCell = $(nameCellNode).find('td[data-fullName]').first();
+                if ($nameCell.length && !$nameCell.find('.csh-compare-icon').length) {
+                    var $icon = $('<span class="csh-compare-icon" title="Compare with target org">⇄</span>');
+                    $icon.on('click', function (ev) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        cshTriggerCompare(fullName);
+                    });
+                    $nameCell.prepend($icon);
+                }
+            }
 
             // Phase 5: colour-code the whole row based on recency comparison.
             //   csh-diff-newer-local  → local is newer (safe to deploy from here)
@@ -1356,6 +1400,284 @@ function listMetaDataProxy(data, retFunc, isDefault) {
 }
 
 
+// -------------------------------------------------------------------------
+// Saved-orgs picker for the Compare flow.
+//
+// Mirrors the Validate-Helper approach: offer a dropdown of orgs we already
+// have refresh tokens for, auto-select the one last used for this change
+// set, and only prompt OAuth when the user explicitly adds a new org or when
+// a refresh token has been revoked.
+// -------------------------------------------------------------------------
+
+function cshCompareChangeSetId() {
+    return $('#id').val() ||
+        ((location.search.match(/[?&]id=([^&]+)/) || [])[1] || null);
+}
+
+function cshCompareFormatLastUsed(ts) {
+    if (!ts) return '';
+    var diff = Date.now() - ts;
+    var m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + 'm ago';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+}
+
+function cshCompareRenderSavedOrgsDropdown(orgs, preselectOrgId) {
+    var $sel = $('#compareSavedOrgsSelect').empty();
+    if (!orgs || !orgs.length) {
+        $('#compareSavedOrgsGroup').hide();
+        $('#compareNewOrgGroup').show();
+        $('#compareBackToSavedOrgsLink').hide();
+        return null;
+    }
+    orgs.forEach(function (o) {
+        var hostShort = (o.host || '').replace(/^https?:\/\//, '');
+        var label = (o.username || 'unknown') + '  —  ' + hostShort +
+            (o.envLabel ? ' · ' + o.envLabel : '') +
+            (o.lastUsedAt ? '  (' + cshCompareFormatLastUsed(o.lastUsedAt) + ')' : '');
+        var $opt = $('<option></option>').val(o.orgId).text(label);
+        $opt.data('org', o);
+        $sel.append($opt);
+    });
+    var ids = orgs.map(function (o) { return o.orgId; });
+    var chosen = (preselectOrgId && ids.indexOf(preselectOrgId) >= 0)
+        ? preselectOrgId
+        : ids[0];
+    $sel.val(chosen);
+    $('#compareSavedOrgsGroup').show();
+    $('#compareNewOrgGroup').hide();
+    $('#compareBackToSavedOrgsLink').show();
+    return chosen;
+}
+
+function cshCompareRefreshSavedOrgsUI() {
+    return new Promise(function (resolve) {
+        chrome.runtime.sendMessage({
+            type: 'cshListSavedOrgs',
+            changeSetId: cshCompareChangeSetId()
+        }, function (resp) {
+            if (resp && resp.ok) {
+                cshCompareRenderSavedOrgsDropdown(resp.orgs || [], resp.lastOrgIdForChangeSet || null);
+            } else {
+                cshCompareRenderSavedOrgsDropdown([], null);
+            }
+            resolve();
+        });
+    });
+}
+
+// Run the compare-metadata list call after we've established a deploy
+// connection (whether via saved org or freshly logged in).
+// Soft cap on listMetadata — Salesforce returns at most this many items per
+// ListMetadataQuery, and the API has no native pagination. We use the value
+// to detect probable truncation (results.length === LIST_META_LIMIT) and
+// warn the user; for folder-based types we sidestep the cap entirely by
+// listing per-folder.
+var CSH_LIST_META_LIMIT = 2000;
+// Metadata API allows up to 3 queries per listMetadata call. Batching by
+// this number minimises round trips when scanning N folders.
+var CSH_LIST_BATCH_SIZE = 3;
+
+function cshCompareStartMetadataList(env) {
+    $("#compareSavedOrgsGroup, #compareNewOrgGroup, #compareEnv, #compareMyDomain").hide();
+    $("#logout").show();
+    $("#editPage").addClass("lowOpacity");
+
+    // Folder-based types (Report, Dashboard, Document, EmailTemplate) have
+    // a cap per folder, not per type — listing per folder aggregates the
+    // whole org even when the total count exceeds CSH_LIST_META_LIMIT.
+    var folderType = entityFolderMap[selectedEntityType];
+    if (folderType) {
+        cshCompareListFolderScoped(folderType, env);
+    } else {
+        cshCompareListFlat(env);
+    }
+}
+
+function cshCompareListFlat(env) {
+    listMetaDataProxy([{ type: resolvedMetadataType }],
+        function (results) {
+            if (!results) {
+                window.cshToast && window.cshToast.show(
+                    'Compare org did not return a metadata list.',
+                    { type: 'error' }
+                );
+                processCompareResults([], env);
+                return;
+            }
+            if (results.error) {
+                console.log('Problem listing compare metadata:', results.error);
+            }
+            if (Array.isArray(results) && results.length >= CSH_LIST_META_LIMIT) {
+                // Non-folder types have no native way to fetch beyond 2000
+                // via listMetadata. Tell the user their diff may be
+                // incomplete rather than silently hiding rows.
+                window.cshToast && window.cshToast.show(
+                    resolvedMetadataType + ': target org returned ' + results.length +
+                    ' items (listMetadata cap). If the type has more, extras will not appear in the compare columns.',
+                    { type: 'warning', duration: 7000 }
+                );
+            }
+            processCompareResults(results, env);
+        },
+        false);
+}
+
+// Fetch a folder-based type by iterating its folders. Salesforce's per-query
+// cap is per folder, so a 10k-report org with 50 folders lists cleanly as
+// long as each folder stays under 2000. We batch CSH_LIST_BATCH_SIZE folder
+// queries per listMetadata call and run those batches in parallel, then
+// merge results once every batch finishes.
+function cshCompareListFolderScoped(folderType, env) {
+    window.cshToast && window.cshToast.show(
+        'Listing folders in compare org…',
+        { type: 'info', duration: 1800 }
+    );
+    listMetaDataProxy([{ type: folderType }], function (folders) {
+        folders = folders || [];
+        if (!Array.isArray(folders) || folders.length === 0) {
+            // No folder records — fall back to flat list so we still show
+            // whatever the bare type query returns (handles orgs where the
+            // folder type happens to be empty or inaccessible).
+            cshCompareListFlat(env);
+            return;
+        }
+
+        var allResults = [];
+        var pendingBatches = 0;
+        var completedFolders = 0;
+        var truncatedFolders = [];
+
+        function sendBatch(queries) {
+            pendingBatches++;
+            var foldersInBatch = queries.map(function (q) { return q.folder; });
+            chrome.runtime.sendMessage(
+                { proxyFunction: 'listDeployMetaData', proxydata: queries },
+                function (response) {
+                    var batchResults = (response && response.results) || [];
+                    if (Array.isArray(batchResults)) {
+                        allResults = allResults.concat(batchResults);
+                    }
+                    // Aggregate-level cap detection: if this batch came back
+                    // with exactly CSH_LIST_META_LIMIT across its queries,
+                    // flag the folders (aggregate across 3 folders is the
+                    // best we can do without per-query counts).
+                    if (batchResults.length >= CSH_LIST_META_LIMIT) {
+                        truncatedFolders = truncatedFolders.concat(foldersInBatch);
+                    }
+                    completedFolders += queries.length;
+                    window.cshToast && window.cshToast.show(
+                        'Listing ' + resolvedMetadataType + ' from target: ' +
+                        completedFolders + ' / ' + folders.length + ' folders',
+                        { type: 'info', duration: 1200 }
+                    );
+                    pendingBatches--;
+                    if (pendingBatches === 0) {
+                        if (truncatedFolders.length > 0) {
+                            window.cshToast && window.cshToast.show(
+                                resolvedMetadataType + ': these folders may be truncated at ' +
+                                CSH_LIST_META_LIMIT + ' items: ' + truncatedFolders.join(', '),
+                                { type: 'warning', duration: 8000 }
+                            );
+                        }
+                        processCompareResults(allResults, env);
+                    }
+                }
+            );
+        }
+
+        var queries = [];
+        for (var i = 0; i < folders.length; i++) {
+            queries.push({ type: resolvedMetadataType, folder: folders[i].fullName });
+            if (queries.length === CSH_LIST_BATCH_SIZE) {
+                sendBatch(queries);
+                queries = [];
+            }
+        }
+        if (queries.length > 0) sendBatch(queries);
+    }, false);
+}
+
+function cshCompareOnConnectSavedOrg() {
+    var orgId = $('#compareSavedOrgsSelect').val();
+    if (!orgId) return;
+    var $btn = $('#compareSavedOrgConnect');
+    var original = $btn.val();
+    $btn.prop('disabled', true).val('Connecting…');
+    chrome.runtime.sendMessage({
+        oauth: 'connectToDeploy',
+        orgId: orgId,
+        changeSetId: cshCompareChangeSetId()
+    }, function (response) {
+        $btn.prop('disabled', false).val(original);
+        if (!response || !response.ok) {
+            var msg = (response && response.error) || 'Unknown error';
+            if (response && response.needsReauth) {
+                var orgData = $('#compareSavedOrgsSelect option:selected').data('org') || {};
+                var host = orgData.host || '';
+                var env;
+                if (/^https?:\/\/login\.salesforce\.com/i.test(host)) env = 'prod';
+                else if (/^https?:\/\/test\.salesforce\.com/i.test(host)) env = 'sandbox';
+                else env = 'mydomain';
+                window.cshToast && window.cshToast.show(msg + ' — re-authorizing…', { type: 'info' });
+                cshCompareStartNewOrgLogin(env, host);
+                return;
+            }
+            window.cshToast && window.cshToast.show('Connect failed: ' + msg, { type: 'error' });
+            return;
+        }
+        $("#loggedInUsername").html(response.username || '');
+        // envLabel hint: fall back to 'prod' if unknown so processCompareResults
+        // doesn't choke — it only uses env for naming in its UI.
+        var env = response.envLabel === 'Sandbox' ? 'sandbox'
+            : response.envLabel === 'Production' ? 'prod' : 'mydomain';
+        cshCompareStartMetadataList(env);
+    });
+}
+
+function cshCompareOnDeleteSavedOrg() {
+    var orgId = $('#compareSavedOrgsSelect').val();
+    if (!orgId) return;
+    var label = $('#compareSavedOrgsSelect option:selected').text();
+    if (!confirm('Forget saved org?\n\n' + label + '\n\nYou will be asked to sign in again next time you use it.')) {
+        return;
+    }
+    chrome.runtime.sendMessage({
+        type: 'cshDeleteSavedOrg',
+        orgId: orgId
+    }, function (resp) {
+        if (!resp || !resp.ok) {
+            window.cshToast && window.cshToast.show(
+                'Could not forget org: ' + ((resp && resp.error) || 'unknown error'),
+                { type: 'error' }
+            );
+            return;
+        }
+        cshCompareRefreshSavedOrgsUI();
+    });
+}
+
+function cshCompareStartNewOrgLogin(env, customHost) {
+    chrome.runtime.sendMessage({
+        oauth: 'connectToDeploy',
+        environment: env,
+        customHost: customHost || null,
+        changeSetId: cshCompareChangeSetId()
+    }, function (response) {
+        if (!response || !response.ok) {
+            var err = (response && response.error) || 'Unknown error';
+            console.log('Problem logging in: ' + err);
+            window.cshToast && window.cshToast.show('Problem logging in: ' + err, { type: 'error' });
+            return;
+        }
+        $("#loggedInUsername").html(response.username || '');
+        cshCompareStartMetadataList(env);
+    });
+}
+
 function oauthLogin(env) {
     var env = $("#compareEnv :selected").val();
     var customHost = null;
@@ -1370,46 +1692,47 @@ function oauthLogin(env) {
         }
     }
     console.log('oauthLogin');
-    chrome.runtime.sendMessage({
-        'oauth': "connectToDeploy",
-        environment: env,
-        customHost: customHost
-    }, function (response) {
-        console.log(response);
-        $("#compareEnv, #compareMyDomain").hide();
-
-        $("#loggedInUsername").html(response.username);
-        $("#logout").show();
-
-        listMetaDataProxy([{type: resolvedMetadataType}],
-            function (results) {
-                if (results.error) {
-                    console.log("Problem logging in: " + results.error);
-                    //do nothing else
-                }
-                $("#editPage").addClass("lowOpacity");
-
-                processCompareResults(results, env);
-                //console.log(results);
-            },
-            false);
-
-    });
+    cshCompareStartNewOrgLogin(env, customHost);
 }
 
 
-function getContents() {
-    var itemToGet = $(this).attr('data-fullName');
-    //(itemToGet);
+// Trigger a compare popup for a single item. The diff ("Full name (Click
+// for diff)") column and the new compare icon both funnel through this.
+// Historical bug: the click handler was bound to the diff-column cell, which
+// never carried the data-fullName attribute — so $(this).attr('data-fullName')
+// returned undefined and the popup opened with item=undefined. Resolving the
+// name explicitly via argument fixes that and lets the new icon reuse the
+// same flow.
+function cshTriggerCompare(fullName) {
+    if (!fullName) {
+        console.warn('cshTriggerCompare called without a fullName');
+        return;
+    }
+    if (!resolvedMetadataType) {
+        window.cshToast && window.cshToast.show(
+            'Connect a compare org before diffing an item.',
+            { type: 'error' }
+        );
+        return;
+    }
     chrome.runtime.sendMessage({
-            'proxyFunction': "compareContents",
-            'entityType': resolvedMetadataType,
-            'itemName': itemToGet
-        },
-        function (response) {
-            //do nothing
-        }
-    );
+        'proxyFunction': "compareContents",
+        'entityType': resolvedMetadataType,
+        'itemName': fullName
+    }, function () { /* background opens the popup */ });
+}
+
+function getContents() {
+    // Prefer the cell's own attribute; fall back to the row's Name cell
+    // (which is where setupTable writes data-fullName first), then to the
+    // link text. Any of these pins down the item without caring which DOM
+    // node the click actually landed on.
+    var cell = $(this);
+    var fullName = cell.attr('data-fullName') ||
+        cell.closest('tr').find('td[data-fullName]').first().attr('data-fullName') ||
+        $.trim(cell.find('a').first().text()) ||
+        $.trim(cell.text());
+    cshTriggerCompare(fullName);
 }
 
 function deployLogout() {
@@ -1418,11 +1741,20 @@ function deployLogout() {
         //do nothing else
     });
 
-    $("#compareEnv").show();
-    // Only show the My-Domain input if that option is currently selected.
-    if ($('#compareEnv').val() === 'mydomain') $('#compareMyDomain').show();
     $("#loggedInUsername").html('');
     $("#logout").hide();
+    // Refresh the saved-orgs picker — if the user has one or more saved
+    // orgs they'll see the dropdown; otherwise they fall back to the classic
+    // env-select form. Makes a silent no-op if the Compare UI isn't mounted
+    // yet (e.g. user logs out before ever triggering setupTable).
+    if (typeof cshCompareRefreshSavedOrgsUI === 'function') {
+        cshCompareRefreshSavedOrgsUI().catch(function () {});
+    } else {
+        // Fallback for pages that never ran setupTable — keep the legacy
+        // env-select visible so Logout still returns to a usable state.
+        $("#compareEnv").show();
+        if ($('#compareEnv').val() === 'mydomain') $('#compareMyDomain').show();
+    }
 
 
 }
@@ -1940,6 +2272,24 @@ $(document).ready(function () {
     });
 
     $('input[name="cancel"]').parent().on('click','#compareorg' , oauthLogin);
+    // Saved-orgs wiring for Compare. These handlers mirror the Validate
+    // Helper's saved-orgs behavior so both flows share one persistent org
+    // registry.
+    $(document).on('click', '#compareSavedOrgConnect', cshCompareOnConnectSavedOrg);
+    $(document).on('click', '#compareSavedOrgDelete', cshCompareOnDeleteSavedOrg);
+    $(document).on('click', '#compareAddAnotherOrgLink', function (ev) {
+        ev.preventDefault();
+        $('#compareSavedOrgsGroup').hide();
+        $('#compareNewOrgGroup').show();
+        $('#compareBackToSavedOrgsLink').show();
+    });
+    $(document).on('click', '#compareBackToSavedOrgsLink', function (ev) {
+        ev.preventDefault();
+        $('#compareNewOrgGroup').hide();
+        $('#compareSavedOrgsGroup').show();
+    });
+    // Populate the saved-orgs dropdown once the compare controls are rendered.
+    cshCompareRefreshSavedOrgsUI();
     // Reveal My Domain URL input when the user picks it.
     $(document).on('change', '#compareEnv', function () {
         if ($(this).val() === 'mydomain') $('#compareMyDomain').show();
@@ -2071,14 +2421,20 @@ $(document).ready(function () {
 chrome.runtime.sendMessage({'proxyFunction': 'getDeployUsername'}, function(username) {
 	console.log(username);
 	if (username) {
-		//Then there is a logged in deploy user
-		$("#compareEnv").hide();
+		//Then there is a logged in deploy user — hide both login paths
+		$("#compareSavedOrgsGroup, #compareNewOrgGroup, #compareEnv, #compareMyDomain").hide();
 		$("#loggedInUsername").html(username);
 		$("#logout").show();
 	} else {
-		$("#compareEnv").show();
-        $("#loggedInUsername").html('');
+		$("#loggedInUsername").html('');
 		$("#logout").hide();
+		// cshCompareRefreshSavedOrgsUI is also called from setupTable and
+		// from the wiring block — calling again here is cheap and covers the
+		// race where this message response arrives after the DOM is ready.
+		if (typeof cshCompareRefreshSavedOrgsUI === 'function') {
+			cshCompareRefreshSavedOrgsUI().catch(function () {});
+		} else {
+			$("#compareEnv").show();
+		}
 	}
-	//do nothing else
 });

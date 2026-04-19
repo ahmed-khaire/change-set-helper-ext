@@ -43,6 +43,29 @@ chrome.storage.onChanged.addListener(function (changes, areaName) {
 const POLLTIMEOUT = 20*60*1000; // 20 minutes
 const POLLINTERVAL = 5000; //5 seconds
 
+// Tracks which saved org the current deploy connection points at. Used to
+// hand a fresh {instanceUrl, accessToken, apiVersion, orgId} bundle to the
+// page after deploy kickoff so the page can poll Salesforce's Metadata REST
+// API directly (bypassing the SW + offscreen doc, both of which suspend on
+// long deploys and stall the phase label). Set in cshConnectDeployOrg.
+// Mirrored to chrome.storage.session so it survives SW restarts between
+// "Connect" and "Go…" — otherwise we'd fail handoff with "No active deploy
+// org" despite the offscreen doc still holding a live jsforce connection.
+var cshActiveDeployOrgId = null;
+
+function cshSetActiveDeployOrgId(orgId) {
+    cshActiveDeployOrgId = orgId;
+    try { chrome.storage.session.set({ cshActiveDeployOrgId: orgId }); } catch (_) {}
+}
+// Restore on SW startup.
+try {
+    chrome.storage.session.get(['cshActiveDeployOrgId'], function (items) {
+        if (items && items.cshActiveDeployOrgId) {
+            cshActiveDeployOrgId = items.cshActiveDeployOrgId;
+        }
+    });
+} catch (_) { /* session storage may not be available in older Chrome */ }
+
 // Connected App Consumer Key. Default is the self-hosted Connected App
 // deployed to the Change Set Helper dev org (Metadata API; see
 // sfdx-connected-app/). Users can override via Options → Connected App
@@ -262,6 +285,284 @@ async function cshRunOauthLogin(host) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Saved-orgs registry — Phase 6 multi-org auth.
+//
+// The Validate Helper and Compare flow used to require fresh OAuth on every
+// visit because the deploy connection lived only in the offscreen document.
+// Users working across multiple target orgs had to re-authenticate each time
+// they switched change sets.
+//
+// We now persist per-org credentials (access + refresh token, instance URL,
+// identity) in chrome.storage.local keyed by host+username, plus a
+// per-change-set "last used org" map so the Validate Helper can auto-select
+// the org the user most recently deployed this change set to. Refresh tokens
+// let us mint fresh access tokens without a popup until the refresh itself
+// expires or is revoked.
+// ---------------------------------------------------------------------------
+var SAVED_ORGS_KEY = 'cshSavedOrgs';
+var ORG_USAGE_KEY = 'cshOrgUsage';
+
+function cshReadJsonKey(key) {
+    return new Promise(function (resolve) {
+        chrome.storage.local.get([key], function (items) {
+            resolve((items && items[key]) || {});
+        });
+    });
+}
+
+function cshWriteJsonKey(key, val) {
+    return new Promise(function (resolve) {
+        chrome.storage.local.set({ [key]: val }, function () { resolve(); });
+    });
+}
+
+function cshMakeOrgId(host, username) {
+    return (host || '').toLowerCase() + '|' + (username || '').toLowerCase();
+}
+
+async function cshListSavedOrgs() {
+    var all = await cshReadJsonKey(SAVED_ORGS_KEY);
+    var ids = Object.keys(all);
+    return ids.map(function (id) {
+        return Object.assign({ orgId: id }, all[id]);
+    }).sort(function (a, b) {
+        return (b.lastUsedAt || 0) - (a.lastUsedAt || 0);
+    });
+}
+
+async function cshGetSavedOrg(orgId) {
+    if (!orgId) return null;
+    var all = await cshReadJsonKey(SAVED_ORGS_KEY);
+    return all[orgId] || null;
+}
+
+async function cshSaveOrg(orgRecord) {
+    var id = orgRecord.orgId || cshMakeOrgId(orgRecord.host, orgRecord.username);
+    var all = await cshReadJsonKey(SAVED_ORGS_KEY);
+    var prev = all[id] || {};
+    // Preserve fields from prior record that the caller didn't supply (e.g.
+    // refreshToken when only the access token was rotated).
+    all[id] = Object.assign({}, prev, orgRecord, {
+        orgId: id,
+        lastUsedAt: orgRecord.lastUsedAt || Date.now()
+    });
+    await cshWriteJsonKey(SAVED_ORGS_KEY, all);
+    return id;
+}
+
+async function cshDeleteSavedOrg(orgId) {
+    var all = await cshReadJsonKey(SAVED_ORGS_KEY);
+    if (!all[orgId]) return false;
+    delete all[orgId];
+    await cshWriteJsonKey(SAVED_ORGS_KEY, all);
+    // Also clear any change-set usage pointers that referenced it, so the
+    // Validate Helper doesn't dangle a "last used" id that no longer exists.
+    var usage = await cshReadJsonKey(ORG_USAGE_KEY);
+    var changed = false;
+    Object.keys(usage).forEach(function (csId) {
+        if (usage[csId] && usage[csId].lastOrgId === orgId) {
+            delete usage[csId];
+            changed = true;
+        }
+    });
+    if (changed) await cshWriteJsonKey(ORG_USAGE_KEY, usage);
+    return true;
+}
+
+async function cshGetLastOrgForChangeSet(changeSetId) {
+    if (!changeSetId) return null;
+    var usage = await cshReadJsonKey(ORG_USAGE_KEY);
+    return (usage[changeSetId] && usage[changeSetId].lastOrgId) || null;
+}
+
+async function cshSetLastOrgForChangeSet(changeSetId, orgId) {
+    if (!changeSetId || !orgId) return;
+    var usage = await cshReadJsonKey(ORG_USAGE_KEY);
+    usage[changeSetId] = { lastOrgId: orgId, lastUsedAt: Date.now() };
+    await cshWriteJsonKey(ORG_USAGE_KEY, usage);
+}
+
+// Fetch the org's identity (username, user id, org id) using the access
+// token we just minted. We prefer /services/oauth2/userinfo because it's the
+// canonical endpoint; if the Connected App policy disables it, we fall back
+// to chatter /users/me which only needs the `api` scope.
+async function cshFetchOrgIdentity(instanceUrl, accessToken) {
+    try {
+        var resp = await fetch(instanceUrl + '/services/oauth2/userinfo', {
+            headers: { 'Authorization': 'Bearer ' + accessToken }
+        });
+        if (resp.ok) {
+            var json = await resp.json();
+            return {
+                username: json.preferred_username || json.email || json.sub || json.user_id,
+                userId: json.user_id || json.sub || null,
+                organizationId: json.organization_id || null,
+                displayName: json.name || json.preferred_username || ''
+            };
+        }
+    } catch (_) { /* fall through */ }
+    var resp2 = await fetch(instanceUrl + '/services/data/v' + CSH_APIVERSION + '/chatter/users/me', {
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+    });
+    if (!resp2.ok) throw new Error('Identity lookup failed (HTTP ' + resp2.status + ')');
+    var j = await resp2.json();
+    return {
+        username: j.username || (j.user && j.user.username) || null,
+        userId: j.id || null,
+        organizationId: null,
+        displayName: j.displayName || j.name || ''
+    };
+}
+
+// Turn a Validate-Helper "environment" + customHost into the OAuth auth host.
+function cshAuthHostForEnv(environment, customHost) {
+    if (environment === 'mydomain') {
+        return cshNormalizeHost(customHost) || 'https://login.salesforce.com';
+    }
+    if (environment === 'prod') return 'https://login.salesforce.com';
+    return 'https://test.salesforce.com';
+}
+
+function cshEnvLabel(environment) {
+    if (environment === 'prod') return 'Production';
+    if (environment === 'mydomain') return 'My Domain';
+    return 'Sandbox';
+}
+
+// Connect the deploy connection either to a previously-saved org (refresh
+// the access token if stale, then hand it to the offscreen document) or to a
+// newly-authorized org via PKCE. The UI calls this with { orgId } on reuse
+// and { environment, customHost } on "Add a new org".
+async function cshConnectDeployOrg(request) {
+    if (request && request.orgId) {
+        var org = await cshGetSavedOrg(request.orgId);
+        if (!org) throw new Error('Saved org not found — please add it again.');
+        var token = org.accessToken;
+        var stale = Date.now() - (org.issuedAt || org.lastUsedAt || 0) > TOKEN_STALE_MS;
+        if (org.refreshToken && (stale || request.forceRefresh)) {
+            try {
+                var refreshed = await cshRefreshAccessToken(org.host, org.refreshToken);
+                token = refreshed.accessToken;
+                await cshSaveOrg({
+                    orgId: org.orgId,
+                    host: org.host,
+                    username: org.username,
+                    userId: org.userId,
+                    organizationId: org.organizationId,
+                    displayName: org.displayName,
+                    envLabel: org.envLabel,
+                    instanceUrl: refreshed.instanceUrl || org.instanceUrl,
+                    accessToken: refreshed.accessToken,
+                    refreshToken: refreshed.refreshToken,
+                    issuedAt: refreshed.issuedAt,
+                    scope: refreshed.scope || org.scope
+                });
+                org.instanceUrl = refreshed.instanceUrl || org.instanceUrl;
+            } catch (err) {
+                // Refresh failed — tell the caller to re-authorize.
+                var e = new Error('Session for ' + (org.username || org.host) + ' expired. Please re-authorize.');
+                e.code = 'needs-reauth';
+                throw e;
+            }
+        }
+        var offRes = await sendToOffscreen({
+            action: 'connectToOrg',
+            connType: 'deploy',
+            instanceUrl: org.instanceUrl,
+            accessToken: token
+        });
+        if (offRes && offRes.error) throw new Error(offRes.error);
+        await cshSaveOrg({ orgId: org.orgId, host: org.host, username: org.username, lastUsedAt: Date.now() });
+        if (request.changeSetId) await cshSetLastOrgForChangeSet(request.changeSetId, org.orgId);
+        cshSetActiveDeployOrgId(org.orgId);
+        return {
+            ok: true,
+            orgId: org.orgId,
+            username: (offRes && offRes.username) || org.username,
+            instanceUrl: org.instanceUrl,
+            host: org.host,
+            envLabel: org.envLabel || ''
+        };
+    }
+
+    // New-org path: PKCE login + identity fetch + save + connect offscreen.
+    var host = cshAuthHostForEnv(request && request.environment, request && request.customHost);
+    var tokens = await cshRunOauthLogin(host);
+    var ident = {};
+    try {
+        ident = await cshFetchOrgIdentity(tokens.instanceUrl, tokens.accessToken);
+    } catch (e) {
+        // Identity fetch shouldn't block the login — fall back to the host
+        // as the visible label. Users will see the org listed but with an
+        // empty username; we'll refresh the identity on next successful use.
+        console.warn('cshFetchOrgIdentity failed:', e.message);
+    }
+    var username = ident.username || 'unknown';
+    var record = {
+        host: host,
+        username: username,
+        userId: ident.userId || null,
+        organizationId: ident.organizationId || null,
+        displayName: ident.displayName || '',
+        envLabel: cshEnvLabel(request && request.environment),
+        instanceUrl: tokens.instanceUrl,
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        issuedAt: tokens.issuedAt,
+        scope: tokens.scope
+    };
+    var orgId = await cshSaveOrg(record);
+    var offRes = await sendToOffscreen({
+        action: 'connectToOrg',
+        connType: 'deploy',
+        instanceUrl: tokens.instanceUrl,
+        accessToken: tokens.accessToken
+    });
+    if (offRes && offRes.error) throw new Error(offRes.error);
+    if (request && request.changeSetId) {
+        await cshSetLastOrgForChangeSet(request.changeSetId, orgId);
+    }
+    cshSetActiveDeployOrgId(orgId);
+    return {
+        ok: true,
+        orgId: orgId,
+        username: (offRes && offRes.username) || username,
+        instanceUrl: tokens.instanceUrl,
+        host: host,
+        envLabel: record.envLabel,
+        freshlyLoggedIn: true
+    };
+}
+
+// Return a fresh {accessToken, instanceUrl} bundle for the given saved org,
+// refreshing via OAuth if the stored access token is stale. Called by the
+// page's deploy poller on 401 (token expired mid-deploy) and once on
+// handoff so the page always starts with a usable token.
+async function cshGetFreshDeployToken(orgId) {
+    var org = await cshGetSavedOrg(orgId);
+    if (!org) throw new Error('Saved org not found');
+    var token = org.accessToken;
+    var instanceUrl = org.instanceUrl;
+    var stale = Date.now() - (org.issuedAt || 0) > TOKEN_STALE_MS;
+    if (org.refreshToken && stale) {
+        var refreshed = await cshRefreshAccessToken(org.host, org.refreshToken);
+        token = refreshed.accessToken;
+        instanceUrl = refreshed.instanceUrl || instanceUrl;
+        await cshSaveOrg({
+            orgId: org.orgId,
+            host: org.host,
+            username: org.username,
+            instanceUrl: instanceUrl,
+            accessToken: token,
+            refreshToken: refreshed.refreshToken,
+            issuedAt: refreshed.issuedAt,
+            scope: refreshed.scope || org.scope
+        });
+    }
+    return { accessToken: token, instanceUrl: instanceUrl };
+}
+
 // Keep service worker alive during long-running operations
 let keepAliveInterval = null;
 
@@ -286,6 +587,7 @@ function stopKeepAlive() {
 let creating; // A global promise to avoid concurrency issues
 let offscreenReady = false;
 let offscreenInactivityTimer = null;
+let offscreenPendingCount = 0; // in-flight sendToOffscreen calls
 const OFFSCREEN_INACTIVITY_TIMEOUT = 5 * 60 * 1000; // Close after 5 minutes of inactivity
 
 // Close offscreen document to free memory
@@ -317,13 +619,21 @@ async function closeOffscreenDocument() {
     }
 }
 
-// Reset inactivity timer - close offscreen after period of no use
+// Reset inactivity timer - close offscreen after period of no use.
+// Skips scheduling while any sendToOffscreen call is still awaiting a
+// response: a single long-running retrieve/deploy can easily exceed 5 min
+// without any new messages, and if the timer fires mid-op the offscreen doc
+// gets torn down and the in-flight sendResponse never fires — surfacing as
+// "A listener indicated an asynchronous response by returning true, but the
+// message channel closed before a response was received".
 function resetOffscreenInactivityTimer() {
     if (offscreenInactivityTimer) {
         clearTimeout(offscreenInactivityTimer);
+        offscreenInactivityTimer = null;
     }
-
+    if (offscreenPendingCount > 0) return;
     offscreenInactivityTimer = setTimeout(() => {
+        if (offscreenPendingCount > 0) return; // last-ditch safety
         console.log('Offscreen document inactive for', OFFSCREEN_INACTIVITY_TIMEOUT / 1000, 'seconds - closing to save memory');
         closeOffscreenDocument();
     }, OFFSCREEN_INACTIVITY_TIMEOUT);
@@ -384,20 +694,22 @@ async function setupOffscreenDocument(path) {
 }
 
 async function sendToOffscreen(message) {
+    // Track in-flight ops so resetOffscreenInactivityTimer won't schedule a
+    // close while we're still waiting on this call. Without this a long
+    // retrieve / deploy that exceeds OFFSCREEN_INACTIVITY_TIMEOUT gets its
+    // own message listener torn down mid-response.
+    offscreenPendingCount++;
     try {
         await setupOffscreenDocument('offscreen.html');
-
-        // Reset inactivity timer on each API call
         resetOffscreenInactivityTimer();
 
-        // Only wait for JSforce on first load
         if (!offscreenReady) {
             // Wait for offscreen document to fully load and JSforce to initialize
             await new Promise(resolve => setTimeout(resolve, 500));
             offscreenReady = true;
         }
 
-        return new Promise((resolve, reject) => {
+        return await new Promise((resolve, reject) => {
             chrome.runtime.sendMessage(message, (response) => {
                 if (chrome.runtime.lastError) {
                     console.error('sendMessage error:', chrome.runtime.lastError.message);
@@ -411,6 +723,12 @@ async function sendToOffscreen(message) {
     } catch (err) {
         console.error('sendToOffscreen failed:', err);
         throw err;
+    } finally {
+        offscreenPendingCount = Math.max(0, offscreenPendingCount - 1);
+        // Re-arm the timer now that this op is done; if another op is still
+        // pending, resetOffscreenInactivityTimer bails out and the
+        // already-running op's completion will re-arm later.
+        resetOffscreenInactivityTimer();
     }
 }
 
@@ -534,6 +852,81 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    // Saved-orgs registry: list / pick / delete / get-last-for-change-set.
+    if (request.type == "cshListSavedOrgs") {
+        (async function () {
+            try {
+                var orgs = await cshListSavedOrgs();
+                var lastForCs = request.changeSetId
+                    ? await cshGetLastOrgForChangeSet(request.changeSetId)
+                    : null;
+                // Omit secrets from the list response — the UI only needs
+                // identity-ish fields to render the dropdown.
+                var safe = orgs.map(function (o) {
+                    return {
+                        orgId: o.orgId,
+                        host: o.host,
+                        username: o.username,
+                        displayName: o.displayName || '',
+                        envLabel: o.envLabel || '',
+                        instanceUrl: o.instanceUrl,
+                        lastUsedAt: o.lastUsedAt || 0,
+                        hasRefreshToken: !!o.refreshToken
+                    };
+                });
+                sendResponse({ ok: true, orgs: safe, lastOrgIdForChangeSet: lastForCs });
+            } catch (err) {
+                sendResponse({ ok: false, error: err.message });
+            }
+        })();
+        return true;
+    }
+
+    if (request.type == "cshDeleteSavedOrg") {
+        (async function () {
+            try {
+                var removed = await cshDeleteSavedOrg(request.orgId);
+                sendResponse({ ok: true, removed: removed });
+            } catch (err) {
+                sendResponse({ ok: false, error: err.message });
+            }
+        })();
+        return true;
+    }
+
+    if (request.type == "cshSetLastOrgForChangeSet") {
+        (async function () {
+            try {
+                await cshSetLastOrgForChangeSet(request.changeSetId, request.orgId);
+                sendResponse({ ok: true });
+            } catch (err) {
+                sendResponse({ ok: false, error: err.message });
+            }
+        })();
+        return true;
+    }
+
+    // Page-side deploy poller asks for a fresh token when its current one 401s.
+    // We refresh via the saved refresh token (if stale) and return the new
+    // {accessToken, instanceUrl}. If the refresh token itself is revoked,
+    // needsReauth=true tells the page to surface the re-login flow.
+    if (request.type == "cshGetDeployToken") {
+        (async function () {
+            try {
+                var fresh = await cshGetFreshDeployToken(request.orgId);
+                sendResponse({ ok: true, accessToken: fresh.accessToken, instanceUrl: fresh.instanceUrl });
+            } catch (err) {
+                console.error('cshGetDeployToken failed:', err);
+                sendResponse({
+                    ok: false,
+                    needsReauth: /invalid_grant|expired access\/refresh token|revoked|inactive/i.test(err.message || ''),
+                    error: err.message || String(err)
+                });
+            }
+        })();
+        return true;
+    }
+
     if (request.type == "cshCartSubmit") {
         // Cart worker batch submission: POST to the native Add-Components
         // endpoint using the scraped form shape, with our chosen ids replacing
@@ -622,7 +1015,38 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 
     if (request.oauth == "connectToDeploy") {
-        connectToDeploy(sendResponse, request.environment, request.customHost);
+        // Legacy callers pass just { environment, customHost }. New callers
+        // pass { orgId } to reuse a saved org, or { environment, customHost,
+        // changeSetId } to add a new one and remember it for that change set.
+        (async function () {
+            try {
+                var res = await cshConnectDeployOrg({
+                    orgId: request.orgId || null,
+                    environment: request.environment || 'sandbox',
+                    customHost: request.customHost || null,
+                    changeSetId: request.changeSetId || null,
+                    forceRefresh: !!request.forceRefresh
+                });
+                sendResponse({
+                    oauth: 'response',
+                    ok: true,
+                    orgId: res.orgId,
+                    username: res.username,
+                    instanceUrl: res.instanceUrl,
+                    host: res.host,
+                    envLabel: res.envLabel,
+                    freshlyLoggedIn: !!res.freshlyLoggedIn
+                });
+            } catch (err) {
+                console.error('connectToDeploy failed:', err);
+                sendResponse({
+                    oauth: 'response',
+                    ok: false,
+                    needsReauth: err && err.code === 'needs-reauth',
+                    error: err && err.message ? err.message : String(err)
+                });
+            }
+        })();
         return true;
     }
 
@@ -772,10 +1196,6 @@ async function setLocalConn(sendResponse, authValue, serverUrl, authMode, instan
     }
 }
 
-function connectToDeploy(sendResponse, environment, customHost) {
-    connectToOrg(sendResponse, environment, 'deploy', customHost);
-}
-
 function connectToLocalOauth(sendResponse) {
     connectToOrg(sendResponse, 'sandbox', 'local');
 }
@@ -871,7 +1291,6 @@ async function deploy(port, opts, changename, sessionId, serverUrl) {
 }
 
 async function deployToSF(zipData, port, opts) {
-    // Set up polling for deploy status
     const deployResponse = await sendToOffscreen({
         action: 'deploy',
         zipData: zipData,
@@ -880,15 +1299,51 @@ async function deployToSF(zipData, port, opts) {
 
     if (deployResponse.error) {
         port.postMessage({result: null, response: null, err: deployResponse.error});
-    } else {
-        // Deploy initiated, start polling for status
-        await pollDeployStatus(port, deployResponse.result.id);
+        return;
+    }
+    await cshHandoffDeployToPage(port, deployResponse.result.id);
+}
+
+// Hand the deploy over to the page so it can poll Salesforce's Metadata REST
+// API directly. The SW → offscreen → jsforce polling loop was unreliable
+// past the MV3 service-worker suspension window and the offscreen doc's
+// 5-minute inactivity timer; the page is the stablest context in the system
+// and setInterval works there without any keep-alive gymnastics.
+async function cshHandoffDeployToPage(port, deployId) {
+    try {
+        var orgId = cshActiveDeployOrgId;
+        if (!orgId) {
+            port.postMessage({result: null, response: null, err: 'No active deploy org — please sign in again.'});
+            return;
+        }
+        var fresh = await cshGetFreshDeployToken(orgId);
+        port.postMessage({
+            handoff: {
+                deployId: deployId,
+                orgId: orgId,
+                instanceUrl: fresh.instanceUrl,
+                accessToken: fresh.accessToken,
+                apiVersion: CSH_APIVERSION
+            }
+        });
+    } catch (err) {
+        console.error('cshHandoffDeployToPage failed:', err);
+        port.postMessage({result: null, response: null, err: err.message || String(err)});
     }
 }
 
 async function pollDeployStatus(port, deployId) {
+    // setInterval in an MV3 service worker dies when the worker suspends —
+    // a common outcome on long-running deploys, which leaves the client UI
+    // stuck at "starting deploy...". An awaited while-loop keeps the deploy()
+    // caller's Promise pending, which combines with keep-alive and the open
+    // port to hold the SW through the whole poll cycle.
+    console.log('[CSH deploy] pollDeployStatus started for id=' + deployId);
     const startTime = Date.now();
-    const pollInterval = setInterval(async () => {
+    let tick = 0;
+    while (true) {
+        await new Promise(function (r) { setTimeout(r, POLLINTERVAL); });
+        tick++;
         try {
             const statusResponse = await sendToOffscreen({
                 action: 'checkDeployStatus',
@@ -896,10 +1351,14 @@ async function pollDeployStatus(port, deployId) {
             });
 
             if (statusResponse.error) {
-                clearInterval(pollInterval);
+                console.log('[CSH deploy] poll tick=' + tick + ' error:', statusResponse.error);
                 port.postMessage({result: null, response: null, err: statusResponse.error});
                 return;
             }
+
+            console.log('[CSH deploy] poll tick=' + tick +
+                ' status=' + statusResponse.result.status +
+                ' done=' + statusResponse.result.done);
 
             port.postMessage({
                 result: {id: deployId, state: statusResponse.result.status},
@@ -907,22 +1366,22 @@ async function pollDeployStatus(port, deployId) {
                 err: null
             });
 
-            // Check if deploy is complete
             if (statusResponse.result.done) {
-                clearInterval(pollInterval);
                 port.postMessage({response: null, err: null, result: statusResponse.result});
+                return;
             }
 
-            // Timeout check
             if (Date.now() - startTime > POLLTIMEOUT) {
-                clearInterval(pollInterval);
                 port.postMessage({result: null, response: null, err: 'Deploy timeout'});
+                return;
             }
         } catch (err) {
-            clearInterval(pollInterval);
-            port.postMessage({result: null, response: null, err: err.toString()});
+            console.log('[CSH deploy] poll tick=' + tick + ' threw:', err);
+            try { port.postMessage({result: null, response: null, err: err.toString()}); }
+            catch (_) { /* port disconnected — nothing to do */ }
+            return;
         }
-    }, POLLINTERVAL);
+    }
 }
 
 async function quickDeploy(port, currentId) {
@@ -935,8 +1394,7 @@ async function quickDeploy(port, currentId) {
         if (response.error) {
             port.postMessage({result: null, response: null, err: response.error});
         } else {
-            // Quick deploy initiated, start polling
-            await pollDeployStatus(port, response.result.id);
+            await cshHandoffDeployToPage(port, response.result.id);
         }
     } catch (err) {
         console.error(err);
@@ -945,7 +1403,11 @@ async function quickDeploy(port, currentId) {
 }
 
 function compareContents(type, item) {
-    chrome.windows.create({'url': "compare.html?item=" + item, 'type': "popup", "focused": false},
+    // Encode the item so names containing &, #, space, ? or / (folder
+    // paths like "FolderA/MyReport") don't break the query string. The
+    // popup side decodes with decodeURIComponent.
+    var url = "compare.html?item=" + encodeURIComponent(item);
+    chrome.windows.create({'url': url, 'type': "popup", "focused": false},
         async function (newWin) {
             await getContents(type, item, 'local', "lhs");
             await getContents(type, item, 'deploy', "rhs");

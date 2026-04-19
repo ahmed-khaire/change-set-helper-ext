@@ -17,6 +17,16 @@
     color: #2b2826;
 }
 
+/* Orphaned content script — extension reloaded while this tab was open. */
+#csh-cart-panel.csh-cart-ext-dead {
+    border-color: #a55b00;
+    box-shadow: 0 6px 18px rgba(165, 91, 0, 0.28);
+}
+#csh-cart-panel.csh-cart-ext-dead .csh-cart-header {
+    background: #a55b00;
+    cursor: default;
+}
+
 #csh-cart-panel.csh-cart-collapsed .csh-cart-search-row,
 #csh-cart-panel.csh-cart-collapsed .csh-cart-body,
 #csh-cart-panel.csh-cart-collapsed .csh-cart-section,
