@@ -85,16 +85,49 @@ var entityTypeMap = {
 
 // Per-picker post-filter applied to both local getMetaData results and the
 // compare-org result set. Used when the resolved Metadata API type is broader
-// than what the Salesforce change-set picker actually lists — e.g. the
-// "Custom Metadata Type" picker maps to CustomObject but only __mdt entries
-// are in scope. Keyed on selectedEntityType (picker value), returns a filter
-// function; callers default to pass-through when no entry exists.
+// than what the Salesforce change-set picker actually lists. Without these
+// filters the compare org returns every record of the broad type, the local
+// table only has rows for the narrow subset, and every extra record lands in
+// "[target only]" — misleading the user into thinking their target is
+// ahead of source when it just has unrelated records.
+//
+// Keyed on selectedEntityType (picker value). Each filter takes a record,
+// returns true to keep. Callers default to pass-through when no entry exists.
+//
+// Why suffix tests and not __c-only inclusion: managed-package objects keep
+// their __c suffix (e.g. "pkg__Thing__c"), so a __c inclusion list handles
+// them correctly, but future custom-object-like types Salesforce may introduce
+// without a __c suffix would be dropped. Exclude-list keeps "Custom Object"
+// maximally compatible, only dropping the subtypes Salesforce currently has
+// distinct pickers for.
 var CSH_POST_FILTERS = {
+    // "Custom Metadata Type" picker → CustomObject, narrowed to __mdt.
     'Custom Metadata Type': function (rec) {
         return rec && typeof rec.fullName === 'string' && /__mdt$/.test(rec.fullName);
     },
     'Custom Metadata Types': function (rec) {
         return rec && typeof rec.fullName === 'string' && /__mdt$/.test(rec.fullName);
+    },
+    // "Custom Object" picker → CustomObject, excluding subtypes Salesforce
+    // surfaces in their own pickers:
+    //   __mdt  Custom Metadata Type
+    //   __b    Big Object
+    //   __x    External Object
+    //   __e    Platform Event
+    //   __kav  Knowledge article type
+    //   __xo   Salesforce-to-Salesforce external object
+    //   __chn  Change Event
+    //   __share / __history / __feed  auto-generated system objects
+    'CustomEntityDefinition': function (rec) {
+        if (!rec || typeof rec.fullName !== 'string') return false;
+        return !/__(mdt|b|x|e|kav|xo|chn|share|history|feed)$/i.test(rec.fullName);
+    },
+    // Covers the case where a Salesforce build emits the API name directly as
+    // the picker value (`CustomObject`) rather than the legacy
+    // `CustomEntityDefinition`. Same filter so behavior is identical either way.
+    'CustomObject': function (rec) {
+        if (!rec || typeof rec.fullName !== 'string') return false;
+        return !/__(mdt|b|x|e|kav|xo|chn|share|history|feed)$/i.test(rec.fullName);
     }
 };
 
@@ -319,10 +352,6 @@ function setupTable() {
 			<a href="#" id="compareBackToSavedOrgsLink" style="display:none;margin-left:8px;font-size:12px;">Back to saved orgs</a>
 		</span>
 	<span id="loggedInUsername"></span>  <span id="logout">(<a id="logoutLink" href="#">Logout</a>)</span>
-	<label id="csh-include-managed-label" style="display:none;margin-left:12px;font-size:12px;cursor:pointer;" title="When off, components from managed packages (with a namespace) are hidden from the compare list.">
-		<input type="checkbox" id="csh-include-managed" style="vertical-align:middle;margin-right:4px;" />
-		Include managed packages
-	</label>
 	<button type="button" id="csh-compare-refresh" style="display:none;margin-left:8px;padding:2px 10px;border:1px solid #c9c9c9;background:#fff;border-radius:3px;cursor:pointer;font-size:12px;" title="Re-run the compare against the same org. Use this after adding components to the change set or after edits in the target org.">↻ Refresh compare</button>
 `);
 
@@ -333,9 +362,6 @@ function setupTable() {
     // just re-reads storage and re-renders the dropdown.
     if (typeof cshCompareRefreshSavedOrgsUI === 'function') {
         cshCompareRefreshSavedOrgsUI().catch(function () {});
-    }
-    if (typeof cshHydrateManagedToggle === 'function') {
-        cshHydrateManagedToggle();
     }
 }
 
@@ -542,6 +568,48 @@ function processListResults(response) {
             console.log('Setting up table with dynamic columns...');
             setupTable();
         }
+    } else if (!dynamicColumns && numCallsInProgress <= 1) {
+        // listMetadata returned zero rows for this type. Two distinct causes,
+        // and we can't be 100% sure which without a second probe:
+        //   (a) the org genuinely has no components of this type
+        //   (b) Salesforce's Metadata API doesn't surface this type even
+        //       though the change-set picker lists it (SharingSet is the
+        //       canonical case — listMetadata returns [] but the picker may
+        //       show items in orgs that use Experience Cloud sharing)
+        //
+        // Heuristic: the Salesforce page already rendered its rows by the time
+        // this callback fires (listTableLength was read at script-load). If the
+        // page has rows but our metadata call returned none, we're in case (b);
+        // if both are empty, we're in case (a). Don't claim "unsupported" when
+        // we can't prove it — the user complained (rightly) that the old
+        // message looked wrong on empty-org types that were clearly supported.
+        //
+        // Either way we need setupTable() to run so DataTables has a <thead>,
+        // padded rows, and a matching columnConfig — otherwise createDataTable
+        // initialises against a malformed table and DataTables gets stuck in
+        // a perpetual "Processing…" state with indeterminate scroll behaviour.
+        // The numCallsInProgress<=1 gate keeps this a one-shot on the last
+        // callback so folder-scoped multi-batch loads still take the dynamic-
+        // column path when any batch returns data.
+        var apiGap = listTableLength > 0;
+        console.log('processListResults: no metadata returned for "' + selectedEntityType +
+                    '" (' + (apiGap ? 'rows present — probable Metadata API gap' :
+                                      'empty org — no components of this type') +
+                    '). Using setupTable fallback columns so the table still renders.');
+        setupTable();
+        if (apiGap) {
+            // Rows exist on the page but listMetadata came back empty — warn
+            // the user that the Last-Modified columns will be blank for this
+            // type even though the components themselves are fine to select.
+            window.cshToast && window.cshToast.show(
+                'Last-Modified metadata is unavailable for "' + selectedEntityType +
+                '". The listed components are still valid — you can select and add them normally.',
+                { type: 'info', duration: 8000 }
+            );
+        }
+        // Empty-org case deliberately shows no toast: DataTables already
+        // renders "No data available in table" which is self-explanatory, and
+        // a popup on top of that would be redundant noise.
     }
 
     // Cache metadata results for reuse during pagination
@@ -1375,7 +1443,13 @@ var TOOLING_QUERYABLE_TYPES = {
     'LightningComponentBundle': { metadataType: 'LightningComponentBundle', nameField: 'DeveloperName' },
     'StaticResource':      { metadataType: 'StaticResource',      nameField: 'Name' },
     'CustomApplication':   { metadataType: 'CustomApplication',   nameField: 'DeveloperName' },
-    'CustomTab':           { metadataType: 'CustomTab',           nameField: 'DeveloperName' },
+    // CustomTab intentionally omitted from the fast path. Tooling API's
+    // CustomTab SObject lists only VF / Web / URL / Lightning tabs — it does
+    // NOT include custom-object tabs (those are derived from the owning
+    // CustomObject). Salesforce's change-set picker shows all tab kinds,
+    // so routing through Tooling here left custom-object-tab rows with empty
+    // Created/Modified columns. Metadata API's listMetadata({type:'CustomTab'})
+    // returns every tab — slower, but complete. See getMetaData for fallback.
     'CustomPermission':    { metadataType: 'CustomPermission',    nameField: 'DeveloperName' },
     'CustomLabel':         { metadataType: 'CustomLabel',         nameField: 'Name' },
     'NamedCredential':     { metadataType: 'NamedCredential',     nameField: 'DeveloperName' },
@@ -1386,7 +1460,20 @@ var TOOLING_QUERYABLE_TYPES = {
     // Flow: FlowDefinition gives one row per flow (not one per version), which
     // matches the Metadata API Flow fullName semantics. Version-level diffing
     // would double-count every flow in the table.
+    //
+    // Both picker values are keyed because Salesforce's change-set picker emits
+    // 'FlowDefinition' in #entityType (see entityTypeMap above) while the fast
+    // path's outputType is 'Flow'. Dual-keying avoids skipping the fast path
+    // for the common picker path — keeping 'Flow' as a defensive alias in case
+    // a future Salesforce build emits the API name directly. listMetadata
+    // fallback must stay on {type:'FlowDefinition'} too: {type:'Flow'} has a
+    // known Salesforce bug where it misreports the active-version entry.
     'Flow': {
+        metadataType: 'FlowDefinition',
+        outputType: 'Flow',
+        nameField: 'DeveloperName'
+    },
+    'FlowDefinition': {
         metadataType: 'FlowDefinition',
         outputType: 'Flow',
         nameField: 'DeveloperName'
@@ -1400,11 +1487,17 @@ var TOOLING_QUERYABLE_TYPES = {
     //     uses DeveloperName / ValidationName as-is (no __c suffix in API)
     // See cshBuildCompositeChild helper below — keeps the prefix/suffix logic
     // in one place so every builder stays consistent.
+    // Composite types below deliberately OMIT `orderBy` so cshBuildToolingSoql
+    // falls back to a local-field sort (nameField). ORDER BY on a relationship
+    // field (`EntityDefinition.QualifiedApiName`) GACKs server-side on some
+    // orgs — Salesforce's Tooling query planner chokes materializing the sort
+    // across many EntityDefinitions. DataTables re-sorts client-side anyway,
+    // so the server-side order only affects tie-breaking during queryMore
+    // pagination, which is harmless.
     'CustomField': {
         metadataType: 'CustomField',
         nameField: 'DeveloperName',
         extraSelect: 'EntityDefinition.QualifiedApiName',
-        orderBy: 'EntityDefinition.QualifiedApiName, DeveloperName',
         fullNameBuilder: function (rec) {
             var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
             if (!parent || !rec.DeveloperName) return null;
@@ -1418,7 +1511,6 @@ var TOOLING_QUERYABLE_TYPES = {
         metadataType: 'ValidationRule',
         nameField: 'ValidationName',
         extraSelect: 'EntityDefinition.QualifiedApiName',
-        orderBy: 'EntityDefinition.QualifiedApiName, ValidationName',
         fullNameBuilder: function (rec) {
             var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
             if (!parent || !rec.ValidationName) return null;
@@ -1439,7 +1531,6 @@ var TOOLING_QUERYABLE_TYPES = {
         metadataType: 'FieldSet',
         nameField: 'DeveloperName',
         extraSelect: 'EntityDefinition.QualifiedApiName',
-        orderBy: 'EntityDefinition.QualifiedApiName, DeveloperName',
         fullNameBuilder: function (rec) {
             var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
             if (!parent || !rec.DeveloperName) return null;
@@ -1450,7 +1541,6 @@ var TOOLING_QUERYABLE_TYPES = {
         metadataType: 'CompactLayout',
         nameField: 'DeveloperName',
         extraSelect: 'EntityDefinition.QualifiedApiName',
-        orderBy: 'EntityDefinition.QualifiedApiName, DeveloperName',
         fullNameBuilder: function (rec) {
             var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
             if (!parent || !rec.DeveloperName) return null;
@@ -1499,16 +1589,18 @@ var TOOLING_QUERYABLE_TYPES = {
             return rec.SobjectType ? (rec.SobjectType + '.' + rec.DeveloperName) : rec.DeveloperName;
         }
     },
-    'ListView': {
-        metadataType: 'ListView',
-        nameField: 'DeveloperName',
-        extraSelect: 'SobjectType',
-        orderBy: 'SobjectType, DeveloperName',
-        fullNameBuilder: function (rec) {
-            if (!rec.SobjectType || !rec.DeveloperName) return null;
-            return rec.SobjectType + '.' + rec.DeveloperName;
-        }
-    },
+    // ListView intentionally omitted from the fast path. Tooling's ListView
+    // SObject returns ~40% more rows than Metadata API listMetadata({type:
+    // 'ListView'}) — the extras are list views on system / platform objects
+    // (ForecastingItemPivot, FlowRecord, FlowInterview, AppMenuItem, Dashboard,
+    // CollaborationGroup, …) plus rows with SobjectType=null (Sharing-report
+    // style views). Change sets can't deploy any of these, and listMetadata
+    // mirrors the change-set picker exactly, so letting listMetadata handle
+    // ListView keeps the diff table honest. Measured on a real org: Tooling
+    // 528 unmanaged rows vs listMetadata 278 (40% noise). listMetadata's
+    // 2000-per-call cap is not a practical concern for ListView — orgs with
+    // >2000 unmanaged list views are vanishingly rare. See getMetaData /
+    // cshCompareListFlat fallback.
 
     // ---- Tier 1: Data API SObjects (not Tooling) -------------------------
     // Same one-SOQL + queryMore pagination, hits conn.query() instead of
@@ -1523,7 +1615,13 @@ var TOOLING_QUERYABLE_TYPES = {
     'PermissionSet': {
         metadataType: 'PermissionSet',
         api: 'data',
-        nameField: 'Name'
+        nameField: 'Name',
+        // Since Spring '23 every Profile auto-generates a hidden PermissionSet
+        // with IsOwnedByProfile=true as part of the "Enhanced Profile" rollout.
+        // Salesforce's change-set picker hides these, so without the filter
+        // every profile-backed row shows up as "[target only]" in the compare
+        // view, making the diff look wildly out-of-sync when it isn't.
+        whereClause: 'IsOwnedByProfile = false'
     },
     'PermissionSetGroup': {
         metadataType: 'PermissionSetGroup',
@@ -1577,14 +1675,13 @@ function cshBuildToolingSoql(cfg) {
     if (cfg.extraSelect) fields.push(cfg.extraSelect);
     var soql = 'SELECT ' + fields.join(', ') + ' FROM ' + cfg.metadataType;
 
-    // Compose WHERE: type-specific clause (e.g. Group.Type = 'Queue') AND
-    // the managed-package filter. Managed items can't be deployed via a
-    // change set anyway (Salesforce blocks it for non-package owners), so
-    // showing them as ghost rows just spams the table with thousands of
-    // un-actionable components. Toggle clears the filter on demand.
+    // Managed-package components can't be deployed via a change set anyway
+    // (Salesforce blocks redeploy for non-package-owner orgs), so they're
+    // always excluded — server-side at SOQL level where possible, client-side
+    // via cshFilterOutManaged for listMetadata fallbacks.
     var clauses = [];
     if (cfg.whereClause) clauses.push(cfg.whereClause);
-    if (cfg.hasNamespace !== false && !cshShouldIncludeManaged()) {
+    if (cfg.hasNamespace !== false) {
         clauses.push('NamespacePrefix = null');
     }
     if (clauses.length) soql += ' WHERE ' + clauses.join(' AND ');
@@ -1593,20 +1690,12 @@ function cshBuildToolingSoql(cfg) {
     return soql;
 }
 
-// Reads the user's "Include managed packages" toggle off the DOM checkbox.
-// Absence = default (exclude managed). Preference is persisted to
-// chrome.storage.local and re-hydrated on page load by cshHydrateManagedToggle.
-function cshShouldIncludeManaged() {
-    var el = document.getElementById('csh-include-managed');
-    return !!(el && el.checked);
-}
-
 // Drop managed-package records from a result set. Used after listMetadata
 // calls (folder-scoped types, non-Tooling-queryable fallbacks) because
 // listMetadata offers no server-side way to filter by namespace — we have
 // to fetch everything and prune in JS. The Tooling fast path applies its
 // own SOQL-level `NamespacePrefix = null` clause and doesn't come through
-// here. No-op when the user has the toggle enabled.
+// here.
 //
 // Signals checked:
 //   - namespacePrefix truthy → came from a namespaced package
@@ -1616,7 +1705,6 @@ function cshShouldIncludeManaged() {
 // edge cases like base-package-org records that have a namespace but are
 // "unmanaged" because the package is defined in this org.
 function cshFilterOutManaged(records) {
-    if (cshShouldIncludeManaged()) return records || [];
     if (!Array.isArray(records)) return records;
     return records.filter(function (r) {
         if (!r) return false;
@@ -1626,32 +1714,9 @@ function cshFilterOutManaged(records) {
     });
 }
 
-// Stashed so the toggle-change handler can re-run the last compare listing
+// Stashed so the compare refresh button can re-run the last compare listing
 // against the same environment without prompting the user to reconnect.
 var cshLastCompareEnv = null;
-
-// Pull the persisted preference from chrome.storage.local, mirror it into
-// the checkbox, then bind a change handler that re-persists and — if a
-// compare listing is already on screen — re-runs it with the new filter.
-function cshHydrateManagedToggle() {
-    var $cb = $('#csh-include-managed');
-    if (!$cb.length) return;
-    try {
-        chrome.storage.local.get(['cshIncludeManaged'], function (res) {
-            $cb.prop('checked', !!(res && res.cshIncludeManaged));
-        });
-    } catch (_) { /* storage unavailable — use DOM default (unchecked) */ }
-    $cb.off('change.cshManaged').on('change.cshManaged', function () {
-        var checked = $(this).is(':checked');
-        try { chrome.storage.local.set({ cshIncludeManaged: checked }); } catch (_) {}
-        // Re-run the last listing only if one is active. cshLastCompareEnv is
-        // set by cshCompareStartMetadataList; if it's still null we haven't
-        // connected yet and there's nothing to refresh.
-        if (cshLastCompareEnv) {
-            cshCompareStartMetadataList(cshLastCompareEnv);
-        }
-    });
-}
 
 function cshNormalizeToolingRecord(rec, cfg, ctx) {
     var ns = rec.NamespacePrefix || '';
@@ -1773,10 +1838,17 @@ function getMetaData(processResultsFunction) {
     // RecordType, Profile, PermissionSet, Queue, Role, …). On Tooling error
     // or missing SObject the caller falls through to metadata.list so
     // coverage never regresses.
-    if (TOOLING_QUERYABLE_TYPES[selectedEntityType]) {
-        var cfg = TOOLING_QUERYABLE_TYPES[selectedEntityType];
+    // TOOLING_QUERYABLE_TYPES is keyed on the Metadata API name (CustomLabel,
+    // CustomField, …). selectedEntityType is the picker value, which for
+    // entityTypeMap-mapped types is the legacy UI name (ExternalString,
+    // CustomFieldDefinition, …) — looking up only by selectedEntityType
+    // silently skipped the fast path and routed those types through the
+    // slow listMetadata fallback (bypassing the SOQL NamespacePrefix=null
+    // filter, returning tens of thousands of managed-package rows).
+    var fastCfg = TOOLING_QUERYABLE_TYPES[selectedEntityType] || TOOLING_QUERYABLE_TYPES[resolvedMetadataType];
+    if (fastCfg) {
         numCallsInProgress++;
-        cshRunQueryFastPath('local', cfg, function (err, normalized) {
+        cshRunQueryFastPath('local', fastCfg, function (err, normalized) {
             if (err) {
                 console.warn('Fast path failed, falling back to metadata.list:', err);
                 chrome.runtime.sendMessage({
@@ -1943,12 +2015,9 @@ var CSH_LIST_BATCH_SIZE = 3;
 function cshCompareStartMetadataList(env) {
     $("#compareSavedOrgsGroup, #compareNewOrgGroup, #compareEnv, #compareMyDomain").hide();
     $("#logout").show();
-    // Stash env so the managed-toggle change handler can rerun the listing
-    // against the same org without prompting the user to re-pick. Also reveal
-    // the toggle now — hidden before connect so we don't imply the filter
-    // applies to the local-org list above the fold.
+    // Stash env so the compare refresh button can rerun the listing against
+    // the same org without prompting the user to re-pick.
     cshLastCompareEnv = env;
-    $('#csh-include-managed-label').show();
     $('#csh-compare-refresh').show();
     $("#editPage").addClass("lowOpacity");
 
@@ -1969,7 +2038,11 @@ function cshCompareListFlat(env) {
     // ValidationRule, RecordType, Flow, QuickAction, ListView, …) and Data-
     // API SObjects (Profile, PermissionSet, Queue, Role, …). Errors fall
     // back to listMetadata so coverage never regresses.
-    var cfg = TOOLING_QUERYABLE_TYPES[selectedEntityType];
+    // Same dual lookup as getMetaData — picker value first, then resolved API
+    // name. Without this, picker values like ExternalString, CustomFieldDefinition,
+    // ValidationFormula skipped the fast path and the compare flow pulled every
+    // managed-package row from listMetadata before filtering client-side.
+    var cfg = TOOLING_QUERYABLE_TYPES[selectedEntityType] || TOOLING_QUERYABLE_TYPES[resolvedMetadataType];
     if (cfg) {
         cshRunQueryFastPath('deploy', cfg, function (err, normalized) {
             if (err) {
@@ -1999,18 +2072,20 @@ function cshCompareListFlatViaListMetadata(env) {
             if (results.error) {
                 console.log('Problem listing compare metadata:', results.error);
             }
-            if (Array.isArray(results) && results.length >= CSH_LIST_META_LIMIT) {
-                // Non-Tooling-queryable, non-folder types still have no way
-                // past the 2000 cap — warn the user rather than silently
-                // hiding rows. Most of the high-count XML families now route
-                // through the Tooling fast path above and never land here.
+            var filtered = cshFilterOutManaged(cshApplyPostFilter(results) || results);
+            // Cap warning fires on the POST-filter count — what the user
+            // actually sees in the table. Warning on the raw listMetadata
+            // count was misleading: a CustomLabel org with 19k managed labels
+            // triggered the warning even though only ~50 unmanaged rows
+            // survived the filter and nothing was actually truncated.
+            if (Array.isArray(filtered) && filtered.length >= CSH_LIST_META_LIMIT) {
                 window.cshToast && window.cshToast.show(
-                    resolvedMetadataType + ': target org returned ' + results.length +
-                    ' items (listMetadata cap). If the type has more, extras will not appear in the compare columns.',
+                    resolvedMetadataType + ': target org returned ' + filtered.length +
+                    ' items after filtering (listMetadata cap). If the type has more, extras will not appear in the compare columns.',
                     { type: 'warning', duration: 7000 }
                 );
             }
-            processCompareResults(cshFilterOutManaged(cshApplyPostFilter(results) || results), env);
+            processCompareResults(filtered, env);
         },
         false);
 }
@@ -2175,6 +2250,7 @@ function cshCompareStartNewOrgLogin(env, customHost) {
 }
 
 function oauthLogin(env) {
+    if (!cshIsExtContextValid()) { cshWarnStaleContext(); return; }
     var env = $("#compareEnv :selected").val();
     var customHost = null;
     if (env === 'mydomain') {
@@ -2191,6 +2267,27 @@ function oauthLogin(env) {
     cshCompareStartNewOrgLogin(env, customHost);
 }
 
+
+// Detects whether the content script is still bound to a live extension
+// context. When the user reloads the extension from chrome://extensions
+// without refreshing this tab, the injected script keeps running but every
+// chrome.runtime.* call throws "Extension context invalidated." Surface a
+// friendly toast instead of a raw stack trace so users know to hit F5.
+function cshIsExtContextValid() {
+    try { return !!(chrome && chrome.runtime && chrome.runtime.id); }
+    catch (_) { return false; }
+}
+
+function cshWarnStaleContext() {
+    var msg = 'Extension was updated — please refresh this tab to reconnect.';
+    if (window.cshToast && window.cshToast.show) {
+        window.cshToast.show(msg, { type: 'warning', duration: 8000 });
+    } else {
+        // Toast hasn't mounted yet (very early in page life) — fall back to
+        // alert so the user still sees something actionable.
+        try { alert(msg); } catch (_) {}
+    }
+}
 
 // Trigger a compare popup for a single item. The diff ("Full name (Click
 // for diff)") column and the new compare icon both funnel through this.
@@ -2211,6 +2308,7 @@ function cshTriggerCompare(fullName) {
         );
         return;
     }
+    if (!cshIsExtContextValid()) { cshWarnStaleContext(); return; }
     // Label the popup with something meaningful on each side. Local = the
     // org hosting the change set page; target = whatever username the deploy
     // connect flow wrote into #loggedInUsername (already visible above the
@@ -2218,13 +2316,20 @@ function cshTriggerCompare(fullName) {
     // the popup doesn't render "undefined" in the header.
     var localLabel = window.location.host || 'This org';
     var targetLabel = ($.trim($('#loggedInUsername').text())) || 'Other org';
-    chrome.runtime.sendMessage({
-        'proxyFunction': "compareContents",
-        'entityType': resolvedMetadataType,
-        'itemName': fullName,
-        'localOrg': localLabel,
-        'targetOrg': targetLabel
-    }, function () { /* background opens the popup */ });
+    try {
+        chrome.runtime.sendMessage({
+            'proxyFunction': "compareContents",
+            'entityType': resolvedMetadataType,
+            'itemName': fullName,
+            'localOrg': localLabel,
+            'targetOrg': targetLabel
+        }, function () { /* background opens the popup */ });
+    } catch (e) {
+        // Context can flip between the check above and the actual send in a
+        // narrow race window. Catch here so the click doesn't surface a raw
+        // "Extension context invalidated" to the console.
+        cshWarnStaleContext();
+    }
 }
 
 function getContents() {
@@ -2255,10 +2360,8 @@ function deployLogout() {
 
     $("#loggedInUsername").html('');
     $("#logout").hide();
-    // Toggle is only meaningful while a compare listing is on screen. Hide it
-    // and drop the stashed env so a subsequent change can't re-trigger an
-    // orphaned listing against a logged-out connection.
-    $('#csh-include-managed-label').hide();
+    // Hide compare-only affordances and drop the stashed env so a subsequent
+    // action can't re-trigger an orphaned listing against a logged-out conn.
     $('#csh-compare-refresh').hide();
     cshLastCompareEnv = null;
     // Refresh the saved-orgs picker — if the user has one or more saved

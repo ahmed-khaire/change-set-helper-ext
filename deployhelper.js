@@ -577,7 +577,7 @@ function cshRenderDeployHelper() {
 
         <input value="Validate" class="btn" name="deployTest" id="deployTest" title="Run the selected action against the connected target org." type="button" />
 
-        <span id="loggedInUsername"></span> (<a id="logoutLink" href="#">Logout</a>)
+        <span id="loggedInUsername"></span> (<a id="logoutLink" href="#">Connect another Org</a>)
     </td>
 	</tr>
 	</tbody>
