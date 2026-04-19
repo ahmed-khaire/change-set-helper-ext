@@ -1119,6 +1119,48 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.proxyFunction == "queryToolingDeploy") {
+        sendToOffscreen({
+            action: 'queryTooling',
+            connType: 'deploy',
+            soql: request.soql
+        }).then(response => {
+            sendResponse({err: response.error || null, records: response.records});
+        }).catch(err => {
+            console.error('Error in queryToolingDeploy:', err);
+            sendResponse({err: err.message, records: null});
+        });
+        return true;
+    }
+
+    if (request.proxyFunction == "querySoqlLocal") {
+        sendToOffscreen({
+            action: 'querySoql',
+            connType: 'local',
+            soql: request.soql
+        }).then(response => {
+            sendResponse({err: response.error || null, records: response.records});
+        }).catch(err => {
+            console.error('Error in querySoqlLocal:', err);
+            sendResponse({err: err.message, records: null});
+        });
+        return true;
+    }
+
+    if (request.proxyFunction == "querySoqlDeploy") {
+        sendToOffscreen({
+            action: 'querySoql',
+            connType: 'deploy',
+            soql: request.soql
+        }).then(response => {
+            sendResponse({err: response.error || null, records: response.records});
+        }).catch(err => {
+            console.error('Error in querySoqlDeploy:', err);
+            sendResponse({err: err.message, records: null});
+        });
+        return true;
+    }
+
     if (request.proxyFunction == "describeLocalMetadata") {
         sendToOffscreen({
             action: 'describeMetadata',
@@ -1161,7 +1203,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 
     if (request.proxyFunction == "compareContents") {
-        compareContents(request.entityType, request.itemName);
+        compareContents(request.entityType, request.itemName, request.localOrg, request.targetOrg);
         return false;
     }
 
@@ -1402,11 +1444,14 @@ async function quickDeploy(port, currentId) {
     }
 }
 
-function compareContents(type, item) {
-    // Encode the item so names containing &, #, space, ? or / (folder
-    // paths like "FolderA/MyReport") don't break the query string. The
-    // popup side decodes with decodeURIComponent.
+function compareContents(type, item, localOrg, targetOrg) {
+    // Encode every piece — item names can contain &, #, space, ? or / (e.g.
+    // "FolderA/MyReport"); org labels are hostnames/usernames and usually
+    // safe but encoding them keeps the URL parser honest if a label ever
+    // includes a space or symbol. The popup decodes with decodeURIComponent.
     var url = "compare.html?item=" + encodeURIComponent(item);
+    if (localOrg) url += "&localOrg=" + encodeURIComponent(localOrg);
+    if (targetOrg) url += "&targetOrg=" + encodeURIComponent(targetOrg);
     chrome.windows.create({'url': url, 'type': "popup", "focused": false},
         async function (newWin) {
             await getContents(type, item, 'local', "lhs");

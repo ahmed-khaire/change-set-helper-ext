@@ -252,6 +252,11 @@ function setupTable() {
 			<a href="#" id="compareBackToSavedOrgsLink" style="display:none;margin-left:8px;font-size:12px;">Back to saved orgs</a>
 		</span>
 	<span id="loggedInUsername"></span>  <span id="logout">(<a id="logoutLink" href="#">Logout</a>)</span>
+	<label id="csh-include-managed-label" style="display:none;margin-left:12px;font-size:12px;cursor:pointer;" title="When off, components from managed packages (with a namespace) are hidden from the compare list.">
+		<input type="checkbox" id="csh-include-managed" style="vertical-align:middle;margin-right:4px;" />
+		Include managed packages
+	</label>
+	<button type="button" id="csh-compare-refresh" style="display:none;margin-left:8px;padding:2px 10px;border:1px solid #c9c9c9;background:#fff;border-radius:3px;cursor:pointer;font-size:12px;" title="Re-run the compare against the same org. Use this after adding components to the change set or after edits in the target org.">↻ Refresh compare</button>
 `);
 
     $('#editPage').append('<input type="hidden" name="rowsperpage" value="5000" /> ');
@@ -261,6 +266,9 @@ function setupTable() {
     // just re-reads storage and re-renders the dropdown.
     if (typeof cshCompareRefreshSavedOrgsUI === 'function') {
         cshCompareRefreshSavedOrgsUI().catch(function () {});
+    }
+    if (typeof cshHydrateManagedToggle === 'function') {
+        cshHydrateManagedToggle();
     }
 }
 
@@ -685,18 +693,32 @@ function processCompareResults(results, env) {
     // "ghost" rows in red so the user can see what they might be missing.
     var targetOnlyRecords = [];
 
+    // Pre-index fullName → rowIdx so the join is O(n+m) instead of O(n·m).
+    // The previous code ran two jQuery attribute-selector scans per result
+    // (`td[data-fullName = "..."]`), which for a 5000-row local table and a
+    // 5000-record compare payload (CustomLabel in an org with many managed
+    // packages is common) is 50M DOM lookups — enough to wedge the page for
+    // 30+ seconds. rows().every() is a single pass over the DataTables API.
+    var fullNameToRowIdx = {};
+    changeSetTable.rows().every(function () {
+        var node = this.node();
+        if (!node) return;
+        var cell = node.querySelector('td[data-fullName]');
+        if (!cell) return;
+        var key = cell.getAttribute('data-fullName');
+        if (key && !(key in fullNameToRowIdx)) fullNameToRowIdx[key] = this.index();
+    });
+
     for (i = 0; i < results.length; i++) {
         var fullName = results[i].fullName;
-        var matchingInput = $('td[data-fullName = "' + fullName + '"]');
+        var rowIdx = fullNameToRowIdx[fullName];
 
-        if (matchingInput.length === 0) {
+        if (rowIdx === undefined) {
             targetOnlyRecords.push(results[i]);
             continue;
         }
-        if (matchingInput.length > 0) {
-            var rowIdx = changeSetTable.cell('td[data-fullName = "' + fullName + '"]').index().row;
 
-            dateMod = new Date(results[i].lastModifiedDate);
+        dateMod = new Date(results[i].lastModifiedDate);
 
             // Update compare columns with data from other org (use dynamic indices)
             changeSetTable.cell(rowIdx, compareColumnIndices.compareDateMod).data(convertDate(dateMod));
@@ -718,15 +740,23 @@ function processCompareResults(results, env) {
             // Only added once compare is live — before connect the icon would
             // just error out. The icon stops propagation so it doesn't toggle
             // the row selection under it.
+            //
+            // The click handler resolves fullName off the icon's own
+            // data-fullName attribute at click time, NOT from a closure over
+            // the for-loop variable. `var fullName` is function-scoped, so a
+            // closure captures the last iteration's value and every icon
+            // would trigger compare for the last row processed.
             var nameCellNode = changeSetTable.row(rowIdx).node();
             if (nameCellNode) {
                 var $nameCell = $(nameCellNode).find('td[data-fullName]').first();
                 if ($nameCell.length && !$nameCell.find('.csh-compare-icon').length) {
                     var $icon = $('<span class="csh-compare-icon" title="Compare with target org">⇄</span>');
+                    $icon.attr('data-fullName', fullName);
                     $icon.on('click', function (ev) {
                         ev.preventDefault();
                         ev.stopPropagation();
-                        cshTriggerCompare(fullName);
+                        var resolved = $(this).attr('data-fullName');
+                        cshTriggerCompare(resolved);
                     });
                     $nameCell.prepend($icon);
                 }
@@ -757,7 +787,6 @@ function processCompareResults(results, env) {
                     changeSetTable.cell(rowIdx, compareColumnIndices.lastModifiedDate).node().style.color = "green";
                 }
             }
-        }
     }
 
     // Phase 6: append ghost rows for target-only records.
@@ -1268,30 +1297,308 @@ function tableInitComplete() {
 // nameField is used when the Tooling sObject exposes DeveloperName instead
 // of Name (Aura / Lightning bundles). metadataType is echoed on the
 // normalized record so downstream consumers see the same shape as before.
+// Tooling SOQL is the only path that scales cleanly past listMetadata's 2000
+// hard cap — jsforce's tooling.query()+queryMore walks nextRecordsUrl until
+// the whole result set is in hand. For every type below, one SOQL gets the
+// entire org regardless of count. Types with composite Metadata-API fullNames
+// (CustomField → Parent.Child, RecordType → SObject.DeveloperName, etc.) use
+// `fullNameBuilder` so listMetadata-compatible member names come out the
+// other side and downstream retrieve() / processCompareResults see the same
+// shape they used to. Any type missing / restricted on a given org simply
+// errors and callers fall back to listMetadata.
 var TOOLING_QUERYABLE_TYPES = {
+    // ---- Single-field name (namespace prefix applied by normalizer) ------
     'ApexClass':      { metadataType: 'ApexClass',      nameField: 'Name' },
     'ApexTrigger':    { metadataType: 'ApexTrigger',    nameField: 'Name' },
     'ApexPage':       { metadataType: 'ApexPage',       nameField: 'Name' },
     'ApexComponent':  { metadataType: 'ApexComponent',  nameField: 'Name' },
+    'ApexTestSuite':  { metadataType: 'ApexTestSuite',  nameField: 'TestSuiteName' },
     'AuraDefinitionBundle':     { metadataType: 'AuraDefinitionBundle',     nameField: 'DeveloperName' },
-    'LightningComponentBundle': { metadataType: 'LightningComponentBundle', nameField: 'DeveloperName' }
+    'LightningComponentBundle': { metadataType: 'LightningComponentBundle', nameField: 'DeveloperName' },
+    'StaticResource':      { metadataType: 'StaticResource',      nameField: 'Name' },
+    'CustomApplication':   { metadataType: 'CustomApplication',   nameField: 'DeveloperName' },
+    'CustomTab':           { metadataType: 'CustomTab',           nameField: 'DeveloperName' },
+    'CustomPermission':    { metadataType: 'CustomPermission',    nameField: 'DeveloperName' },
+    'CustomLabel':         { metadataType: 'CustomLabel',         nameField: 'Name' },
+    'NamedCredential':     { metadataType: 'NamedCredential',     nameField: 'DeveloperName' },
+    'RemoteSiteSetting':   { metadataType: 'RemoteSiteSetting',   nameField: 'DeveloperName' },
+    'ExternalDataSource':  { metadataType: 'ExternalDataSource',  nameField: 'DeveloperName' },
+    'BrandingSet':         { metadataType: 'BrandingSet',         nameField: 'DeveloperName' },
+
+    // Flow: FlowDefinition gives one row per flow (not one per version), which
+    // matches the Metadata API Flow fullName semantics. Version-level diffing
+    // would double-count every flow in the table.
+    'Flow': {
+        metadataType: 'FlowDefinition',
+        outputType: 'Flow',
+        nameField: 'DeveloperName'
+    },
+
+    // ---- Composite fullNames (Parent.Child via fullNameBuilder) ----------
+    // Managed-package rules for every composite builder below:
+    //   - child name gets `ns__` prefix when NamespacePrefix is non-empty
+    //   - CustomField additionally gets `__c` suffix (DeveloperName is bare)
+    //   - everything else (ValidationRule/RecordType/FieldSet/CompactLayout)
+    //     uses DeveloperName / ValidationName as-is (no __c suffix in API)
+    // See cshBuildCompositeChild helper below — keeps the prefix/suffix logic
+    // in one place so every builder stays consistent.
+    'CustomField': {
+        metadataType: 'CustomField',
+        nameField: 'DeveloperName',
+        extraSelect: 'EntityDefinition.QualifiedApiName',
+        orderBy: 'EntityDefinition.QualifiedApiName, DeveloperName',
+        fullNameBuilder: function (rec) {
+            var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
+            if (!parent || !rec.DeveloperName) return null;
+            // Tooling CustomField.DeveloperName is the bare API name (e.g.
+            // "MyField"); Metadata API fullName needs the __c suffix plus
+            // any managed-package prefix: Account.pkg__MyField__c
+            return parent + '.' + cshBuildCompositeChild(rec.NamespacePrefix, rec.DeveloperName, '__c');
+        }
+    },
+    'ValidationRule': {
+        metadataType: 'ValidationRule',
+        nameField: 'ValidationName',
+        extraSelect: 'EntityDefinition.QualifiedApiName',
+        orderBy: 'EntityDefinition.QualifiedApiName, ValidationName',
+        fullNameBuilder: function (rec) {
+            var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
+            if (!parent || !rec.ValidationName) return null;
+            return parent + '.' + cshBuildCompositeChild(rec.NamespacePrefix, rec.ValidationName, '');
+        }
+    },
+    'RecordType': {
+        metadataType: 'RecordType',
+        nameField: 'DeveloperName',
+        extraSelect: 'SobjectType',
+        orderBy: 'SobjectType, DeveloperName',
+        fullNameBuilder: function (rec) {
+            if (!rec.SobjectType || !rec.DeveloperName) return null;
+            return rec.SobjectType + '.' + cshBuildCompositeChild(rec.NamespacePrefix, rec.DeveloperName, '');
+        }
+    },
+    'FieldSet': {
+        metadataType: 'FieldSet',
+        nameField: 'DeveloperName',
+        extraSelect: 'EntityDefinition.QualifiedApiName',
+        orderBy: 'EntityDefinition.QualifiedApiName, DeveloperName',
+        fullNameBuilder: function (rec) {
+            var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
+            if (!parent || !rec.DeveloperName) return null;
+            return parent + '.' + cshBuildCompositeChild(rec.NamespacePrefix, rec.DeveloperName, '');
+        }
+    },
+    'CompactLayout': {
+        metadataType: 'CompactLayout',
+        nameField: 'DeveloperName',
+        extraSelect: 'EntityDefinition.QualifiedApiName',
+        orderBy: 'EntityDefinition.QualifiedApiName, DeveloperName',
+        fullNameBuilder: function (rec) {
+            var parent = rec.EntityDefinition && rec.EntityDefinition.QualifiedApiName;
+            if (!parent || !rec.DeveloperName) return null;
+            return parent + '.' + cshBuildCompositeChild(rec.NamespacePrefix, rec.DeveloperName, '');
+        }
+    },
+
+    // ---- Tier 2: Tooling types needing EntityDefinition Id→ApiName -------
+    // TableEnumOrId holds the entity API name for standard objects but the
+    // 15/18-char Id for custom objects; the entity map resolves the latter.
+    'Layout': {
+        metadataType: 'Layout',
+        nameField: 'Name',
+        extraSelect: 'TableEnumOrId',
+        orderBy: 'TableEnumOrId, Name',
+        needsEntityMap: true,
+        fullNameBuilder: function (rec, ctx) {
+            if (!rec.TableEnumOrId || !rec.Name) return null;
+            var parent = (ctx && ctx.entityMap && ctx.entityMap[rec.TableEnumOrId]) || rec.TableEnumOrId;
+            // Layout fullName uses DASH, not dot: "Account-Account Layout".
+            return parent + '-' + rec.Name;
+        }
+    },
+    'WorkflowRule': {
+        metadataType: 'WorkflowRule',
+        nameField: 'Name',
+        extraSelect: 'TableEnumOrId',
+        orderBy: 'TableEnumOrId, Name',
+        needsEntityMap: true,
+        fullNameBuilder: function (rec, ctx) {
+            if (!rec.TableEnumOrId || !rec.Name) return null;
+            var parent = (ctx && ctx.entityMap && ctx.entityMap[rec.TableEnumOrId]) || rec.TableEnumOrId;
+            return parent + '.' + rec.Name;
+        }
+    },
+    // QuickActionDefinition.SobjectType is already the API name (or null for
+    // global actions); no entity-map lookup needed.
+    'QuickAction': {
+        metadataType: 'QuickActionDefinition',
+        outputType: 'QuickAction',
+        nameField: 'DeveloperName',
+        extraSelect: 'SobjectType',
+        orderBy: 'SobjectType NULLS FIRST, DeveloperName',
+        fullNameBuilder: function (rec) {
+            if (!rec.DeveloperName) return null;
+            return rec.SobjectType ? (rec.SobjectType + '.' + rec.DeveloperName) : rec.DeveloperName;
+        }
+    },
+    'ListView': {
+        metadataType: 'ListView',
+        nameField: 'DeveloperName',
+        extraSelect: 'SobjectType',
+        orderBy: 'SobjectType, DeveloperName',
+        fullNameBuilder: function (rec) {
+            if (!rec.SobjectType || !rec.DeveloperName) return null;
+            return rec.SobjectType + '.' + rec.DeveloperName;
+        }
+    },
+
+    // ---- Tier 1: Data API SObjects (not Tooling) -------------------------
+    // Same one-SOQL + queryMore pagination, hits conn.query() instead of
+    // conn.tooling.query(). Opted out of NamespacePrefix where the SObject
+    // doesn't expose it (Profile, Group, UserRole).
+    'Profile': {
+        metadataType: 'Profile',
+        api: 'data',
+        nameField: 'Name',
+        hasNamespace: false
+    },
+    'PermissionSet': {
+        metadataType: 'PermissionSet',
+        api: 'data',
+        nameField: 'Name'
+    },
+    'PermissionSetGroup': {
+        metadataType: 'PermissionSetGroup',
+        api: 'data',
+        nameField: 'DeveloperName'
+    },
+    'Group': {
+        metadataType: 'Group',
+        api: 'data',
+        nameField: 'DeveloperName',
+        hasNamespace: false,
+        // The Group SObject is polymorphic (public groups, queues, role
+        // groups, …). The Metadata API Group type is public groups only.
+        whereClause: "Type = 'Regular'"
+    },
+    'Queue': {
+        metadataType: 'Group',
+        outputType: 'Queue',
+        api: 'data',
+        nameField: 'DeveloperName',
+        hasNamespace: false,
+        whereClause: "Type = 'Queue'"
+    },
+    'Role': {
+        metadataType: 'UserRole',
+        outputType: 'Role',
+        api: 'data',
+        nameField: 'DeveloperName',
+        hasNamespace: false
+    }
 };
 
-function cshBuildToolingSoql(cfg) {
-    return 'SELECT Id, ' + cfg.nameField +
-        ', NamespacePrefix, LastModifiedDate, LastModifiedBy.Name, CreatedDate, CreatedBy.Name ' +
-        'FROM ' + cfg.metadataType +
-        ' ORDER BY ' + cfg.nameField;
+// Composes the child portion of a Parent.Child metadata fullName from the
+// Tooling SObject row's bare developer name plus a managed-package prefix
+// and an optional API suffix (e.g. "__c" for custom fields). Exists so the
+// ns-prefix + suffix rule lives in one place instead of being copy-pasted
+// across every composite fullNameBuilder.
+function cshBuildCompositeChild(namespacePrefix, bareName, suffix) {
+    var child = bareName;
+    if (namespacePrefix) child = namespacePrefix + '__' + child;
+    if (suffix) child = child + suffix;
+    return child;
 }
 
-function cshNormalizeToolingRecord(rec, cfg) {
-    var name = rec[cfg.nameField] || '';
+function cshBuildToolingSoql(cfg) {
+    var fields = ['Id', cfg.nameField];
+    // Some Data-API SObjects (Profile, UserRole, Group) have no NamespacePrefix.
+    // Selecting it errors, so each config opts out explicitly.
+    if (cfg.hasNamespace !== false) fields.push('NamespacePrefix');
+    fields.push('LastModifiedDate', 'LastModifiedBy.Name', 'CreatedDate', 'CreatedBy.Name');
+    if (cfg.extraSelect) fields.push(cfg.extraSelect);
+    var soql = 'SELECT ' + fields.join(', ') + ' FROM ' + cfg.metadataType;
+
+    // Compose WHERE: type-specific clause (e.g. Group.Type = 'Queue') AND
+    // the managed-package filter. Managed items can't be deployed via a
+    // change set anyway (Salesforce blocks it for non-package owners), so
+    // showing them as ghost rows just spams the table with thousands of
+    // un-actionable components. Toggle clears the filter on demand.
+    var clauses = [];
+    if (cfg.whereClause) clauses.push(cfg.whereClause);
+    if (cfg.hasNamespace !== false && !cshShouldIncludeManaged()) {
+        clauses.push('NamespacePrefix = null');
+    }
+    if (clauses.length) soql += ' WHERE ' + clauses.join(' AND ');
+
+    soql += ' ORDER BY ' + (cfg.orderBy || cfg.nameField);
+    return soql;
+}
+
+// Reads the user's "Include managed packages" toggle off the DOM checkbox.
+// Absence = default (exclude managed). Preference is persisted to
+// chrome.storage.local and re-hydrated on page load by cshHydrateManagedToggle.
+function cshShouldIncludeManaged() {
+    var el = document.getElementById('csh-include-managed');
+    return !!(el && el.checked);
+}
+
+// Stashed so the toggle-change handler can re-run the last compare listing
+// against the same environment without prompting the user to reconnect.
+var cshLastCompareEnv = null;
+
+// Pull the persisted preference from chrome.storage.local, mirror it into
+// the checkbox, then bind a change handler that re-persists and — if a
+// compare listing is already on screen — re-runs it with the new filter.
+function cshHydrateManagedToggle() {
+    var $cb = $('#csh-include-managed');
+    if (!$cb.length) return;
+    try {
+        chrome.storage.local.get(['cshIncludeManaged'], function (res) {
+            $cb.prop('checked', !!(res && res.cshIncludeManaged));
+        });
+    } catch (_) { /* storage unavailable — use DOM default (unchecked) */ }
+    $cb.off('change.cshManaged').on('change.cshManaged', function () {
+        var checked = $(this).is(':checked');
+        try { chrome.storage.local.set({ cshIncludeManaged: checked }); } catch (_) {}
+        // Re-run the last listing only if one is active. cshLastCompareEnv is
+        // set by cshCompareStartMetadataList; if it's still null we haven't
+        // connected yet and there's nothing to refresh.
+        if (cshLastCompareEnv) {
+            cshCompareStartMetadataList(cshLastCompareEnv);
+        }
+    });
+}
+
+function cshNormalizeToolingRecord(rec, cfg, ctx) {
     var ns = rec.NamespacePrefix || '';
+    var fullName;
+    if (typeof cfg.fullNameBuilder === 'function') {
+        // Parent.Child composite — builder owns the full shape, including any
+        // namespace concerns specific to that type. Builders receive ctx so
+        // they can consult e.g. the EntityDefinition Id→QualifiedApiName map.
+        // Builders that can't compose a name (missing relationship field)
+        // return null so the row is filtered upstream instead of
+        // masquerading as "undefined".
+        fullName = cfg.fullNameBuilder(rec, ctx);
+    } else {
+        var name = rec[cfg.nameField] || '';
+        // Managed-package fullName convention is ns__Name (double underscore),
+        // not ns.Name — Metadata API listMetadata would never emit the dot
+        // form, so the old separator silently broke row-joins for every
+        // simple-name type (ApexClass, LWC bundle, StaticResource, …) coming
+        // out of a managed package.
+        fullName = ns ? (ns + '__' + name) : name;
+    }
+    var outType = cfg.outputType || cfg.metadataType;
+    // FlowDefinition → Flow, QuickActionDefinition → QuickAction, UserRole → Role, Group → Queue
+    // for Type='Queue'. outputType keeps the Metadata API type that callers
+    // expect decoupled from the SObject we queried.
     return {
         id: rec.Id,
-        fullName: ns ? (ns + '.' + name) : name,
-        type: cfg.metadataType,
-        fileName: (cfg.metadataType + '/' + name),
+        fullName: fullName,
+        type: outType,
+        fileName: (outType + '/' + (fullName || rec[cfg.nameField] || '')),
         namespacePrefix: ns || undefined,
         lastModifiedDate: rec.LastModifiedDate,
         lastModifiedByName: rec.LastModifiedBy ? rec.LastModifiedBy.Name : null,
@@ -1300,32 +1607,101 @@ function cshNormalizeToolingRecord(rec, cfg) {
     };
 }
 
+// EntityDefinition Id → QualifiedApiName cache, used by types whose parent
+// column (Layout.TableEnumOrId, WorkflowRule.TableEnumOrId) holds the 15/18-
+// char Id for custom objects. Fetched at most once per connType per session;
+// EntityDefinition is small enough that a single query is cheap.
+var cshEntityApiCache = { local: null, deploy: null };
+
+function cshResolveEntityApiNames(connType, cb) {
+    if (cshEntityApiCache[connType]) {
+        cb(null, cshEntityApiCache[connType]);
+        return;
+    }
+    var proxy = connType === 'deploy' ? 'queryToolingDeploy' : 'queryToolingLocal';
+    chrome.runtime.sendMessage(
+        { proxyFunction: proxy, soql: 'SELECT Id, QualifiedApiName FROM EntityDefinition' },
+        function (response) {
+            if (response && response.err) { cb(response.err, null); return; }
+            var records = (response && response.records) || [];
+            var map = {};
+            for (var i = 0; i < records.length; i++) {
+                var r = records[i];
+                if (r.Id && r.QualifiedApiName) {
+                    map[r.Id] = r.QualifiedApiName;
+                    // Salesforce Ids come back as 18-char case-safe here, but
+                    // Layout.TableEnumOrId is documented as either a 15-char
+                    // Id or an API name. Stash both for tolerant lookup.
+                    if (r.Id.length === 18) map[r.Id.substring(0, 15)] = r.QualifiedApiName;
+                }
+            }
+            cshEntityApiCache[connType] = map;
+            cb(null, map);
+        }
+    );
+}
+
+// Dispatcher for the list-metadata fast paths. Picks the right proxy
+// (queryTooling* vs querySoql*) based on cfg.api, pre-fetches the
+// EntityDefinition map when the config needs it, and funnels results
+// through cshNormalizeToolingRecord. Callers always get the
+// { err, records: normalized[] } shape so list/compare paths stay
+// interchangeable with the listMetadata response.
+function cshRunQueryFastPath(connType, cfg, cb) {
+    function pickProxy() {
+        if (cfg.api === 'data') {
+            return connType === 'deploy' ? 'querySoqlDeploy' : 'querySoqlLocal';
+        }
+        return connType === 'deploy' ? 'queryToolingDeploy' : 'queryToolingLocal';
+    }
+
+    function runMain(entityMap) {
+        var soql = cshBuildToolingSoql(cfg);
+        console.log('FastPath SOQL [' + connType + '/' + (cfg.api || 'tooling') + ']:', soql);
+        chrome.runtime.sendMessage(
+            { proxyFunction: pickProxy(), soql: soql },
+            function (response) {
+                if (response && response.err) { cb(response.err, null); return; }
+                var records = (response && response.records) || [];
+                var ctx = { entityMap: entityMap };
+                var normalized = records
+                    .map(function (r) { return cshNormalizeToolingRecord(r, cfg, ctx); })
+                    .filter(function (r) { return r && r.fullName; });
+                cb(null, normalized);
+            }
+        );
+    }
+
+    if (cfg.needsEntityMap) {
+        cshResolveEntityApiNames(connType, function (err, map) {
+            if (err) { cb(err, null); return; }
+            runMain(map);
+        });
+    } else {
+        runMain(null);
+    }
+}
+
 function getMetaData(processResultsFunction) {
 
-    // Fast path for code types: one Tooling SOQL query instead of listMetadata.
-    // Falls through to the existing metadata.list path on error so coverage
-    // is preserved even if Tooling is restricted on the org.
+    // Fast path: one SOQL (Tooling or Data API) + queryMore chain instead of
+    // listMetadata's 2000-capped SOAP protocol. Covers code families plus a
+    // broad swath of XML families (CustomField, Layout, ValidationRule, Flow,
+    // RecordType, Profile, PermissionSet, Queue, Role, …). On Tooling error
+    // or missing SObject the caller falls through to metadata.list so
+    // coverage never regresses.
     if (TOOLING_QUERYABLE_TYPES[selectedEntityType]) {
         var cfg = TOOLING_QUERYABLE_TYPES[selectedEntityType];
-        var soql = cshBuildToolingSoql(cfg);
         numCallsInProgress++;
-        console.log('Tooling SOQL fast path for', selectedEntityType + ':', soql);
-        chrome.runtime.sendMessage({
-            proxyFunction: 'queryToolingLocal',
-            soql: soql
-        }, function (response) {
-            if (response && response.err) {
-                console.warn('Tooling fast path failed, falling back to metadata.list:', response.err);
-                // Re-dispatch through metadata.list
+        cshRunQueryFastPath('local', cfg, function (err, normalized) {
+            if (err) {
+                console.warn('Fast path failed, falling back to metadata.list:', err);
                 chrome.runtime.sendMessage({
                     proxyFunction: 'listLocalMetaData',
                     proxydata: [{ type: resolvedMetadataType }]
                 }, processResultsFunction);
                 return;
             }
-            var records = (response && response.records) || [];
-            var normalized = records.map(function (r) { return cshNormalizeToolingRecord(r, cfg); });
-            // Match the shape of listLocalMetaData's response
             processResultsFunction({ err: null, results: normalized });
         });
         return;
@@ -1484,6 +1860,13 @@ var CSH_LIST_BATCH_SIZE = 3;
 function cshCompareStartMetadataList(env) {
     $("#compareSavedOrgsGroup, #compareNewOrgGroup, #compareEnv, #compareMyDomain").hide();
     $("#logout").show();
+    // Stash env so the managed-toggle change handler can rerun the listing
+    // against the same org without prompting the user to re-pick. Also reveal
+    // the toggle now — hidden before connect so we don't imply the filter
+    // applies to the local-org list above the fold.
+    cshLastCompareEnv = env;
+    $('#csh-include-managed-label').show();
+    $('#csh-compare-refresh').show();
     $("#editPage").addClass("lowOpacity");
 
     // Folder-based types (Report, Dashboard, Document, EmailTemplate) have
@@ -1498,6 +1881,28 @@ function cshCompareStartMetadataList(env) {
 }
 
 function cshCompareListFlat(env) {
+    // Fast path: one SOQL, queryMore walks past 2000 automatically. Covers
+    // code families, Tooling-queryable XML families (CustomField, Layout,
+    // ValidationRule, RecordType, Flow, QuickAction, ListView, …) and Data-
+    // API SObjects (Profile, PermissionSet, Queue, Role, …). Errors fall
+    // back to listMetadata so coverage never regresses.
+    var cfg = TOOLING_QUERYABLE_TYPES[selectedEntityType];
+    if (cfg) {
+        cshRunQueryFastPath('deploy', cfg, function (err, normalized) {
+            if (err) {
+                console.warn('Compare fast path failed, falling back to listMetadata:', err);
+                cshCompareListFlatViaListMetadata(env);
+                return;
+            }
+            console.log('Compare fast path results:', normalized.length, 'records for', selectedEntityType);
+            processCompareResults(normalized, env);
+        });
+        return;
+    }
+    cshCompareListFlatViaListMetadata(env);
+}
+
+function cshCompareListFlatViaListMetadata(env) {
     listMetaDataProxy([{ type: resolvedMetadataType }],
         function (results) {
             if (!results) {
@@ -1512,9 +1917,10 @@ function cshCompareListFlat(env) {
                 console.log('Problem listing compare metadata:', results.error);
             }
             if (Array.isArray(results) && results.length >= CSH_LIST_META_LIMIT) {
-                // Non-folder types have no native way to fetch beyond 2000
-                // via listMetadata. Tell the user their diff may be
-                // incomplete rather than silently hiding rows.
+                // Non-Tooling-queryable, non-folder types still have no way
+                // past the 2000 cap — warn the user rather than silently
+                // hiding rows. Most of the high-count XML families now route
+                // through the Tooling fast path above and never land here.
                 window.cshToast && window.cshToast.show(
                     resolvedMetadataType + ': target org returned ' + results.length +
                     ' items (listMetadata cap). If the type has more, extras will not appear in the compare columns.',
@@ -1630,6 +2036,10 @@ function cshCompareOnConnectSavedOrg() {
             return;
         }
         $("#loggedInUsername").html(response.username || '');
+        // Fresh connection — nuke any entity-map cache from a previous
+        // deploy org so Tier-2 composites (Layout, WorkflowRule) don't
+        // resolve Ids against the wrong org.
+        cshEntityApiCache.deploy = null;
         // envLabel hint: fall back to 'prod' if unknown so processCompareResults
         // doesn't choke — it only uses env for naming in its UI.
         var env = response.envLabel === 'Sandbox' ? 'sandbox'
@@ -1674,6 +2084,9 @@ function cshCompareStartNewOrgLogin(env, customHost) {
             return;
         }
         $("#loggedInUsername").html(response.username || '');
+        // Fresh connection — clear the deploy entity-map cache so Tier-2
+        // composite resolution doesn't use Ids from a previous org.
+        cshEntityApiCache.deploy = null;
         cshCompareStartMetadataList(env);
     });
 }
@@ -1715,10 +2128,19 @@ function cshTriggerCompare(fullName) {
         );
         return;
     }
+    // Label the popup with something meaningful on each side. Local = the
+    // org hosting the change set page; target = whatever username the deploy
+    // connect flow wrote into #loggedInUsername (already visible above the
+    // compare table). Fall back to generic labels if either is missing so
+    // the popup doesn't render "undefined" in the header.
+    var localLabel = window.location.host || 'This org';
+    var targetLabel = ($.trim($('#loggedInUsername').text())) || 'Other org';
     chrome.runtime.sendMessage({
         'proxyFunction': "compareContents",
         'entityType': resolvedMetadataType,
-        'itemName': fullName
+        'itemName': fullName,
+        'localOrg': localLabel,
+        'targetOrg': targetLabel
     }, function () { /* background opens the popup */ });
 }
 
@@ -1741,8 +2163,21 @@ function deployLogout() {
         //do nothing else
     });
 
+    // Entity-Id ↔ API-name map is org-specific — the next deploy connection
+    // could be a completely different org with its own custom-object Ids.
+    // Clear both sides so a stale local cache can't leak into a fresh
+    // compare either (local flips too on a tab-level org change).
+    cshEntityApiCache.local = null;
+    cshEntityApiCache.deploy = null;
+
     $("#loggedInUsername").html('');
     $("#logout").hide();
+    // Toggle is only meaningful while a compare listing is on screen. Hide it
+    // and drop the stashed env so a subsequent change can't re-trigger an
+    // orphaned listing against a logged-out connection.
+    $('#csh-include-managed-label').hide();
+    $('#csh-compare-refresh').hide();
+    cshLastCompareEnv = null;
     // Refresh the saved-orgs picker — if the user has one or more saved
     // orgs they'll see the dropdown; otherwise they fall back to the classic
     // env-select form. Makes a silent no-op if the Compare UI isn't mounted
@@ -2277,6 +2712,16 @@ $(document).ready(function () {
     // registry.
     $(document).on('click', '#compareSavedOrgConnect', cshCompareOnConnectSavedOrg);
     $(document).on('click', '#compareSavedOrgDelete', cshCompareOnDeleteSavedOrg);
+    // Refresh pulls the target-org listing again (and re-reads the local
+    // change set rows off the DataTable). Handy when the user has just added
+    // components to the change set, or when someone edited metadata in the
+    // target org and they want updated "modified by/date" columns without
+    // reconnecting.
+    $(document).on('click', '#csh-compare-refresh', function (ev) {
+        ev.preventDefault();
+        if (!cshLastCompareEnv) return;
+        cshCompareStartMetadataList(cshLastCompareEnv);
+    });
     $(document).on('click', '#compareAddAnotherOrgLink', function (ev) {
         ev.preventDefault();
         $('#compareSavedOrgsGroup').hide();

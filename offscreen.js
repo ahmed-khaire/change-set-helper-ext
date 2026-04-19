@@ -133,6 +133,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 .catch(err => sendResponse({error: err.message}));
             return true;
 
+        case 'querySoql':
+            querySoql(request.connType, request.soql)
+                .then(records => sendResponse({records: records}))
+                .catch(err => sendResponse({error: err.message}));
+            return true;
+
         case 'downloadMetadata':
             downloadMetadata(request.connType, request.changename)
                 .then(result => sendResponse({result: result}))
@@ -273,6 +279,33 @@ async function queryTooling(connType, soql) {
         if (res && Array.isArray(res.records)) all = all.concat(res.records);
     }
     console.log('queryTooling:', all.length, 'record(s) fetched for', soql.slice(0, 60) + '...');
+    return all;
+}
+
+// Standard Data API SOQL counterpart to queryTooling — same queryMore chain,
+// but hits conn.query() for regular SObjects (Profile, PermissionSet, UserRole,
+// Group, …) that aren't Tooling-queryable but still need >2000 pagination.
+async function querySoql(connType, soql) {
+    const conn = connType === 'deploy' ? connDeploy.conn : connLocal.conn;
+    if (!conn) throw new Error('Not connected');
+    var all = [];
+    var res = await new Promise((resolve, reject) => {
+        conn.query(soql, function (err, r) {
+            if (err) return reject(err);
+            resolve(r);
+        });
+    });
+    if (res && Array.isArray(res.records)) all = all.concat(res.records);
+    while (res && res.done === false && res.nextRecordsUrl) {
+        res = await new Promise((resolve, reject) => {
+            conn.queryMore(res.nextRecordsUrl, function (err, r) {
+                if (err) return reject(err);
+                resolve(r);
+            });
+        });
+        if (res && Array.isArray(res.records)) all = all.concat(res.records);
+    }
+    console.log('querySoql:', all.length, 'record(s) fetched for', soql.slice(0, 60) + '...');
     return all;
 }
 

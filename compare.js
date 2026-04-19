@@ -1,8 +1,33 @@
 $(document).ready(function () {
 
-	var subStr = window.location.search.match("item=(.*)");
-	var compareItem = decodeURIComponent(subStr[1]);
-	window.document.title = "COMPARING ------ " + compareItem + " ------  This Org < -- > Other Org"
+	// Parse the popup's query string properly. The old regex `item=(.*)`
+	// greedily swallowed any &localOrg=/&targetOrg= we now append, so it
+	// treated the entire tail as part of the item name. URLSearchParams
+	// decodes each field individually and handles missing params cleanly.
+	var params = new URLSearchParams(window.location.search);
+	var compareItem = params.get('item') || '';
+	var localOrg = params.get('localOrg') || 'This org';
+	var targetOrg = params.get('targetOrg') || 'Other org';
+	window.document.title = "COMPARING " + compareItem + " — " + localOrg + " < — > " + targetOrg;
+
+	// Drop a header bar with the org names so the user can tell the two
+	// panes apart at a glance. Mergely doesn't expose per-pane labels, so
+	// we render our own two-column strip above the diff. HTML-escape the
+	// labels — they come from window.location.host and a DOM text read, so
+	// an attacker-controlled org name (unlikely, but possible on a shared
+	// machine) shouldn't get to inject markup into the popup.
+	function escapeHtml(s) {
+		return String(s).replace(/[<>&"']/g, function (c) {
+			return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c];
+		});
+	}
+	$('body').prepend(
+		'<div id="csh-compare-header" style="display:flex;align-items:center;padding:6px 10px;background:#f4f6f9;border-bottom:1px solid #d8dde6;font:12px/1.4 Arial,sans-serif;color:#2b2826;">' +
+			'<div style="flex:1;"><strong>This org:</strong> ' + escapeHtml(localOrg) + '</div>' +
+			'<div style="padding:0 12px;color:#706e6b;">' + escapeHtml(compareItem) + '</div>' +
+			'<div style="flex:1;text-align:right;"><strong>Other org:</strong> ' + escapeHtml(targetOrg) + '</div>' +
+		'</div>'
+	);
 	$('#compare').mergely({
 		width: 'auto',
 		height: 'auto',
