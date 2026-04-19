@@ -70,6 +70,7 @@
         resolveColumnIndices(table);
         injectToolbar(table);
         populateFilterDropdowns(table);
+        hijackRemoveLinks(table);
         observeTableChanges(table);
         wireDelegatedEvents(table);
         applyFilters(table); // populates the "N components" counter
@@ -355,9 +356,83 @@
 
     function extractComponentIdFromLink(link) {
         if (!link) return null;
+        // After hijackRemoveLink strips the inline onclick, the cid is
+        // preserved on data-csh-cid. Fall back to the original onclick for
+        // any link the hijack hasn't processed yet.
+        var cached = link.getAttribute('data-csh-cid');
+        if (cached) return cached;
         var onclick = link.getAttribute('onclick') || '';
         var m = onclick.match(CONFIRM_REGEX);
         return m ? m[1] : null;
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-row Remove hijack.
+    //
+    // The native per-row "Remove" anchor has an inline onclick that runs
+    // A4J's confirmRemoveComponent(cid), which opens a confirm modal whose
+    // OK button unavoidably full-page-reloads the detail page (see the long
+    // note on the bulk path). We short-circuit that by stripping the onclick
+    // on each Remove link, stashing cid on data-csh-cid, and installing a
+    // delegated click handler that routes through the same fetch-based
+    // classic Del URL path the bulk flow uses. No A4J, no reload.
+    // -----------------------------------------------------------------------
+    function hijackRemoveLinks(root) {
+        var links = root.querySelectorAll(REMOVE_LINK_SEL);
+        for (var i = 0; i < links.length; i++) hijackRemoveLink(links[i]);
+    }
+
+    function hijackRemoveLink(link) {
+        if (!link || link.getAttribute('data-csh-hijacked') === '1') return;
+        var cid = extractComponentIdFromLink(link);
+        if (cid) link.setAttribute('data-csh-cid', cid);
+        // Both: removeAttribute clears the HTML reflection, = null clears
+        // the property in the browser's event model. Belt and braces since
+        // the whole point is to stop the A4J path from firing.
+        link.removeAttribute('onclick');
+        try { link.onclick = null; } catch (_) {}
+        link.setAttribute('href', 'javascript:void(0)');
+        link.setAttribute('data-csh-hijacked', '1');
+    }
+
+    async function handleSingleRemoveClick(link) {
+        var cid = extractComponentIdFromLink(link);
+        if (!cid) {
+            console.warn('[CSH] single remove: no cid on link', link);
+            return;
+        }
+        var row = link.closest('tr.dataRow');
+        var label = cid;
+        if (row) {
+            var nameCell = colIndex.name >= 0 ? row.children[colIndex.name] : null;
+            var name = nameCell ? (nameCell.textContent || '').trim() : '';
+            if (name) label = name;
+        }
+        if (!confirm('Remove "' + label + '" from this change set? This cannot be undone.')) return;
+        if (!window.cshChangeSetOps || !window.cshChangeSetOps.removeById) {
+            console.error('[CSH] cshChangeSetOps not available for single remove');
+            alert('Change Set Helper is still loading — try again in a moment.');
+            return;
+        }
+        if (row) row.style.opacity = '0.5';
+        try {
+            await window.cshChangeSetOps.removeById(cid);
+            // removeOne() inside cshChangeSetOps already purges the row from
+            // the DOM, so there's nothing more to do on success.
+            if (window.cshToast) {
+                window.cshToast.show('Removed "' + label + '"', { type: 'success', duration: 3000 });
+            }
+        } catch (err) {
+            if (row) row.style.opacity = '';
+            var msg = (err && err.message) || 'Remove failed';
+            console.error('[CSH] single remove failed for', cid, err);
+            if (window.cshToast) {
+                window.cshToast.show('Failed to remove "' + label + '": ' + msg,
+                    { type: 'error', duration: 8000 });
+            } else {
+                alert('Remove failed: ' + msg);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -516,6 +591,22 @@
             }
         });
 
+        // Intercept clicks on native per-row Remove links. Capture phase so
+        // we run before any stray inline onclick that escaped hijack (e.g.
+        // a row rendered between setupPage() and the MutationObserver's
+        // next tick).
+        document.addEventListener('click', function (ev) {
+            var link = ev.target && ev.target.closest && ev.target.closest(REMOVE_LINK_SEL);
+            if (!link || !table.contains(link)) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+            // Make sure hijack ran on this link (strips the inline onclick
+            // and stashes cid on data-csh-cid) before we dispatch.
+            hijackRemoveLink(link);
+            handleSingleRemoveClick(link);
+        }, true);
+
         document.addEventListener('click', function (ev) {
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all-btn')) {
@@ -604,12 +695,18 @@
                     if (node.nodeType !== 1) return;
                     if (node.matches && node.matches('tr.dataRow')) {
                         if (BULK_REMOVE_ENABLED) annotateRow(node);
+                        // Re-hijack: A4J may replace the rendered tbody on
+                        // every partial refresh, resurrecting inline onclicks.
+                        hijackRemoveLinks(node);
                         sawRowMutation = true;
                     }
                     if (node.querySelectorAll) {
                         var nested = node.querySelectorAll('tr.dataRow');
                         if (nested.length) sawRowMutation = true;
                         if (BULK_REMOVE_ENABLED) nested.forEach(annotateRow);
+                        if (node.querySelectorAll(REMOVE_LINK_SEL).length) {
+                            hijackRemoveLinks(node);
+                        }
                     }
                 });
                 m.removedNodes.forEach(function (node) {
@@ -671,16 +768,52 @@
         try { return new URL(href, location.href).href; } catch (_) { return href; }
     }
 
+    // Match the row's Remove/Del action. On an outbound change set viewed
+    // via /<033id>?tab=PackageComponents the action column anchor is labeled
+    // "Remove" (not "Del", which is only used on generic list views). The
+    // href pattern has also varied across releases — we now accept anything
+    // that looks like a remove/delete action by URL OR by text, including
+    // onclick-driven anchors that carry their cid as a query param.
     function findDelLinkInRow(rowEl) {
         var candidates = rowEl.querySelectorAll('a, button');
         for (var i = 0; i < candidates.length; i++) {
             var el = candidates[i];
             var txt = (el.textContent || '').trim();
+            var title = (el.getAttribute('title') || '').trim();
             var href = el.getAttribute('href') || '';
-            if (/^del\b/i.test(txt)) return href;
-            if (/listComponentRemoveForPackage|outboundChangeSetComponentRemove/i.test(href)) return href;
+            var onclick = el.getAttribute('onclick') || '';
+            // Text or title reads like a remove affordance.
+            if (/^(del|remove)\b/i.test(txt) || /^(del|remove)\b/i.test(title)) {
+                // Accept any URL that carries a component id via cid= or delID=.
+                if (/[?&](?:cid|delID)=/i.test(href)) return href;
+                var fromOnclick = extractCidUrlFromAttr(onclick);
+                if (fromOnclick) return fromOnclick;
+            }
+            // URL pattern looks like one of SF's remove/delete endpoints.
+            if (/listComponentRemoveForPackage|outboundChangeSetComponentRemove|listComponentRemove|removeComponent|componentRemove|componentDelete|deleteredirect\.jsp/i.test(href)) {
+                return href;
+            }
         }
         return null;
+    }
+
+    // Some SF releases render the Remove action as a plain anchor whose
+    // onclick calls window.open('/servlet/...?cid=...') or navigates via
+    // confirmDelete('...?delID=...'). When the href is '#' or empty but the
+    // onclick carries the real URL, pull it out.
+    function extractCidUrlFromAttr(str) {
+        if (!str) return null;
+        var m = str.match(/['"]((?:[^'"]+)\?[^'"]*\b(?:cid|delID)=[^'"]+)['"]/i);
+        return m ? m[1] : null;
+    }
+
+    // Extract the component id from a Del URL. Different SF endpoints use
+    // different param names: cid= (listComponentRemove*, outboundChangeSet*)
+    // vs delID= (the generic /setup/own/deleteredirect.jsp path).
+    function extractCidFromDelHref(href) {
+        if (!href) return null;
+        var m = href.match(/[?&](?:cid|delID)=([^&]+)/i);
+        return m ? decodeURIComponent(m[1]) : null;
     }
 
     // Fallback when the classic Package Components view has no Del link —
@@ -886,13 +1019,49 @@
                     (doc.querySelector('title') || {}).textContent,
                     'html snippet:', html.slice(0, 500));
             }
+            var rowsKept = 0;
             rows.forEach(function (row) {
                 var href = findDelLinkInRow(row);
                 if (!href) return;
-                var m = href.match(/[?&]cid=([^&]+)/i);
-                if (!m) return;
-                map.set(decodeURIComponent(m[1]), new URL(href, nextUrl).href);
+                var rawCid = extractCidFromDelHref(href);
+                if (!rawCid) return;
+                var absHref = new URL(href, nextUrl).href;
+                // Store under both the raw cid and its 15-char prefix so
+                // lookups work regardless of which id form the caller has.
+                // The outbound detail page's confirmRemoveComponent('...')
+                // string is typically 15-char, while Del URLs in the classic
+                // view are often 18-char; without normalization the map.get
+                // lookup misses.
+                map.set(rawCid, absHref);
+                if (rawCid.length === 18) map.set(rawCid.slice(0, 15), absHref);
+                rowsKept++;
             });
+            // If we saw rows but matched nothing, the Action anchor shape has
+            // drifted (SF release change, managed-package style override,
+            // etc.). Dump the first row's anchors once so the gap is visible
+            // in the console without a DOM inspector trip.
+            if (pageNum === 1 && rows.length > 0 && rowsKept === 0) {
+                var sample = rows[0];
+                var anchors = Array.prototype.map.call(
+                    sample.querySelectorAll('a, button'),
+                    function (el) {
+                        return {
+                            tag: el.tagName,
+                            text: (el.textContent || '').trim().slice(0, 40),
+                            title: el.getAttribute('title') || '',
+                            href: el.getAttribute('href') || '',
+                            onclick: (el.getAttribute('onclick') || '').slice(0, 200)
+                        };
+                    }
+                );
+                // Stringify so the anchor details show inline in the log
+                // instead of being collapsed into [{…}, …] by the console.
+                console.warn('[CSH] buildDelHrefMap: 0 matches across ' + rows.length +
+                    ' rows. First row anchors JSON: ' + JSON.stringify(anchors));
+                // Also dump the full first-row HTML (trimmed) for structural context.
+                console.warn('[CSH] First row HTML: ' +
+                    (sample.outerHTML || '').slice(0, 1500));
+            }
             var nextHref = findNextPageHrefInDoc(doc);
             nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
         }
@@ -901,11 +1070,42 @@
         return map;
     }
 
+    // Look up a Del URL tolerating 15/18-char id mismatches between the
+    // detail page (confirmRemoveComponent id) and the classic components
+    // view (Del URL cid).
+    function lookupDelHref(map, cid) {
+        if (!cid) return null;
+        var href = map.get(cid);
+        if (href) return href;
+        if (cid.length === 18) {
+            href = map.get(cid.slice(0, 15));
+            if (href) return href;
+        }
+        if (cid.length === 15) {
+            // Final fallback: scan for any 18-char key with matching 15-char prefix.
+            var iter = map.keys();
+            var next = iter.next();
+            while (!next.done) {
+                var k = next.value;
+                if (k && k.length === 18 && k.slice(0, 15) === cid) return map.get(k);
+                next = iter.next();
+            }
+        }
+        return null;
+    }
+
     // GET the Del URL → parse confirm form → POST the form back. Matches
     // changeview.js's removeOneComponent (classic SF delete flow).
+    //
+    // Special case: /setup/own/deleteredirect.jsp is SF's generic one-shot
+    // delete servlet. Its URL already carries a _CONFIRMATIONTOKEN so a
+    // single GET performs the delete and 302-redirects to retURL. There is
+    // no confirm form to parse, so we stop after the GET succeeds.
     async function deleteViaDelHref(delHref) {
+        var isOneShotRedirect = /\/setup\/own\/deleteredirect\.jsp/i.test(delHref);
         var r = await fetch(delHref, { credentials: 'include', redirect: 'follow' });
         if (!r.ok) throw new Error('HTTP ' + r.status + ' on confirm page');
+        if (isOneShotRedirect) return;
         var html = await r.text();
         var doc = new DOMParser().parseFromString(html, 'text/html');
         var forms = doc.querySelectorAll('form');
@@ -943,14 +1143,21 @@
 
     async function removeOne(cid) {
         var map = await buildDelHrefMap();
-        var href = map.get(cid);
+        var href = lookupDelHref(map, cid);
         if (!href) {
             // Cache might be stale (new components added since build). Retry
             // once with a fresh map.
             delHrefCache = null;
             map = await buildDelHrefMap();
-            href = map.get(cid);
+            href = lookupDelHref(map, cid);
             if (!href) {
+                // Dump a small sample of the keys we do have so the mismatch
+                // is obvious in the console if this keeps happening.
+                var sample = [];
+                var iter = map.keys(), n = iter.next(), i = 0;
+                while (!n.done && i < 6) { sample.push(n.value); n = iter.next(); i++; }
+                console.error('[CSH] removeOne miss — cid=', cid,
+                    'mapSize=', map.size, 'sampleKeys=', sample);
                 throw new Error('Del URL not found for ' + cid + ' in classic components view');
             }
         }

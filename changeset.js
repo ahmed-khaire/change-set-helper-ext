@@ -351,7 +351,7 @@ function setupTable() {
 			<input type='text' id='compareMyDomain' placeholder='https://yourorg.my.salesforce.com' style='display:none;margin-left:6px;padding:3px 6px;min-width:240px;' />
 			<a href="#" id="compareBackToSavedOrgsLink" style="display:none;margin-left:8px;font-size:12px;">Back to saved orgs</a>
 		</span>
-	<span id="loggedInUsername"></span>  <span id="logout">(<a id="logoutLink" href="#">Logout</a>)</span>
+	<span id="loggedInUsername"></span>  <span id="logout">(<a id="logoutLink" href="#">Connect another Org</a>)</span>
 	<button type="button" id="csh-compare-refresh" style="display:none;margin-left:8px;padding:2px 10px;border:1px solid #c9c9c9;background:#fff;border-radius:3px;cursor:pointer;font-size:12px;" title="Re-run the compare against the same org. Use this after adding components to the change set or after edits in the target org.">↻ Refresh compare</button>
 `);
 
@@ -2857,18 +2857,21 @@ function startMetadataLoading() {
 
 
     var changeSetHead2 = $('<thead></thead>').prependTo('table.list').append($('table.list tr:first'));
-    if (typeColumn.length > 0) {
-        changeSetHead2.after('<tfoot><tr><td></td><td></td><td></td></tr></tfoot>');
-    } else {
-        changeSetHead2.after('<tfoot><tr><td></td><td></td></tr></tfoot>');
-    }
+
+    // Build tfoot with one <td> per actual header <th>. Hard-coding 2 or 3
+    // cells here broke on pages where Salesforce rendered additional columns
+    // (Parent Object, API Name, Included By, etc.) — DataTables' _fnBuildHead
+    // then crashed with "Cannot set properties of undefined (setting 'nTf')"
+    // when its column loop ran off the end of the short footer.
+    var colCount = changeSetHead2.find('th').length;
+    var tfootCells = new Array(Math.max(colCount, 1)).fill('<td></td>').join('');
+    changeSetHead2.after('<tfoot><tr>' + tfootCells + '</tr></tfoot>');
 
     // Derive the initial sort column from the actual header th count.
     // Salesforce usually renders Action+Type+Name (3 cols) or Action+Name (2),
     // so index 1 is safe — but for edge-case renders with only 1 th, a
     // hardcoded [[1,'asc']] makes DataTables throw inside _fnSortFlatten
     // ("Cannot read properties of undefined (reading 'aDataSort')").
-    var colCount = changeSetHead2.find('th').length;
     var initialOrder = colCount >= 2 ? [[1, 'asc']] : (colCount >= 1 ? [[0, 'asc']] : []);
     changeSetTable = $('table.list').DataTable({
             paging: false,
