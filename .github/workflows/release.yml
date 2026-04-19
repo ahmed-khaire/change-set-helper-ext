@@ -70,11 +70,12 @@ jobs:
             offscreen.html offscreen.js \
             changeset.js changeview.js \
             deployhelper.js metadatahelper.js \
-            common.js \
+            detailcomponents.js detailpagebridge.js \
+            common.js cart.js \
             compare.js compare.html \
             options.html options.js \
             popup.html \
-            changeset.css \
+            changeset.css cart.css \
             lib \
             brainbulb128.png brainbulb48.png braincloudsmall.png \
             loading.gif
