@@ -5,6 +5,8 @@ CLAUDE.md
 
 # Local build output
 change-set-helper-ext-*.zip
+*.crx
+*.pem
 
 # Local SFDX scratch project for deploying the Connected App
 sfdx-connected-app/
