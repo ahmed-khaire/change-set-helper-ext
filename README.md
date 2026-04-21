@@ -507,7 +507,17 @@ This project builds upon the original work by Susan Bohme. Please respect the or
 
 ## 📊 Version History
 
-### v3.0.1 (Current)
+### v3.1.0 (Current)
+- ✨ Select components from different types and add them in one go
+- ✨ See everything in your change set without leaving the add screen
+- ✨ Validate and deploy directly to other orgs
+- ✨ Export/Import package.xml
+- ✨ Bulk removal of components
+- 🐛 Fixed Compare + connect multiple orgs at once
+- 🐛 Single-row remove — no more page reload
+- 🐛 Validate now shows progress and detailed error messages.
+
+### v3.0.1
 - ✨ Progressive table loading - table appears in 2-3 seconds
 - ✨ Smart pagination automatically enabled at 1,500 rows
 - ✨ Async pagination with animated progress indicator
