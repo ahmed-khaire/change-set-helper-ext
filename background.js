@@ -927,6 +927,45 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.type == "cshClassicFetch") {
+        // Content-script proxy for credentialed GETs of classic Salesforce
+        // pages. Content scripts running on *.my.salesforce-setup.com can't
+        // fetch *.my.salesforce.com with credentials: the two domains are
+        // different eTLDs under the public suffix list, so the browser blocks
+        // the cross-origin cookie request and the content-script fetch throws
+        // "Failed to fetch". The service worker has host_permissions for both
+        // domains, so it can cross the boundary and send the sid cookie for
+        // the target origin. Used by cart.js syncFromChangeSetView to scrape
+        // /<id>?tab=PackageComponents on Setup-domain orgs.
+        (async function () {
+            try {
+                if (!request.url) {
+                    sendResponse({ ok: false, error: 'cshClassicFetch: url required' });
+                    return;
+                }
+                var resp = await fetch(request.url, {
+                    method: 'GET',
+                    credentials: 'include',
+                    // X-Requested-With avoids Salesforce interstitials that
+                    // sometimes wrap plain browser navigations; the classic
+                    // component list page returns the same HTML either way.
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+                var text = await resp.text();
+                sendResponse({
+                    ok: resp.ok,
+                    status: resp.status,
+                    finalUrl: resp.url,
+                    text: text
+                });
+            } catch (err) {
+                console.error('cshClassicFetch failed:', err);
+                sendResponse({ ok: false, error: err.message || String(err) });
+            }
+        })();
+        return true;
+    }
+
     if (request.type == "cshCartSubmit") {
         // Cart worker batch submission: POST to the native Add-Components
         // endpoint using the scraped form shape, with our chosen ids replacing

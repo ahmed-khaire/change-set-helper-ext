@@ -1283,17 +1283,71 @@
         }
         return null;
     }
+    // Salesforce's 2024 domain split serves Setup pages (including
+    // AddToPackageFromChangeMgmtUi) from *.my.salesforce-setup.com and the
+    // rest of the app — including outbound change-set detail pages and their
+    // ?tab=PackageComponents view — from *.my.salesforce.com. Cookies don't
+    // cross those eTLDs, so a `credentials:'include'` fetch built against
+    // location.href on a Setup page hits the wrong origin for this URL and
+    // Salesforce returns a Lightning shell / login page with no tr.dataRow.
+    // Translating just the host back to my.salesforce.com keeps the rest of
+    // the URL (path, query) intact and ships the right cookies.
+    function _appOriginForChangeSetView() {
+        var host = location.host || '';
+        if (/\.my\.salesforce-setup\.com$/i.test(host)) {
+            return location.protocol + '//' + host.replace(/\.my\.salesforce-setup\.com$/i, '.my.salesforce.com');
+        }
+        return location.origin;
+    }
+    // Cross-origin credentialed fetches from content scripts are blocked by
+    // Chrome even when the extension declares host_permissions for both
+    // domains. The service worker doesn't have that limitation, so we proxy
+    // through it via cshClassicFetch (background.js). Returns the same shape
+    // a raw fetch+text() would produce: { ok, status, url, text }. Same-origin
+    // fetches still go direct to avoid an unnecessary SW round trip on legacy
+    // *.my.salesforce.com orgs.
+    function _fetchClassicPage(url) {
+        var sameOrigin = (function () {
+            try { return new URL(url).origin === location.origin; }
+            catch (_) { return false; }
+        })();
+        if (sameOrigin) {
+            return fetch(url, { credentials: 'include' }).then(function (r) {
+                return r.text().then(function (text) {
+                    return { ok: r.ok, status: r.status, url: r.url, text: text };
+                });
+            });
+        }
+        return new Promise(function (resolve, reject) {
+            chrome.runtime.sendMessage({ type: 'cshClassicFetch', url: url }, function (resp) {
+                if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                    return;
+                }
+                if (!resp) {
+                    reject(new Error('cshClassicFetch: no response from service worker'));
+                    return;
+                }
+                if (resp.error) {
+                    reject(new Error(resp.error));
+                    return;
+                }
+                resolve({ ok: resp.ok, status: resp.status, url: resp.finalUrl || url, text: resp.text || '' });
+            });
+        });
+    }
     async function syncFromChangeSetView(changeSetId, packageId) {
         if (!packageId) throw new Error('syncFromChangeSetView: packageId required');
         var items = [];
-        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', location.href).href;
+        var appOrigin = _appOriginForChangeSetView();
+        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
         var safety = 200;
         var pageNum = 0;
         while (nextUrl && safety-- > 0) {
             pageNum++;
-            var r = await fetch(nextUrl, { credentials: 'include' });
+            var r = await _fetchClassicPage(nextUrl);
             if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
-            var html = await r.text();
+            var html = r.text;
             var doc = new DOMParser().parseFromString(html, 'text/html');
             var table = doc.querySelector('table.list');
             if (!table) {
@@ -1343,6 +1397,23 @@
                 'dropped=', dropped, 'headerIdx=', idx);
             var nextHref = _findNextPageHrefInDoc(doc);
             nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
+        }
+        // Zero scraped rows from a page that DID parse (table.list was found,
+        // else page-1 would have thrown above) means Salesforce served us a
+        // Lightning shell / unexpected layout, not a genuinely empty change
+        // set. Calling syncItemsFromServer with authoritative:true would be
+        // refused by its own defensive guard — skipping here keeps the log
+        // clean and avoids masking real work under a downstream warning.
+        // Callers see a zero-count summary and the preceding per-page log
+        // makes the cause (row dropped counts / headerIdx / shell response)
+        // easy to diagnose when it matters.
+        if (items.length === 0) {
+            console.warn('[CSH] Add-page authoritative sync: zero rows scraped from ' +
+                         new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href +
+                         ' — skipping authoritative prune to preserve cart state. ' +
+                         'Likely causes: Lightning-shell response, wrong id kind (0A2 vs 033), ' +
+                         'or classic-DOM selectors not matching this org\'s rendered rows.');
+            return { count: 0, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
         }
         // Write to every distinct key so both the Add page (033 MetadataPackage
         // id) and the Detail page (0A2 outbound change-set id) see the same

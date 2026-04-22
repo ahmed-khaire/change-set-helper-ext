@@ -93,14 +93,12 @@ table.list tr.csh-diff-same > td:first-child {
     padding: 3px 10px;
 }
 
-/* Hide Salesforce's alphabet quick-nav (A | B | C | ... | Other | All) from
-   the rolodex bar. The DataTables column-level search inputs we add to the
-   table footer supersede it, and leaving the alphabet visible just crowds
-   the row that now hosts the unified Actions group. */
-div.rolodex .listItem,
-div.rolodex .listItems {
-    display: none !important;
-}
+/* Leave Salesforce's native alphabet quick-nav (A | B | C | ... | Other |
+   All) visible on the rolodex bar. It lives alongside our toolbar actions
+   and provides a working fallback when the extension-enhanced table fails
+   to render (Lightning shell edge cases, cross-origin hiccups, etc.) —
+   users can still narrow the native rolodex by first letter and add
+   components the classic way. */
 
 /* Phase 7 — Detail page Components block: selection column + bulk remove
    + filter/search. Targets the inline components table on

@@ -2413,19 +2413,41 @@ var ENABLE_PAGINATION_THRESHOLD = 1500; // Enable DataTables paging above this t
 // sibling VF origin — both the top frame AND those iframes match our
 // manifest pattern, so all_frames:true injects our content script in each
 // and we end up rendering multiple spinners / carts / toolbars. Detect the
-// nested-duplicate case via document.referrer and short-circuit everything.
-// Lightning's wrapper top-frame URL doesn't match our pattern, so iframes
-// there still initialise correctly.
+// sibling-nested case by reading the PARENT frame's URL and short-circuit
+// everything in that case.
+//
+// Why parent URL, not document.referrer: referrer reflects the previous
+// navigation within the SAME frame, not the embedding context. In Lightning
+// the Add page lives inside an iframe; when the user switches entity types
+// on the picker dropdown, the iframe re-navigates within itself. After the
+// switch, document.referrer becomes the *previous* AddToPackage URL, which
+// matched the old regex and made every post-switch navigation silently
+// skip init — users saw the extension disappear the moment they changed
+// picker selection in Lightning.
+//
+// Parent URL behaves correctly in both scenarios:
+//   - Classic sibling-iframe: parent IS the top Add page, same origin, the
+//     cross-frame read succeeds and matches the AddToPackage pattern → skip.
+//   - Lightning wrapper (Aura / Aloha): parent is a different eTLD (lightning
+//     .force.com, salesforce-setup.com, etc.), the read throws SecurityError,
+//     we catch it and treat ourselves as the primary iframe → run.
+// Top frame short-circuit stays: top is never a nested duplicate.
 var cshIsNestedDuplicate = (function () {
     if (window === window.top) return false;
     try {
-        var ref = document.referrer || '';
-        if (/\/p\/mfpkg\/AddToPackage(FromChangeMgmtUi|Ui)/i.test(ref)) {
-            console.log('csh: skipping init — nested frame whose parent is also AddToPackage');
+        var parentUrl = window.parent.location.href;
+        if (/\/p\/mfpkg\/AddToPackage(FromChangeMgmtUi|Ui)/i.test(parentUrl)) {
+            console.log('csh: skipping init — parent frame is also an AddToPackage page');
             return true;
         }
-    } catch (_) {}
-    return false;
+        // Same-origin parent that isn't AddToPackage — we're embedded by
+        // something unrelated; run normally.
+        return false;
+    } catch (_) {
+        // Cross-origin parent (Lightning shell, split-domain Setup wrapper,
+        // etc.) — we're the primary Add iframe, run normally.
+        return false;
+    }
 })();
 
 if (cshIsNestedDuplicate) {
