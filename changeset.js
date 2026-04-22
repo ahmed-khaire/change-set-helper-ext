@@ -5,8 +5,16 @@ var numCallsInProgress = 0;
 var totalComponentCount = 0; // Track total rows loaded for pagination decisions
 var isLoadingMorePages = false; // Flag to indicate we're still loading pages in background
 var cachedMetadataResults = []; // Store metadata results to reuse during pagination
+var cachedMetadataIds = new Set(); // Companion to cachedMetadataResults for O(1) dedup
 var dynamicColumns = null; // Store dynamic column configuration based on metadata properties
 var resolvedMetadataType = null; // Metadata API type name resolved via override map or describeMetadata cache
+
+// Verbose per-call diagnostic logs. Off in production because on big orgs
+// (Custom Fields / Layouts / RecordTypes) processListResults and
+// applyMetadataToRows each emit a burst of structured logs — stringification
+// cost is non-trivial with DevTools open and the noise drowns useful signal.
+// Flip to true while debugging a user report.
+var CSH_DEBUG = false;
 
 // Compare functionality column indices (set dynamically after table setup)
 var compareColumnIndices = {
@@ -551,11 +559,12 @@ function processListResults(response) {
     var len = results ? results.length : 0;
     console.log('Processing', len, 'metadata results from JSforce');
 
-    // Log first few results to see data structure
+    // Log first few results to see data structure. Gated: the object print
+    // stringifies the full record, which is costly when fired per batch.
     if (len > 0) {
-        console.log('First JSforce result:', results[0]);
+        if (CSH_DEBUG) console.log('First JSforce result:', results[0]);
         if (len > 1) {
-            console.log('Second JSforce result:', results[1]);
+            if (CSH_DEBUG) console.log('Second JSforce result:', results[1]);
         }
 
         // Determine dynamic columns from the union of all records (only once)
@@ -612,11 +621,17 @@ function processListResults(response) {
         // a popup on top of that would be redundant noise.
     }
 
-    // Cache metadata results for reuse during pagination
-    // Merge new results with cached results (dedupe by id)
+    // Cache metadata results for reuse during pagination. Dedup via the
+    // companion Set for O(1) checks — the prior Array.findIndex scan was
+    // O(cacheSize) per record, which on big-org Custom Fields (30k+ records
+    // delivered by the fast path in one batch) dominated per-call time at
+    // roughly 450M string compares on the main thread before the apply
+    // loop even started.
     for (i = 0; i < len; i++) {
-        var existingIndex = cachedMetadataResults.findIndex(r => r.id === results[i].id);
-        if (existingIndex === -1) {
+        var rid = results[i] && results[i].id;
+        if (!rid) continue;
+        if (!cachedMetadataIds.has(rid)) {
+            cachedMetadataIds.add(rid);
             cachedMetadataResults.push(results[i]);
         }
     }
@@ -659,59 +674,84 @@ function applyMetadataToRows(results) {
     console.log('========================================');
     console.log('applyMetadataToRows: Processing', results.length, 'metadata records');
 
-    // Log first metadata record to see structure
-    if (results.length > 0) {
-        console.log('Sample metadata record:', {
-            id: results[0].id,
-            fullName: results[0].fullName,
-            lastModifiedDate: results[0].lastModifiedDate,
-            lastModifiedByName: results[0].lastModifiedByName,
-            createdDate: results[0].createdDate,
-            createdByName: results[0].createdByName
-        });
-    }
+    // Diagnostic snapshots of the first metadata record + the DOM side of
+    // the join. Useful when triaging a user report, noisy otherwise — each
+    // fires on every fast-path batch and on every pagination page re-apply,
+    // which on big orgs means 30+ bursts of structured logs per selection.
+    if (CSH_DEBUG) {
+        if (results.length > 0) {
+            console.log('Sample metadata record:', {
+                id: results[0].id,
+                fullName: results[0].fullName,
+                lastModifiedDate: results[0].lastModifiedDate,
+                lastModifiedByName: results[0].lastModifiedByName,
+                createdDate: results[0].createdDate,
+                createdByName: results[0].createdByName
+            });
+        }
 
-    // Log table structure
-    var sampleRow = $("table.list tr.dataRow").first();
-    if (sampleRow.length > 0) {
-        var cellCount = sampleRow.find('td').length;
-        console.log('Sample row has', cellCount, 'cells');
+        var sampleRow = $("table.list tr.dataRow").first();
+        if (sampleRow.length > 0) {
+            var cellCount = sampleRow.find('td').length;
+            console.log('Sample row has', cellCount, 'cells');
+            var cellContents = [];
+            sampleRow.find('td').each(function(index) {
+                var text = $(this).text().trim();
+                cellContents.push(index + ':' + (text.substring(0, 20) || 'empty'));
+            });
+            console.log('Sample row cells:', cellContents.join(' | '));
+        }
 
-        // Log each cell content
-        var cellContents = [];
-        sampleRow.find('td').each(function(index) {
+        var headers = [];
+        $("table.list thead tr th, table.list thead tr td").each(function(index) {
             var text = $(this).text().trim();
-            cellContents.push(index + ':' + (text.substring(0, 20) || 'empty'));
+            var linkText = $(this).find('a').text().trim();
+            headers.push(index + ':' + (linkText || text || 'empty'));
         });
-        console.log('Sample row cells:', cellContents.join(' | '));
+        console.log('Table headers:', headers.join(' | '));
     }
 
-    // Log header structure
-    var headers = [];
-    $("table.list thead tr th, table.list thead tr td").each(function(index) {
-        var text = $(this).text().trim();
-        var linkText = $(this).find('a').text().trim();
-        headers.push(index + ':' + (linkText || text || 'empty'));
-    });
-    console.log('Table headers:', headers.join(' | '));
+    // Build a value → row lookup ONCE per call. Salesforce renders every
+    // dataRow with a row-selection <input> whose value is the 15-char
+    // Salesforce Id we match against. Indexing up front turns the per-record
+    // match from an O(rows) DOM scan (jQuery's `input[value=…]` attribute
+    // selector has no attribute index and walks every <input>) into an O(1)
+    // hash lookup. On big orgs this was the dominant freeze: with 30k
+    // CustomField metadata records and an eventually-30k-row DOM after
+    // auto-pagination, the old path executed on the order of 900M DOM
+    // visits across all applyMetadataToRows invocations in the session.
+    var rowByInputValue = new Map();
+    var dataRowInputs = document.querySelectorAll('table.list tr.dataRow input');
+    for (var rbi = 0; rbi < dataRowInputs.length; rbi++) {
+        var inp = dataRowInputs[rbi];
+        if (!inp || !inp.value) continue;
+        // First <input> per row wins — its value is the 15-char Id Salesforce
+        // uses for the selection checkbox. Later inputs in the same row (hidden
+        // 18-char variants, etc.) are ignored so a later sibling can't overwrite
+        // the mapping with a stale / unrelated row reference.
+        if (!rowByInputValue.has(inp.value)) {
+            var r = inp.closest('tr');
+            if (r) rowByInputValue.set(inp.value, r);
+        }
+    }
 
     for (i = 0; i < results.length; i++) {
         // Normalize ID to 15 characters (Salesforce IDs can be 15 or 18 chars)
         // 18-char IDs are just 15-char IDs with a 3-char case-safe suffix
         shortid = results[i].id.substring(0, 15);
-        var matchingInput = $("input[value='" + shortid + "']");
+        var rowEl = rowByInputValue.get(shortid);
 
         // If not found with 15-char ID, try the full 18-char ID if available
-        if (matchingInput.length === 0 && results[i].id.length === 18) {
-            matchingInput = $("input[value='" + results[i].id + "']");
+        if (!rowEl && results[i].id.length === 18) {
+            rowEl = rowByInputValue.get(results[i].id);
         }
 
-        if (matchingInput.length === 0) {
-            if (i === 0) console.log('First metadata record: No matching row found for ID:', shortid, 'or', results[i].id);
+        if (!rowEl) {
+            if (CSH_DEBUG && i === 0) console.log('First metadata record: No matching row found for ID:', shortid, 'or', results[i].id);
             continue;
         }
 
-        var row = matchingInput.first().closest('tr');
+        var row = $(rowEl);
 
         // Dynamic columns start AFTER every cell Salesforce originally rendered
         // in this row (Name + optional Type + optional ParentObject + ...).
@@ -721,8 +761,8 @@ function applyMetadataToRows(results) {
             ? cshOriginalRowCellCount
             : (typeColumn.length > 0 ? 2 : 1);
 
-        // Log first row update
-        if (i === 0) {
+        // First-record diagnostic trace. Gated — only useful when triaging.
+        if (CSH_DEBUG && i === 0) {
             console.log('Updating first row:');
             console.log('  - typeColumn exists:', typeColumn.length > 0);
             console.log('  - Base column count (td cells before dynamic):', baseColumnCount);
@@ -736,7 +776,7 @@ function applyMetadataToRows(results) {
             var nameCell = row.children('td:eq(0)');
             nameCell.attr("data-fullName", results[i].fullName);
             nameCell.addClass("fullNameClass");
-            if (i === 0) {
+            if (CSH_DEBUG && i === 0) {
                 console.log('  - Stored fullName on Name column (td index 0):', results[i].fullName);
             }
         }
@@ -748,8 +788,7 @@ function applyMetadataToRows(results) {
                 var cellIndex = baseColumnCount + colIdx;
                 var value = results[i][column.propertyName];
 
-                // Log first row details - BEFORE formatting
-                if (i === 0) {
+                if (CSH_DEBUG && i === 0) {
                     console.log('  - Column', colIdx, '(' + column.propertyName + '): raw value =', value, ', isDate =', column.isDate);
                 }
 
@@ -765,8 +804,7 @@ function applyMetadataToRows(results) {
                 var cell = row.children('td:eq(' + cellIndex + ')');
                 cell.text(value);
 
-                // Log first row details - AFTER formatting
-                if (i === 0) {
+                if (CSH_DEBUG && i === 0) {
                     console.log('    → Writing to cell index', cellIndex, ':', value);
                 }
             }
@@ -780,7 +818,7 @@ function applyMetadataToRows(results) {
         if (results[i].folder) {
             var folderCell = row.children('td:eq(' + compareColumnsStartIndex + ')');
             folderCell.text(results[i].folder);
-            if (i === 0) {
+            if (CSH_DEBUG && i === 0) {
                 console.log('  - Populated folder cell at index', compareColumnsStartIndex, ':', results[i].folder);
             }
         }
@@ -2384,6 +2422,7 @@ function deployLogout() {
 
 // Clear cached metadata and dynamic columns for fresh load
 cachedMetadataResults = [];
+cachedMetadataIds = new Set();
 dynamicColumns = null; // Reset so next entity type can determine its own columns
 
 var selectedEntityType = $('#entityType').val();
