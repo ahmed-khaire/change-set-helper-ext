@@ -1444,18 +1444,14 @@
         if (panel) return panel;
         panel = document.createElement('div');
         panel.id = 'csh-cart-panel';
-        // On the Change Set Detail page the user isn't actively adding items,
-        // they're reviewing an already-populated cart — default to collapsed
-        // so the panel doesn't cover the component table on load. The header
-        // bar stays visible and one click on "–" expands it. The Add
-        // Components pages keep the default expanded state because that's
-        // where cart-building actually happens.
-        if (/\/changemgmt\/outboundChangeSetDetailPage\.apexp/i.test(location.pathname)) {
-            panel.classList.add('csh-cart-collapsed');
-        }
+        // Default to collapsed on all pages — the header bar stays visible
+        // and one click on "–" expands it. Avoids covering the component
+        // table on the Change Set Detail page and the Add Components grid
+        // on load.
+        panel.classList.add('csh-cart-collapsed');
         panel.innerHTML =
             '<div class="csh-cart-header">' +
-              '<span class="csh-cart-title">Change Set Cart</span>' +
+              '<span class="csh-cart-title">Change Set Details</span>' +
               '<button class="csh-cart-toggle-all" title="Collapse/expand all groups" aria-label="Collapse or expand all groups">⇅</button>' +
               '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
             '</div>' +
@@ -1718,10 +1714,14 @@
             document.body.appendChild(panel);
         }
         panel.classList.add('csh-cart-ext-dead');
+        // The banner replaces the header with a non-toggleable one, so if
+        // the panel was left collapsed by ensurePanel() the reload message
+        // in the body would be hidden with no way to open it.
+        panel.classList.remove('csh-cart-collapsed');
         panel.style.display = '';
         panel.innerHTML =
             '<div class="csh-cart-header">' +
-              '<span class="csh-cart-title">Change Set Cart</span>' +
+              '<span class="csh-cart-title">Change Set Details</span>' +
             '</div>' +
             '<div class="csh-cart-body">' +
               '<div class="csh-cart-empty" style="padding:14px 12px;line-height:1.4;">' +
@@ -1784,7 +1784,7 @@
         panel.classList.toggle('csh-cart-sync-error', syncState === 'error');
         var titleEl = panel.querySelector('.csh-cart-title');
         if (titleEl) {
-            var base = 'Change Set Cart';
+            var base = 'Change Set Details';
             if (syncState === 'syncing') {
                 titleEl.innerHTML = escapeHtml(base) +
                     ' <span class="csh-cart-sync-badge">· Syncing' +
