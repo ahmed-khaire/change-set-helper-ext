@@ -201,8 +201,7 @@
                 var cid = null;
                 var href = findDelLinkInRow(row);
                 if (href) {
-                    var m = href.match(/[?&]cid=([^&]+)/i);
-                    if (m) cid = decodeURIComponent(m[1]);
+                    cid = extractCidFromDelHref(href);
                 }
                 if (!cid) cid = findCidInRowAnchors(row, packageId, idx.name);
                 if (!cid) { dropped.noCid++; return; }
@@ -1038,6 +1037,14 @@
                     (doc.querySelector('title') || {}).textContent,
                     'html snippet:', html.slice(0, 500));
             }
+            var header = doc.querySelector('table.list tr.headerRow');
+            var idx = { name: -1 };
+            if (header) {
+                Array.prototype.forEach.call(header.children, function (cell, i) {
+                    var text = (cell.textContent || '').trim().toLowerCase();
+                    if ((text === 'name' || text === 'component name') && idx.name === -1) idx.name = i;
+                });
+            }
             var rowsKept = 0;
             rows.forEach(function (row) {
                 var href = findDelLinkInRow(row);
@@ -1053,6 +1060,16 @@
                 // lookup misses.
                 map.set(rawCid, absHref);
                 if (rawCid.length === 18) map.set(rawCid.slice(0, 15), absHref);
+                // Side-cart rows can carry the underlying metadata component
+                // id (for example 01p ApexClass) rather than the 034 package
+                // component id used by Salesforce's remove URL. Alias the
+                // row's component-link id to the same delete URL so both
+                // sources can remove the row.
+                var componentId = findCidInRowAnchors(row, csId, idx.name);
+                if (componentId && componentId !== rawCid) {
+                    map.set(componentId, absHref);
+                    if (componentId.length === 18) map.set(componentId.slice(0, 15), absHref);
+                }
                 rowsKept++;
             });
             // If we saw rows but matched nothing, the Action anchor shape has

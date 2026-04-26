@@ -5,7 +5,9 @@
     right: 16px;
     bottom: 16px;
     width: 420px;
-    max-height: calc(100vh - 120px);
+    min-height: 260px;
+    height: min(680px, calc(100vh - 96px));
+    max-height: calc(100vh - 48px);
     background: #fff;
     border: 1px solid #c9c9c9;
     border-radius: 6px;
@@ -15,6 +17,7 @@
     flex-direction: column;
     font: 12px/1.35 "Salesforce Sans", Arial, sans-serif;
     color: #2b2826;
+    overflow: hidden;
 }
 
 /* Orphaned content script — extension reloaded while this tab was open. */
@@ -34,6 +37,11 @@
     display: none;
 }
 
+#csh-cart-panel.csh-cart-collapsed {
+    height: auto;
+    min-height: 0;
+}
+
 #csh-cart-panel .csh-cart-header {
     display: flex;
     align-items: center;
@@ -43,7 +51,6 @@
     color: #fff;
     border-radius: 5px 5px 0 0;
     font-weight: 600;
-    cursor: move;
 }
 
 #csh-cart-panel .csh-cart-title { flex: 1 1 auto; }
@@ -100,6 +107,7 @@
 #csh-cart-panel .csh-cart-body {
     padding: 8px 10px;
     overflow-y: auto;
+    min-height: 180px;
     flex: 1 1 auto;
 }
 

@@ -437,6 +437,39 @@
         });
     }
 
+    async function getItemByUid(changeSetId, uid) {
+        var { cart } = await getCart(changeSetId);
+        return (cart.items || []).find(function (it) { return it.uid === uid; }) || null;
+    }
+
+    async function removeDoneItemFromServerAndCart(changeSetId, uid) {
+        var item = await getItemByUid(changeSetId, uid);
+        if (!item) return;
+        if (item.status !== 'done') {
+            await removeItem(changeSetId, uid);
+            return;
+        }
+        var label = bestDisplayName(item);
+        if (!item.salesforceId) {
+            window.cshToast && window.cshToast.show(
+                'Cannot remove "' + label + '" from Salesforce because its component id is missing.',
+                { type: 'error' }
+            );
+            return;
+        }
+        if (!confirm('Remove "' + label + '" from this change set? This cannot be undone.')) return;
+        if (window.cshChangeSetOps && window.cshChangeSetOps.removeById) {
+            await window.cshChangeSetOps.removeById(item.salesforceId);
+        } else {
+            await removeDoneItemViaClassicView(changeSetId, item);
+        }
+        await removeItem(changeSetId, uid);
+        window.cshToast && window.cshToast.show(
+            'Removed "' + label + '" from the change set.',
+            { type: 'success', duration: 3000 }
+        );
+    }
+
     // Unticks every currently-rendered row checkbox. Used by the "Clear
     // cart" paths that wipe staged items en masse — any checkbox visible
     // in the current DataTable view corresponds to a staged (or paused)
@@ -1231,16 +1264,36 @@
     // page's panel stayed empty until the user had first visited the Detail
     // page and the dual-key sync had happened to land on the 033 key.
     // -----------------------------------------------------------------------
+    var PACKAGE_ID_RE = /^033[A-Za-z0-9]{12,15}$/;
+
     function _findDelHrefInRow(rowEl) {
         var candidates = rowEl.querySelectorAll('a, button');
         for (var i = 0; i < candidates.length; i++) {
             var el = candidates[i];
             var txt = (el.textContent || '').trim();
+            var title = (el.getAttribute('title') || '').trim();
             var href = el.getAttribute('href') || '';
-            if (/^del\b/i.test(txt)) return href;
-            if (/listComponentRemoveForPackage|outboundChangeSetComponentRemove/i.test(href)) return href;
+            var onclick = el.getAttribute('onclick') || '';
+            if (/^(del|remove)\b/i.test(txt) || /^(del|remove)\b/i.test(title)) {
+                if (/[?&](?:cid|delID)=/i.test(href)) return href;
+                var fromOnclick = _extractCidUrlFromAttr(onclick);
+                if (fromOnclick) return fromOnclick;
+            }
+            if (/listComponentRemoveForPackage|outboundChangeSetComponentRemove|listComponentRemove|removeComponent|componentRemove|componentDelete|deleteredirect\.jsp/i.test(href)) return href;
         }
         return null;
+    }
+
+    function _extractCidUrlFromAttr(str) {
+        if (!str) return null;
+        var m = str.match(/['"]((?:[^'"]+)\?[^'"]*\b(?:cid|delID)=[^'"]+)['"]/i);
+        return m ? m[1] : null;
+    }
+
+    function _extractCidFromDelHref(href) {
+        if (!href) return null;
+        var m = href.match(/[?&](?:cid|delID)=([^&]+)/i);
+        return m ? decodeURIComponent(m[1]) : null;
     }
     // Extract a 15/18-char Salesforce ID from anchor hrefs in the row. Used as
     // a fallback when the view has no Del link (e.g., the classic Package
@@ -1378,8 +1431,7 @@
                 var cid = null;
                 var href = _findDelHrefInRow(row);
                 if (href) {
-                    var m = href.match(/[?&]cid=([^&]+)/i);
-                    if (m) cid = decodeURIComponent(m[1]);
+                    cid = _extractCidFromDelHref(href);
                 }
                 if (!cid) cid = _findCidInRowAnchors(row, packageId, idx.name);
                 if (!cid) { dropped.noCid++; return; }
@@ -1436,6 +1488,144 @@
         return summary;
     }
 
+    function _id15(id) {
+        return id ? String(id).slice(0, 15) : '';
+    }
+
+    async function _resolvePackageIdForServerRemove(changeSetId) {
+        if (changeSetId && PACKAGE_ID_RE.test(changeSetId)) return changeSetId;
+        if (window.cshIdMap && changeSetId) {
+            var cached = await window.cshIdMap.getPackageId(changeSetId);
+            if (cached && PACKAGE_ID_RE.test(cached)) return cached;
+        }
+        var inputs = document.querySelectorAll('input');
+        for (var i = 0; i < inputs.length; i++) {
+            var val = inputs[i].value || '';
+            if (PACKAGE_ID_RE.test(val)) return val;
+        }
+        var bodyMatch = (document.body && document.body.innerHTML || '').match(/033[A-Za-z0-9]{12,15}/);
+        return bodyMatch ? bodyMatch[0] : null;
+    }
+
+    async function _findClassicRemoveHref(packageId, item) {
+        var appOrigin = _appOriginForChangeSetView();
+        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
+        var wantedId = _id15(item.salesforceId);
+        var wantedName = String(item.fullName || item.name || '').trim();
+        var safety = 200;
+        while (nextUrl && safety-- > 0) {
+            var r = await _fetchClassicPage(nextUrl);
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
+            var doc = new DOMParser().parseFromString(r.text, 'text/html');
+            var table = doc.querySelector('table.list');
+            if (!table) throw new Error('No table.list on classic components view (' + r.url + ')');
+            var header = table.querySelector('tr.headerRow');
+            var idx = { name: -1, fullName: -1 };
+            if (header) {
+                Array.prototype.forEach.call(header.children, function (cell, i) {
+                    var text = (cell.textContent || '').trim().toLowerCase();
+                    if ((text === 'name' || text === 'component name') && idx.name === -1) idx.name = i;
+                    else if ((text === 'api name' || text === 'full name') && idx.fullName === -1) idx.fullName = i;
+                });
+            }
+            var rows = table.querySelectorAll('tr.dataRow');
+            for (var i = 0; i < rows.length; i++) {
+                var row = rows[i];
+                var href = _findDelHrefInRow(row);
+                if (!href) continue;
+                var delId = _id15(_extractCidFromDelHref(href));
+                var componentId = _id15(_findCidInRowAnchors(row, packageId, idx.name));
+                var cells = row.children;
+                var rowName = idx.name >= 0 && cells[idx.name] ? (cells[idx.name].textContent || '').trim() : '';
+                var rowFullName = idx.fullName >= 0 && cells[idx.fullName] ? (cells[idx.fullName].textContent || '').trim() : '';
+                var idMatches = wantedId && (wantedId === delId || wantedId === componentId);
+                var nameMatches = wantedName && (wantedName === rowName || wantedName === rowFullName);
+                if (idMatches || nameMatches) {
+                    return new URL(href, nextUrl).href;
+                }
+            }
+            var nextHref = _findNextPageHrefInDoc(doc);
+            nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
+        }
+        throw new Error('Remove URL not found for ' + (item.fullName || item.name || item.salesforceId));
+    }
+
+    function _submitClassicForm(action, method, body) {
+        method = (method || 'POST').toUpperCase();
+        var sameOrigin = (function () {
+            try { return new URL(action).origin === location.origin; }
+            catch (_) { return false; }
+        })();
+        if (sameOrigin) {
+            return fetch(action, {
+                method: method,
+                credentials: 'include',
+                redirect: 'follow',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString()
+            });
+        }
+        return new Promise(function (resolve, reject) {
+            chrome.runtime.sendMessage({
+                type: 'cshClassicFormSubmit',
+                url: action,
+                method: method,
+                body: body.toString()
+            }, function (resp) {
+                if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                if (!resp) return reject(new Error('cshClassicFormSubmit: no response from service worker'));
+                resolve({
+                    ok: !!resp.ok,
+                    status: resp.status,
+                    url: resp.finalUrl || action,
+                    text: function () { return Promise.resolve(resp.text || ''); }
+                });
+            });
+        });
+    }
+
+    async function _deleteViaClassicHref(delHref) {
+        var isOneShotRedirect = /\/setup\/own\/deleteredirect\.jsp/i.test(delHref);
+        var r = await _fetchClassicPage(delHref);
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' on confirm page');
+        if (isOneShotRedirect) return;
+        var doc = new DOMParser().parseFromString(r.text, 'text/html');
+        var forms = doc.querySelectorAll('form');
+        if (forms.length === 0) return;
+        var form = null;
+        for (var i = 0; i < forms.length; i++) {
+            var f = forms[i];
+            var actionHint = (f.getAttribute('action') || '').toLowerCase();
+            if (/remove|delete|listremove|listcomponentremove/.test(actionHint) ||
+                f.querySelector('input[type="submit"][name*="ave" i]') ||
+                f.querySelector('input[type="submit"][value*="OK" i]')) {
+                form = f; break;
+            }
+        }
+        if (!form) form = forms[0];
+        var action = new URL(form.getAttribute('action') || delHref, delHref).href;
+        var method = (form.getAttribute('method') || 'POST').toUpperCase();
+        var body = new URLSearchParams();
+        form.querySelectorAll('input[type="hidden"], input[type="text"]').forEach(function (inp) {
+            if (inp.name) body.append(inp.name, inp.value);
+        });
+        var submit = form.querySelector('input[type="submit"][name]');
+        if (submit) body.append(submit.name, submit.value);
+        var r2 = await _submitClassicForm(action, method, body);
+        if (!r2.ok && !(r2.status >= 300 && r2.status < 400)) {
+            throw new Error('HTTP ' + r2.status + ' on confirm POST');
+        }
+    }
+
+    async function removeDoneItemViaClassicView(changeSetId, item) {
+        var packageId = await _resolvePackageIdForServerRemove(changeSetId);
+        if (!packageId) {
+            throw new Error('Could not resolve 033 MetadataPackage id for server-side removal');
+        }
+        var href = await _findClassicRemoveHref(packageId, item);
+        await _deleteViaClassicHref(href);
+    }
+
     // -----------------------------------------------------------------------
     // Floating panel UI
     // -----------------------------------------------------------------------
@@ -1444,18 +1634,14 @@
         if (panel) return panel;
         panel = document.createElement('div');
         panel.id = 'csh-cart-panel';
-        // On the Change Set Detail page the user isn't actively adding items,
-        // they're reviewing an already-populated cart — default to collapsed
-        // so the panel doesn't cover the component table on load. The header
-        // bar stays visible and one click on "–" expands it. The Add
-        // Components pages keep the default expanded state because that's
-        // where cart-building actually happens.
-        if (/\/changemgmt\/outboundChangeSetDetailPage\.apexp/i.test(location.pathname)) {
-            panel.classList.add('csh-cart-collapsed');
-        }
+        // Default to collapsed on all pages — the header bar stays visible
+        // and one click on "–" expands it. Avoids covering the component
+        // table on the Change Set Detail page and the Add Components grid
+        // on load.
+        panel.classList.add('csh-cart-collapsed');
         panel.innerHTML =
             '<div class="csh-cart-header">' +
-              '<span class="csh-cart-title">Change Set Cart</span>' +
+              '<span class="csh-cart-title">Change Set Details</span>' +
               '<button class="csh-cart-toggle-all" title="Collapse/expand all groups" aria-label="Collapse or expand all groups">⇅</button>' +
               '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
             '</div>' +
@@ -1718,10 +1904,14 @@
             document.body.appendChild(panel);
         }
         panel.classList.add('csh-cart-ext-dead');
+        // The banner replaces the header with a non-toggleable one, so if
+        // the panel was left collapsed by ensurePanel() the reload message
+        // in the body would be hidden with no way to open it.
+        panel.classList.remove('csh-cart-collapsed');
         panel.style.display = '';
         panel.innerHTML =
             '<div class="csh-cart-header">' +
-              '<span class="csh-cart-title">Change Set Cart</span>' +
+              '<span class="csh-cart-title">Change Set Details</span>' +
             '</div>' +
             '<div class="csh-cart-body">' +
               '<div class="csh-cart-empty" style="padding:14px 12px;line-height:1.4;">' +
@@ -1784,7 +1974,7 @@
         panel.classList.toggle('csh-cart-sync-error', syncState === 'error');
         var titleEl = panel.querySelector('.csh-cart-title');
         if (titleEl) {
-            var base = 'Change Set Cart';
+            var base = 'Change Set Details';
             if (syncState === 'syncing') {
                 titleEl.innerHTML = escapeHtml(base) +
                     ' <span class="csh-cart-sync-badge">· Syncing' +
@@ -1859,12 +2049,12 @@
                     (secondary && !virtualized ? '<div class="csh-cart-item-subname">' + escapeHtml(secondary) + '</div>' : '') +
                   '</div>' +
                   '<span class="csh-cart-item-status">' + statusLabel(it) + '</span>' +
-                  // 'done' (= already added to the change set) rows have no
-                  // × button. Removing those locally doesn't delete them
-                  // server-side — the next background sync just re-inserts
-                  // them — so the button was misleading. Removal of added
-                  // components lives on the Detail page's bulk-remove
-                  // toolbar instead.
+                  (it.status === 'done'
+                    ? '<button class="csh-cart-remove" data-server-remove="1" title="' + escapeAttr(removeTitle(it)) + '">x</button>'
+                    : '') +
+                  // Non-done rows remove locally. Done rows remove from
+                  // Salesforce first, using cshChangeSetOps on the Detail
+                  // page or the classic PackageComponents fallback elsewhere.
                   (it.status === 'done'
                     ? ''
                     : '<button class="csh-cart-remove" title="' + escapeAttr(removeTitle(it)) + '"' +
@@ -2121,7 +2311,19 @@
             var li = btn.closest('.csh-cart-item');
             if (!li) return;
             var csId = currentChangeSetId();
-            if (csId) removeItem(csId, li.getAttribute('data-uid'));
+            if (!csId) return;
+            if (btn.getAttribute('data-server-remove') === '1') {
+                btn.disabled = true;
+                removeDoneItemFromServerAndCart(csId, li.getAttribute('data-uid'))
+                    .catch(function (err) {
+                        btn.disabled = false;
+                        var msg = (err && err.message) || String(err);
+                        console.error('[CSH] cart server remove failed:', err);
+                        window.cshToast && window.cshToast.show('Remove failed: ' + msg, { type: 'error' });
+                    });
+                return;
+            }
+            removeItem(csId, li.getAttribute('data-uid'));
         });
     }
 
@@ -2145,9 +2347,9 @@
         if (it.status === 'submitting') return 'Submission in progress — cannot remove yet';
         if (it.status === 'done') {
             if (it.source === 'server-sync') {
-                return 'Remove from cart only (still in change set on server)';
+                return 'Remove from change set';
             }
-            return 'Remove from cart (still in change set on server)';
+            return 'Remove from change set';
         }
         return 'Remove';
     }
