@@ -218,6 +218,21 @@ function cshSameOrigin(urlA, urlB) {
     }
 }
 
+function cshMessageSenderUrl(sender) {
+    return (sender && sender.url) || (sender && sender.tab && sender.tab.url) || null;
+}
+
+function cshValidateSalesforceProxyRequest(requestUrl, sender) {
+    var senderUrl = cshMessageSenderUrl(sender);
+    if (!senderUrl || !cshIsTrustedSalesforceUrl(senderUrl)) {
+        return 'untrusted sender';
+    }
+    if (!requestUrl || !cshIsTrustedSalesforceUrl(requestUrl)) {
+        return 'untrusted url';
+    }
+    return null;
+}
+
 async function cshExchangeCodeForToken(host, code, codeVerifier) {
     var body = new URLSearchParams();
     body.append('grant_type', 'authorization_code');
@@ -965,6 +980,11 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                     sendResponse({ ok: false, error: 'cshClassicFetch: url required' });
                     return;
                 }
+                var fetchValidationError = cshValidateSalesforceProxyRequest(request.url, sender);
+                if (fetchValidationError) {
+                    sendResponse({ ok: false, error: 'cshClassicFetch: ' + fetchValidationError });
+                    return;
+                }
                 var resp = await fetch(request.url, {
                     method: 'GET',
                     credentials: 'include',
@@ -982,6 +1002,46 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                 });
             } catch (err) {
                 console.error('cshClassicFetch failed:', err);
+                sendResponse({ ok: false, error: err.message || String(err) });
+            }
+        })();
+        return true;
+    }
+
+    if (request.type == "cshClassicFormSubmit") {
+        // Cross-origin classic Salesforce form POST proxy. Used by cart.js on
+        // Add Components pages served from *.salesforce-setup.com when the
+        // actual PackageComponents delete form posts to *.salesforce.com.
+        (async function () {
+            try {
+                if (!request.url) {
+                    sendResponse({ ok: false, error: 'cshClassicFormSubmit: url required' });
+                    return;
+                }
+                var formValidationError = cshValidateSalesforceProxyRequest(request.url, sender);
+                if (formValidationError) {
+                    sendResponse({ ok: false, error: 'cshClassicFormSubmit: ' + formValidationError });
+                    return;
+                }
+                var resp = await fetch(request.url, {
+                    method: request.method || 'POST',
+                    credentials: 'include',
+                    redirect: 'follow',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: request.body || ''
+                });
+                var text = await resp.text().catch(function () { return ''; });
+                sendResponse({
+                    ok: resp.ok,
+                    status: resp.status,
+                    finalUrl: resp.url,
+                    text: text
+                });
+            } catch (err) {
+                console.error('cshClassicFormSubmit failed:', err);
                 sendResponse({ ok: false, error: err.message || String(err) });
             }
         })();

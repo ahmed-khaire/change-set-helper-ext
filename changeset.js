@@ -3058,7 +3058,10 @@ $(document).ready(function () {
     //   2. DOM scan — Salesforce embeds many "View Change Set" links and
     //      breadcrumbs back to the Detail page; the 0A2 appears in their
     //      hrefs even when retURL is missing.
-    var __cshPkgId = $('#id').val() || null;
+    var __cshPackageIdRe = /^033[A-Za-z0-9]{12,15}$/;
+    var __cshChangeSetIdRe = /^0A2[A-Za-z0-9]{12,15}$/;
+    var __cshRawId = $('#id').val() || null;
+    var __cshPkgId = (__cshRawId && __cshPackageIdRe.test(__cshRawId)) ? __cshRawId : null;
     var __cshCsId = null;
     var __cshRet = (location.search.match(/[?&]retURL=([^&]+)/) || [])[1];
     if (__cshRet) {
@@ -3077,6 +3080,20 @@ $(document).ready(function () {
             if (__cshMatch) { __cshCsId = __cshMatch[0]; break; }
         }
     }
+    if (!__cshCsId && __cshRawId && __cshChangeSetIdRe.test(__cshRawId)) {
+        __cshCsId = __cshRawId;
+    }
+    if (!__cshPkgId) {
+        var __cshAllInputs = document.querySelectorAll('input');
+        for (var __cshJ = 0; __cshJ < __cshAllInputs.length; __cshJ++) {
+            var __cshVal = __cshAllInputs[__cshJ].value || '';
+            if (__cshPackageIdRe.test(__cshVal)) { __cshPkgId = __cshVal; break; }
+        }
+    }
+    if (!__cshPkgId) {
+        var __cshBodyMatch = (document.body && document.body.innerHTML || '').match(/033[A-Za-z0-9]{12,15}/);
+        if (__cshBodyMatch) __cshPkgId = __cshBodyMatch[0];
+    }
 
     // Persist the 0A2 ↔ 033 mapping so the Detail page's authoritative cart
     // sync can resolve the package id without bouncing through a hidden
@@ -3092,7 +3109,7 @@ $(document).ready(function () {
     // guard, and renders the floating panel if there are pending items.
     if (window.cshCart && window.cshCart.init) {
         window.cshCart.init({
-            changeSetId: __cshPkgId,
+            changeSetId: __cshPkgId || __cshCsId || __cshRawId,
             currentType: selectedEntityType || null
         });
     }
@@ -3104,18 +3121,36 @@ $(document).ready(function () {
     //
     // Writes to both the 033 (Add-page) and 0A2 (Detail-page) storage keys
     // so the cart stays in sync across navigations.
-    if (window.cshCart && window.cshCart.syncFromChangeSetView && __cshPkgId) {
-        var __cshSetSync = window.cshCart.setSyncState || function () {};
-        __cshSetSync('syncing');
-        window.cshCart.syncFromChangeSetView(__cshCsId || __cshPkgId, __cshPkgId)
-            .then(function (r) {
-                console.log('[CSH] Add-page cart sync:', r);
+    if (window.cshCart && window.cshCart.syncFromChangeSetView) {
+        (async function () {
+            var __cshSetSync = window.cshCart.setSyncState || function () {};
+            if (!__cshPkgId && window.cshIdMap && __cshCsId) {
+                try {
+                    var __cshCachedPkg = await window.cshIdMap.getPackageId(__cshCsId);
+                    if (__cshCachedPkg && __cshPackageIdRe.test(__cshCachedPkg)) {
+                        __cshPkgId = __cshCachedPkg;
+                    }
+                } catch (e) {
+                    console.warn('cshIdMap.getPackageId failed:', e && e.message);
+                }
+            }
+            if (!__cshPkgId || !__cshPackageIdRe.test(__cshPkgId)) {
+                console.warn('[CSH] Add-page cart sync skipped: no 033 MetadataPackage id found. rawId=',
+                    __cshRawId, 'changeSetId=', __cshCsId);
                 __cshSetSync('idle');
-            })
-            .catch(function (e) {
-                console.warn('[CSH] Add-page cart sync failed:', e && e.message);
-                __cshSetSync('error', (e && e.message) || 'Sync failed');
-            });
+                return;
+            }
+            __cshSetSync('syncing');
+            window.cshCart.syncFromChangeSetView(__cshCsId || __cshPkgId, __cshPkgId)
+                .then(function (r) {
+                    console.log('[CSH] Add-page cart sync:', r);
+                    __cshSetSync('idle');
+                })
+                .catch(function (e) {
+                    console.warn('[CSH] Add-page cart sync failed:', e && e.message);
+                    __cshSetSync('error', (e && e.message) || 'Sync failed');
+                });
+        })();
     }
 });
 
