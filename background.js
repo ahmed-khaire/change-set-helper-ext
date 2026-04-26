@@ -196,6 +196,28 @@ function cshHostFromUrl(urlStr) {
     } catch (_) { return null; }
 }
 
+function cshIsTrustedSalesforceUrl(urlStr) {
+    try {
+        var u = new URL(urlStr);
+        if (u.protocol !== 'https:') return false;
+        var host = u.hostname.toLowerCase();
+        return host.endsWith('.salesforce.com') ||
+            host.endsWith('.force.com') ||
+            host.endsWith('.cloudforce.com') ||
+            host.endsWith('.salesforce-setup.com');
+    } catch (_) {
+        return false;
+    }
+}
+
+function cshSameOrigin(urlA, urlB) {
+    try {
+        return new URL(urlA).origin === new URL(urlB).origin;
+    } catch (_) {
+        return false;
+    }
+}
+
 async function cshExchangeCodeForToken(host, code, codeVerifier) {
     var body = new URLSearchParams();
     body.append('grant_type', 'authorization_code');
@@ -1025,13 +1047,28 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     if (request.type == "getSessionCookie") {
         // HttpOnly-cookie fallback: content scripts can't read the sid cookie
         // directly when the org has "Require HttpOnly attribute" enabled, but
-        // the cookies API can. We search the most common Salesforce cookie
-        // stores and return the first hit. Falls back silently to null.
+        // the cookies API can. Only return cookies to trusted Salesforce
+        // content scripts, and only for the exact same origin as the sender so
+        // this handler cannot become a cross-org cookie oracle.
         (async function () {
             try {
+                var senderUrl = (sender && sender.url) ||
+                    (sender && sender.tab && sender.tab.url);
                 var url = request.url || (sender && sender.tab && sender.tab.url);
                 if (!url) {
                     sendResponse({ sid: null, reason: 'no-url' });
+                    return;
+                }
+                if (!senderUrl || !cshIsTrustedSalesforceUrl(senderUrl)) {
+                    sendResponse({ sid: null, reason: 'untrusted-sender' });
+                    return;
+                }
+                if (!cshIsTrustedSalesforceUrl(url)) {
+                    sendResponse({ sid: null, reason: 'untrusted-url' });
+                    return;
+                }
+                if (!cshSameOrigin(senderUrl, url)) {
+                    sendResponse({ sid: null, reason: 'cross-origin-blocked' });
                     return;
                 }
                 var storeId = sender && sender.tab && sender.tab.cookieStoreId;
