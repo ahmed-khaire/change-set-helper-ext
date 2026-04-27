@@ -22,6 +22,13 @@ $(document).ready(function () {
 			return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c];
 		});
 	}
+	function isCurrentCompareMessage(request) {
+		if (!request || !request.setSide) return false;
+		if (request.setSide !== 'lhs' && request.setSide !== 'rhs') return false;
+		if (requestId) return request.requestId === requestId;
+		if (request.requestId) return false;
+		return !compareItem || compareItem === request.compareItem;
+	}
 	$('body').prepend(
 		'<div id="csh-compare-header" style="display:flex;align-items:center;padding:6px 10px;background:#f4f6f9;border-bottom:1px solid #d8dde6;font:12px/1.4 Arial,sans-serif;color:#2b2826;">' +
 			'<div style="flex:1;"><strong>This org:</strong> ' + escapeHtml(localOrg) + '</div>' +
@@ -81,6 +88,9 @@ $(document).ready(function () {
 
 	chrome.runtime.onMessage.addListener(
 		  function(request, sender, sendResponse) {
+			 if (!isCurrentCompareMessage(request)) {
+				 return false;
+			 }
 			 if (request.err){
 				 // Reflect the error in the panel and stop the elapsed timer;
 				 // don't rely on $().innerHTML (which doesn't exist on jQuery
@@ -89,18 +99,12 @@ $(document).ready(function () {
 				 progress[sideKey] = 'error';
 				 $('.csh-compare-progress-phase').append(
 					 '<div style="color:#c23934;margin-top:4px;">' + sideKey.toUpperCase() + ' failed: ' +
-					 String(request.err).replace(/[<>&"']/g, function (c) {
-						 return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c];
-					 }) + '</div>'
+					 escapeHtml(request.err) + '</div>'
 				 );
 				 updateProgressPanel();
 				 return false;
 			 }
 			 if (request.setSide) {
-				 if (compareItem  && compareItem!=request.compareItem) {
-					return false;
-				 }
-
 				var zip = new JSZip();
 				zip.loadAsync(request.content.zipFile, {base64: true}).then(function (zip) {
 					// Gather candidate files first, skip directory entries and
@@ -182,7 +186,8 @@ $(document).ready(function () {
 				}).catch(function (e) {
 					progress[request.setSide] = 'error';
 					$('.csh-compare-progress-phase').append(
-						'<div style="color:#c23934;margin-top:4px;">' + request.setSide.toUpperCase() + ' unzip failed: ' + (e && e.message ? e.message : String(e)) + '</div>'
+						'<div style="color:#c23934;margin-top:4px;">' + request.setSide.toUpperCase() +
+						' unzip failed: ' + escapeHtml(e && e.message ? e.message : String(e)) + '</div>'
 					);
 					updateProgressPanel();
 				});

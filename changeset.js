@@ -3890,6 +3890,10 @@ $(document).ready(function () {
                     setTimeout(function () { location.reload(); }, 600);
                 } else {
                     btn.prop('disabled', false).text('Sign in via OAuth');
+                    if (resp && resp.userCancelled) {
+                        window.cshToast && window.cshToast.show('Sign-in was cancelled.', { type: 'info' });
+                        return;
+                    }
                     window.cshToast && window.cshToast.show(
                         'Sign in failed: ' + ((resp && resp.error) || 'unknown error') +
                         '. Use Options → OAuth Diagnostic to troubleshoot.',

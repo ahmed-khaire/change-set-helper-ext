@@ -17,8 +17,14 @@
   "content_scripts": [
     {
       "matches": [
-        "https://*/p/mfpkg/AddToPackageFromChangeMgmtUi*",
-        "https://*/p/mfpkg/AddToPackageUi*"
+        "https://*.salesforce.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
+        "https://*.salesforce.com/p/mfpkg/AddToPackageUi*",
+        "https://*.force.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
+        "https://*.force.com/p/mfpkg/AddToPackageUi*",
+        "https://*.cloudforce.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
+        "https://*.cloudforce.com/p/mfpkg/AddToPackageUi*",
+        "https://*.salesforce-setup.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
+        "https://*.salesforce-setup.com/p/mfpkg/AddToPackageUi*"
       ],
       "css": [
         "lib/jquery.dataTables.css",
@@ -55,7 +61,10 @@
     },
     {
       "matches": [
-        "https://*/*tab=PackageComponents*"
+        "https://*.salesforce.com/*tab=PackageComponents*",
+        "https://*.force.com/*tab=PackageComponents*",
+        "https://*.cloudforce.com/*tab=PackageComponents*",
+        "https://*.salesforce-setup.com/*tab=PackageComponents*"
       ],
       "css": [
         "lib/jquery.dataTables.css",
@@ -74,7 +83,10 @@
     },
     {
       "matches": [
-        "https://*/changemgmt/outboundChangeSetDetailPage.apexp*"
+        "https://*.salesforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.force.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.cloudforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.salesforce-setup.com/changemgmt/outboundChangeSetDetailPage.apexp*"
       ],
       "css": [
         "lib/jquery.dataTables.css",
@@ -109,8 +121,14 @@
     },
     {
       "matches": [
-        "https://*/lightning/setup/OutboundChangeSet/home*",
-        "https://*/changemgmt/listOutboundChangeSet.apexp*"
+        "https://*.salesforce.com/lightning/setup/OutboundChangeSet/home*",
+        "https://*.salesforce.com/changemgmt/listOutboundChangeSet.apexp*",
+        "https://*.force.com/lightning/setup/OutboundChangeSet/home*",
+        "https://*.force.com/changemgmt/listOutboundChangeSet.apexp*",
+        "https://*.cloudforce.com/lightning/setup/OutboundChangeSet/home*",
+        "https://*.cloudforce.com/changemgmt/listOutboundChangeSet.apexp*",
+        "https://*.salesforce-setup.com/lightning/setup/OutboundChangeSet/home*",
+        "https://*.salesforce-setup.com/changemgmt/listOutboundChangeSet.apexp*"
       ],
       "js": [
         "cshlogger.js",
@@ -122,7 +140,10 @@
     },
     {
       "matches": [
-        "https://*/changemgmt/outboundChangeSetDetailPage.apexp*"
+        "https://*.salesforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.force.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.cloudforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.salesforce-setup.com/changemgmt/outboundChangeSetDetailPage.apexp*"
       ],
       "js": [
         "detailpagebridge.js"
@@ -138,10 +159,6 @@
     "cookies"
   ],
   "host_permissions": [
-    "https://*.com/p/mfpkg/AddToPackageFromChangeMgmtUi*",
-    "https://*.com/p/mfpkg/AddToPackageUi*",
-    "https://*.com/*tab=PackageComponents*",
-    "https://*.com/changemgmt/outboundChangeSetDetailPage.apexp*",
     "https://*.salesforce.com/*",
     "https://*.force.com/*",
     "https://*.cloudforce.com/*",

@@ -853,6 +853,10 @@ function cshOnConnectSavedOrg() {
 		$btn.prop('disabled', false).val(originalLabel);
 		if (!response || !response.ok) {
 			var msg = (response && response.error) || 'Unknown error';
+			if (response && response.userCancelled) {
+				window.cshToast && window.cshToast.show('Target org sign-in was cancelled.', { type: 'info' });
+				return;
+			}
 			if (response && response.needsReauth) {
 				// Refresh token was revoked / expired. Invite the user to
 				// re-OAuth for this org without deleting the saved record —
@@ -939,6 +943,10 @@ async function cshStartNewOrgLogin(env, customHost) {
 	}, function (response) {
 		if (!response || !response.ok) {
 			var err = (response && response.error) || 'Unknown error';
+			if (response && response.userCancelled) {
+				window.cshToast && window.cshToast.show('Target org sign-in was cancelled.', { type: 'info' });
+				return;
+			}
 			console.log('Problem logging in:', err);
 			window.cshToast && window.cshToast.show('Problem logging in: ' + err, { type: 'error' });
 			return;

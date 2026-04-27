@@ -1506,7 +1506,7 @@
         // Dedup by (type + fullName) among unresolved items to avoid double-import.
         var seen = {};
         cart.items.forEach(function (it) {
-            if (!it.salesforceId && it.fullName) seen[type + '||' + it.fullName] = true;
+            if (!it.salesforceId && it.type && it.fullName) seen[it.type + '||' + it.fullName] = true;
         });
         var added = 0;
         items.forEach(function (it) {

@@ -4,7 +4,7 @@ importScripts('cshlogger.js');
 
 var CSH_APIVERSION = "66.0";
 var CSH_APIVERSION_IS_USER_PREF = false;
-const versionPattern = RegExp('^[0-9][0-9]\.0$');
+const versionPattern = RegExp('^[0-9][0-9]\\.0$');
 
 // Priority:
 //   1. chrome.storage.sync.salesforceApiVersion  — user-set from options page
@@ -230,6 +230,20 @@ function cshValidateSalesforceProxyRequest(requestUrl, sender) {
     }
     if (!requestUrl || !cshIsTrustedSalesforceUrl(requestUrl)) {
         return 'untrusted url';
+    }
+    return null;
+}
+
+function cshValidateCartSubmitAction(actionUrl, sender) {
+    var validationError = cshValidateSalesforceProxyRequest(actionUrl, sender);
+    if (validationError) return validationError;
+    try {
+        var u = new URL(actionUrl);
+        if (!/^\/p\/mfpkg\/AddToPackage(FromChangeMgmtUi|Ui)?$/i.test(u.pathname)) {
+            return 'unexpected add-components endpoint';
+        }
+    } catch (_) {
+        return 'invalid url';
     }
     return null;
 }
@@ -631,6 +645,7 @@ function stopKeepAlive() {
 // Offscreen document management
 let creating; // A global promise to avoid concurrency issues
 let offscreenReady = false;
+let offscreenReadyWaiters = [];
 let offscreenInactivityTimer = null;
 let offscreenPendingCount = 0; // in-flight sendToOffscreen calls
 const OFFSCREEN_INACTIVITY_TIMEOUT = 5 * 60 * 1000; // Close after 5 minutes of inactivity
@@ -706,6 +721,7 @@ async function setupOffscreenDocument(path) {
 
         if (existingContexts.length > 0) {
             console.log('Offscreen document already exists');
+            offscreenReady = true;
             return;
         }
 
@@ -738,6 +754,26 @@ async function setupOffscreenDocument(path) {
     }
 }
 
+function waitForOffscreenReady(timeoutMs) {
+    if (offscreenReady) return Promise.resolve(true);
+    return new Promise(function (resolve) {
+        var settled = false;
+        var timer = setTimeout(function () {
+            if (settled) return;
+            settled = true;
+            offscreenReadyWaiters = offscreenReadyWaiters.filter(function (fn) { return fn !== done; });
+            resolve(false);
+        }, timeoutMs || 5000);
+        function done() {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(true);
+        }
+        offscreenReadyWaiters.push(done);
+    });
+}
+
 async function sendToOffscreen(message) {
     // Track in-flight ops so resetOffscreenInactivityTimer won't schedule a
     // close while we're still waiting on this call. Without this a long
@@ -749,9 +785,12 @@ async function sendToOffscreen(message) {
         resetOffscreenInactivityTimer();
 
         if (!offscreenReady) {
-            // Wait for offscreen document to fully load and JSforce to initialize
-            await new Promise(resolve => setTimeout(resolve, 500));
-            offscreenReady = true;
+            // Wait for the offscreen document's explicit ready signal instead
+            // of assuming a fixed delay is enough on slow startup.
+            var ready = await waitForOffscreenReady(5000);
+            if (!ready) {
+                console.warn('Offscreen document did not signal ready before timeout; sending message anyway');
+            }
         }
 
         return await new Promise((resolve, reject) => {
@@ -809,6 +848,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     if (request.action === 'offscreenReady') {
         console.log('Offscreen document signaled ready!');
         offscreenReady = true;
+        offscreenReadyWaiters.splice(0).forEach(function (resolve) { resolve(); });
         return false;
     }
 
@@ -816,10 +856,12 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         startCompareRetrieves(request.requestId).catch(function (err) {
             console.error('Compare retrieve startup failed:', err);
             chrome.runtime.sendMessage({
+                'requestId': request.requestId,
                 'setSide': 'lhs',
                 'err': err && err.message ? err.message : String(err)
             });
             chrome.runtime.sendMessage({
+                'requestId': request.requestId,
                 'setSide': 'rhs',
                 'err': err && err.message ? err.message : String(err)
             });
@@ -853,8 +895,16 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                 });
             })
             .catch(function (err) {
-                console.error('cshAuthLogin failed:', err);
-                sendResponse({ ok: false, error: err.message });
+                if (err && err.code === 'user-cancelled') {
+                    console.warn('cshAuthLogin cancelled by user:', err.message || err);
+                } else {
+                    console.error('cshAuthLogin failed:', err);
+                }
+                sendResponse({
+                    ok: false,
+                    userCancelled: err && err.code === 'user-cancelled',
+                    error: err.message
+                });
             });
         return true;
     }
@@ -1083,6 +1133,11 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                 var ids = request.ids || [];
                 if (!shape || !shape.action) {
                     sendResponse({ ok: false, error: 'No form shape available' });
+                    return;
+                }
+                var submitValidationError = cshValidateCartSubmitAction(shape.action, sender);
+                if (submitValidationError) {
+                    sendResponse({ ok: false, error: 'cshCartSubmit: ' + submitValidationError });
                     return;
                 }
                 var body = new URLSearchParams();
@@ -1636,10 +1691,12 @@ async function startCompareRetrieves(requestId) {
     var req = cshPendingCompareRequests[requestId];
     if (!req) {
         chrome.runtime.sendMessage({
+            'requestId': requestId,
             'setSide': 'lhs',
             'err': 'Compare request expired or was not found. Re-open the compare popup.'
         });
         chrome.runtime.sendMessage({
+            'requestId': requestId,
             'setSide': 'rhs',
             'err': 'Compare request expired or was not found. Re-open the compare popup.'
         });
@@ -1647,12 +1704,12 @@ async function startCompareRetrieves(requestId) {
     }
     delete cshPendingCompareRequests[requestId];
     await Promise.all([
-        getContents(req.type, req.item, 'local', "lhs"),
-        getContents(req.type, req.item, 'deploy', "rhs")
+        getContents(req.type, req.item, 'local', "lhs", requestId),
+        getContents(req.type, req.item, 'deploy', "rhs", requestId)
     ]);
 }
 
-async function getContents(type, item, connType, side) {
+async function getContents(type, item, connType, side, requestId) {
     try {
         const response = await sendToOffscreen({
             action: 'retrieveMetadata',
@@ -1667,9 +1724,10 @@ async function getContents(type, item, connType, side) {
         });
 
         if (response.error) {
-            chrome.runtime.sendMessage({'setSide': side, 'err': response.error});
+            chrome.runtime.sendMessage({ 'requestId': requestId, 'setSide': side, 'err': response.error });
         } else {
             chrome.runtime.sendMessage({
+                'requestId': requestId,
                 'setSide': side,
                 'type': type,
                 'content': {zipFile: response.zipData},
@@ -1678,7 +1736,7 @@ async function getContents(type, item, connType, side) {
         }
     } catch (err) {
         console.error(err);
-        chrome.runtime.sendMessage({'setSide': side, 'err': err.toString()});
+        chrome.runtime.sendMessage({ 'requestId': requestId, 'setSide': side, 'err': err.toString() });
     }
 }
 
