@@ -200,10 +200,141 @@ var CSH_DEVELOPER_NAME_TYPES = {
 // (CustomField, WorkflowFieldUpdate, RecordType, etc.) instead of only Name.
 var cshOriginalRowCellCount = null;    // max <td> count per tr.dataRow before we touched the table
 var cshOriginalHeaderCount = null;     // <th>+<td> count in tr.headerRow before we touched it
+var cshBaseColumns = [];               // Salesforce-rendered columns for the current component type
+var cshComponentRows = [];             // Data-backed row model, populated from Salesforce pages
+var cshComponentRowsById = new Map();  // 15-char Salesforce Id -> cshComponentRows entry
 
 function cshExtraColumnsPerRow() {
     var dyn = (dynamicColumns && dynamicColumns.length > 0) ? dynamicColumns.length : 3;
     return dyn + 4; // dynamic + 4 compare columns
+}
+
+function cshNormalizeHeaderLabel(label, index) {
+    label = String(label || '').replace(/\s+/g, ' ').trim();
+    if (!label || /^(Sorted\s+)?(Ascending|Descending)$/i.test(label)) {
+        return index === 0 ? 'Name' : ('Column ' + (index + 1));
+    }
+    return label;
+}
+
+function cshReadBaseColumnsFromTable() {
+    var $headers = $("table.list tr.headerRow").children('th,td');
+    var dataCellCount = cshOriginalRowCellCount || $("table.list tr.dataRow:first").children('td').length;
+    var headerOffset = ($headers.length === dataCellCount + 1) ? 1 : 0;
+    var columns = [];
+
+    for (var cellIndex = 0; cellIndex < dataCellCount; cellIndex++) {
+        var headerIndex = cellIndex + headerOffset;
+        var $header = $headers.eq(headerIndex);
+        var text = ($header.find('a').text() || $header.text() || '').trim();
+        var label = cshNormalizeHeaderLabel(text, cellIndex);
+        columns.push({
+            label: label,
+            headerIndex: headerIndex,
+            cellIndex: cellIndex
+        });
+    }
+    if (columns.length && !columns.some(function (c) { return c.label === 'Name' || c.label === 'Component Name'; })) {
+        columns[0].label = 'Name';
+    }
+    cshBaseColumns = columns;
+    return columns;
+}
+
+function cshFindBaseColumn(labelRe) {
+    for (var i = 0; i < cshBaseColumns.length; i++) {
+        if (labelRe.test(cshBaseColumns[i].label)) return cshBaseColumns[i];
+    }
+    return null;
+}
+
+function cshRowIdFromElement(rowEl) {
+    if (!rowEl) return null;
+    var hidden = rowEl.querySelector('input[name="ids"]');
+    if (hidden && hidden.value) return hidden.value;
+    var checkbox = rowEl.querySelector('input[type="checkbox"]');
+    if (checkbox && checkbox.value) return checkbox.value;
+    var inputs = rowEl.querySelectorAll('input');
+    for (var i = 0; i < inputs.length; i++) {
+        if (inputs[i].value) return inputs[i].value;
+    }
+    return null;
+}
+
+function cshUpsertComponentRowFromElement(rowEl) {
+    if (!rowEl) return null;
+    if (!cshBaseColumns.length) cshReadBaseColumnsFromTable();
+    var id = cshRowIdFromElement(rowEl);
+    if (!id) return null;
+    var id15 = String(id).slice(0, 15);
+    var cells = rowEl.children || [];
+    var baseCells = {};
+    cshBaseColumns.forEach(function (col) {
+        var cell = cells[col.cellIndex];
+        baseCells[col.label] = cell ? $(cell).text().replace(/\s+/g, ' ').trim() : '';
+    });
+    var nameCol = cshFindBaseColumn(/^(Name|Component Name)$/i);
+    var typeCol = cshFindBaseColumn(/^Type$/i);
+    var apiCol = cshFindBaseColumn(/^(API Name|Full Name|Developer Name)$/i);
+    var name = nameCol ? baseCells[nameCol.label] : (baseCells.Name || '');
+    var fullName = null;
+    if (nameCol && cells[nameCol.cellIndex]) {
+        fullName = cells[nameCol.cellIndex].getAttribute('data-fullName');
+    }
+    if (!fullName && apiCol) fullName = baseCells[apiCol.label];
+
+    var existing = cshComponentRowsById.get(id15);
+    var row = Object.assign(existing || {}, {
+        id: id15,
+        salesforceId: id15,
+        type: selectedEntityType || resolvedMetadataType || '',
+        metadataType: resolvedMetadataType || selectedEntityType || '',
+        name: name || fullName || id15,
+        fullName: fullName || undefined,
+        baseCells: baseCells,
+        baseColumnOrder: cshBaseColumns.map(function (c) { return c.label; }),
+        metadata: existing && existing.metadata ? existing.metadata : {},
+        compare: existing && existing.compare ? existing.compare : {},
+        rowEl: rowEl
+    });
+    if (typeCol && baseCells[typeCol.label]) row.displayType = baseCells[typeCol.label];
+    if (!existing) cshComponentRows.push(row);
+    cshComponentRowsById.set(id15, row);
+    return row;
+}
+
+function cshAddComponentRowsFromDom(rows) {
+    if (!rows || !rows.length) return 0;
+    var count = 0;
+    $(rows).each(function () {
+        if (cshUpsertComponentRowFromElement(this)) count++;
+    });
+    return count;
+}
+
+function cshApplyMetadataToComponentRows(results) {
+    if (!results || !results.length) return;
+    for (var i = 0; i < results.length; i++) {
+        var rec = results[i];
+        if (!rec || !rec.id) continue;
+        var row = cshComponentRowsById.get(String(rec.id).slice(0, 15));
+        if (!row) continue;
+        row.metadata = Object.assign({}, row.metadata || {}, rec);
+        if (rec.fullName) row.fullName = rec.fullName;
+        if (rec.fullName && (!row.name || row.name === row.id)) row.name = rec.fullName;
+    }
+}
+
+function cshGetComponentRowById(id) {
+    if (!id) return null;
+    return cshComponentRowsById.get(String(id).slice(0, 15)) || null;
+}
+
+function cshSetComponentRowChecked(id, checked) {
+    var row = cshGetComponentRowById(id);
+    if (!row || !window.cshCart || !window.cshCart.setItemChecked) return Promise.resolve(false);
+    var csId = cshAddPagePackageId || cshAddPageChangeSetId || changeSetId || $('#id').val();
+    return window.cshCart.setItemChecked(csId, selectedEntityType || row.type, row, checked);
 }
 
 // Helper function to add columns to specific rows (avoids freezing with large datasets).
@@ -309,6 +440,7 @@ function setupTable() {
     console.log('setupTable: original header cells =', cshOriginalHeaderCount,
                 ', widest data row =', widestDataRow);
     cshNormalizeNameHeader();
+    cshReadBaseColumnsFromTable();
 
     // Log original header structure
     var originalHeaders = [];
@@ -356,6 +488,7 @@ function setupTable() {
     // Add columns only to existing rows (not ALL rows to avoid freeze)
     var existingRows = $("table.list tr.dataRow");
     console.log('setupTable: Found', existingRows.length, 'data rows to update');
+    console.log('setupTable: Captured', cshAddComponentRowsFromDom(existingRows), 'row model entries');
 
     // Log first row BEFORE adding columns
     if (existingRows.length > 0) {
@@ -727,6 +860,7 @@ function processListResults(response) {
         }
     }
     console.log('Cached metadata now has', cachedMetadataResults.length, 'total records');
+    cshApplyMetadataToComponentRows(results);
 
     // Apply metadata to matching rows in the table
     applyMetadataToRows(results);
@@ -780,6 +914,7 @@ async function cshHydrateFromIndexedDbCache() {
                 cachedMetadataResults.push(cached[i]);
             }
         }
+        cshApplyMetadataToComponentRows(cached);
         applyMetadataToRows(cached);
         if (!changeSetTable) {
             totalComponentCount = listTableLength;
@@ -3247,6 +3382,7 @@ function startPaginationWithMetadata() {
 
             var parsedResponse = $(data);
             var nextTable = parsedResponse.find("table.list tr.dataRow");
+            cshAddComponentRowsFromDom(nextTable);
 
             // Add columns to new rows
             if (resolvedMetadataType != null) {

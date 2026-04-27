@@ -392,6 +392,66 @@
         return added;
     }
 
+    async function setItemChecked(changeSetId, type, item, checked) {
+        if (!changeSetId || !type || !item) return false;
+        var sfId = item.id || item.salesforceId;
+        if (!sfId) return false;
+        sfId = String(sfId).slice(0, 15);
+
+        var { all, cart } = await getCart(changeSetId);
+        var rowKey = function (it) {
+            return it && it.type === type && String(it.salesforceId || '').slice(0, 15) === sfId;
+        };
+        var existing = null;
+        for (var i = 0; i < cart.items.length; i++) {
+            if (rowKey(cart.items[i])) {
+                existing = cart.items[i];
+                break;
+            }
+        }
+
+        if (checked) {
+            if (existing) {
+                if (existing.status === 'failed') {
+                    existing.status = 'staged';
+                    existing.error = '';
+                }
+                if (item.name && (!existing.name || existing.name === existing.salesforceId)) existing.name = item.name;
+                if (item.fullName && !existing.fullName) existing.fullName = item.fullName;
+            } else {
+                existing = {
+                    uid: uid(),
+                    type: type,
+                    salesforceId: sfId,
+                    name: item.name || item.fullName || sfId,
+                    fullName: item.fullName || undefined,
+                    status: 'staged',
+                    source: 'data-table',
+                    addedAt: Date.now()
+                };
+                cart.items.push(existing);
+            }
+        } else {
+            cart.items = cart.items.filter(function (it) {
+                if (!rowKey(it)) return true;
+                return it.status !== 'staged' && it.status !== 'failed';
+            });
+        }
+
+        await saveCart(all);
+        if (window.cshDb && checked) {
+            window.cshDb.markMembers(changeSetId, [{
+                id: sfId,
+                type: type,
+                name: item.name || item.fullName || sfId,
+                fullName: item.fullName || undefined
+            }], 'pending_add', { source: 'cart-data-table-selection' })
+                .catch(function (e) { console.warn('cshDb data-table selection cache failed:', e && e.message); });
+        }
+        renderPanel();
+        return true;
+    }
+
     // Server-sync insert — reconciles cart with what actually exists in the
     // change set on the server. Called by background sync (#6) after it
     // walks the classic components view and reads (cid, type) pairs that
@@ -2838,6 +2898,7 @@
         init: init,
         addItems: addItems,
         addItemsBatch: addItemsBatch,
+        setItemChecked: setItemChecked,
         syncItemsFromServer: syncItemsFromServer,
         setSyncState: setSyncState,
         removeItem: removeItem,
