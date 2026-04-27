@@ -284,7 +284,8 @@
         return { all: all, cart: all[changeSetId] };
     }
 
-    function saveCart(all) {
+    async function saveCart(all, opts) {
+        opts = opts || {};
         pendingAll = all;
         // Cached status counts on each cart so renders avoid re-iterating
         // the whole item list on every frame. Every mutation flows through
@@ -296,9 +297,12 @@
                 }
             }
         }
-        scheduleFlush();
+        if (opts.flush) {
+            await flushNow();
+        } else {
+            scheduleFlush();
+        }
         notifyCartChanged();
-        return Promise.resolve();
     }
 
     function recountCart(cart) {
@@ -702,6 +706,45 @@
         });
     }
 
+    async function removeServerItems(changeSetIds, items) {
+        if (!Array.isArray(changeSetIds)) changeSetIds = [changeSetIds];
+        changeSetIds = changeSetIds.filter(Boolean);
+        items = Array.isArray(items) ? items.filter(function (it) { return it && it.id; }) : [];
+        if (!changeSetIds.length || !items.length) return { removed: 0 };
+
+        function sfId15(id) { return id ? String(id).slice(0, 15) : ''; }
+        var byId = {};
+        items.forEach(function (it) {
+            byId[sfId15(it.id)] = it;
+        });
+
+        var all = await storageGet(CART_KEY) || {};
+        var removed = 0;
+        changeSetIds.forEach(function (changeSetId) {
+            var cart = all[changeSetId];
+            if (!cart || !Array.isArray(cart.items)) return;
+            cart.items = cart.items.filter(function (row) {
+                if (row.status !== 'done' || !row.salesforceId) return true;
+                var match = byId[sfId15(row.salesforceId)];
+                if (!match) return true;
+                if (match.type && row.type && match.type !== row.type) return true;
+                removed++;
+                return false;
+            });
+        });
+
+        if (removed > 0) await saveCart(all, { flush: true });
+
+        if (window.cshDb) {
+            await Promise.all(changeSetIds.map(function (changeSetId) {
+                return window.cshDb.markMembers(changeSetId, items, 'removed', { source: 'detail-remove' })
+                    .catch(function (e) { console.warn('cshDb removed member cache failed:', e && e.message); });
+            }));
+        }
+
+        return { removed: removed };
+    }
+
     async function getItemByUid(changeSetId, uid) {
         var { cart } = await getCart(changeSetId);
         return (cart.items || []).find(function (it) { return it.uid === uid; }) || null;
@@ -791,12 +834,12 @@
         await saveCart(all);
     }
 
-    async function updateItemStatuses(changeSetId, predicate, patch) {
+    async function updateItemStatuses(changeSetId, predicate, patch, opts) {
         var { all, cart } = await getCart(changeSetId);
         cart.items.forEach(function (it) {
             if (predicate(it)) Object.assign(it, patch);
         });
-        await saveCart(all);
+        await saveCart(all, opts);
     }
 
     // -----------------------------------------------------------------------
@@ -1099,6 +1142,7 @@
             return;
         }
         workerRunning = true;
+        renderPanel();
         try {
             while (true) {
                 // Refresh the lock at the start of every batch so other tabs
@@ -1125,7 +1169,8 @@
                 await updateItemStatuses(
                     changeSetId,
                     function (it) { return batchItems.some(function (b) { return b.uid === it.uid; }); },
-                    { status: 'submitting', batchId: batchId }
+                    { status: 'submitting', batchId: batchId },
+                    { flush: true }
                 );
                 renderPanel();
 
@@ -1138,7 +1183,8 @@
                             status: 'failed',
                             error: 'No form shape cached for ' + type +
                                    '. Visit the ' + type + ' type in Add Components once, then retry.'
-                        }
+                        },
+                        { flush: true }
                     );
                     renderPanel();
                     continue;
@@ -1181,11 +1227,15 @@
                     await updateItemStatuses(
                         changeSetId,
                         function (it) { return it.batchId === batchId; },
-                        { status: 'done' }
+                        { status: 'done' },
+                        { flush: true }
                     );
                     if (window.cshDb) {
-                        window.cshDb.markMembers(changeSetId, batchItems, 'present', { source: 'cart-submit' })
-                            .catch(function (e) { console.warn('cshDb submit cache failed:', e && e.message); });
+                        try {
+                            await window.cshDb.markMembers(changeSetId, batchItems, 'present', { source: 'cart-submit' });
+                        } catch (e) {
+                            console.warn('cshDb submit cache failed:', e && e.message);
+                        }
                     }
                     window.cshToast && window.cshToast.show(
                         'Cart: added ' + batchItems.length + ' ' + type + ' item(s) to change set.',
@@ -1195,7 +1245,8 @@
                     await updateItemStatuses(
                         changeSetId,
                         function (it) { return it.batchId === batchId; },
-                        { status: 'failed', error: lastError }
+                        { status: 'failed', error: lastError },
+                        { flush: true }
                     );
                     window.cshToast && window.cshToast.show(
                         'Cart: batch for ' + type + ' failed after ' + MAX_ATTEMPTS + ' attempts. ' + lastError,
@@ -1971,6 +2022,7 @@
         panel.innerHTML =
             '<div class="csh-cart-header">' +
               '<span class="csh-cart-title">Change Set Details</span>' +
+              '<button class="csh-cart-sync-now" title="Sync added components from Salesforce" aria-label="Sync added components from Salesforce">↻</button>' +
               '<button class="csh-cart-toggle-all" title="Collapse/expand all groups" aria-label="Collapse or expand all groups">⇅</button>' +
               '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
             '</div>' +
@@ -2023,6 +2075,19 @@
             renderPanel();
         });
         panel.querySelector('.csh-cart-close').addEventListener('click', togglePanel);
+        panel.querySelector('.csh-cart-sync-now').addEventListener('click', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (syncState === 'syncing') return;
+            var detail = { changeSetId: currentChangeSetId(), handled: false };
+            window.dispatchEvent(new CustomEvent('csh:cart-sync-request', { detail: detail }));
+            if (!detail.handled && window.cshToast) {
+                window.cshToast.show(
+                    'Open the Change Set Detail page to sync added components from Salesforce.',
+                    { type: 'info', duration: 5000 }
+                );
+            }
+        });
         // Delegated chip click — chips live inside the body, which is
         // re-rendered on every paint, so wire the listener on the stable
         // panel element. Click toggles: same filter → clear; other → switch.
@@ -2301,6 +2366,13 @@
         if (!panel) return;
         panel.classList.toggle('csh-cart-syncing', syncState === 'syncing');
         panel.classList.toggle('csh-cart-sync-error', syncState === 'error');
+        var syncBtn = panel.querySelector('.csh-cart-sync-now');
+        if (syncBtn) {
+            syncBtn.disabled = syncState === 'syncing';
+            syncBtn.title = syncState === 'syncing'
+                ? 'Syncing added components from Salesforce'
+                : 'Sync added components from Salesforce';
+        }
         var titleEl = panel.querySelector('.csh-cart-title');
         if (titleEl) {
             var base = 'Change Set Details';
@@ -2659,7 +2731,7 @@
     function statusLabel(it) {
         if (it.status === 'staged') return 'staged';
         if (it.status === 'submitting') return 'submitting…';
-        if (it.status === 'done') return 'added ✓';
+        if (it.status === 'done') return 'added';
         if (it.status === 'failed') return 'failed — ' + (it.error || '');
         return it.status;
     }
@@ -2902,6 +2974,7 @@
         syncItemsFromServer: syncItemsFromServer,
         setSyncState: setSyncState,
         removeItem: removeItem,
+        removeServerItems: removeServerItems,
         clearType: clearType,
         clearDone: clearDone,
         clearStaged: clearStaged,

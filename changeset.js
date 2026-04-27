@@ -14,6 +14,9 @@ var cshAddPagePackageId = null;
 var cshTypeRefreshRunning = false;
 var cshMetadataOverlayTimer = null;
 var CSH_TYPE_CACHE_FRESH_MS = 15 * 60 * 1000;
+var CSH_DATATABLE_PAGE_LENGTH = 500;
+var CSH_METADATA_REFRESH_TIMEOUT_MS = 90 * 1000;
+var cshMetadataCacheWrites = [];
 
 // Verbose per-call diagnostic logs. Off in production because on big orgs
 // (Custom Fields / Layouts / RecordTypes) processListResults and
@@ -777,11 +780,7 @@ function processListResults(response) {
             console.warn('cshDb add-page metadata cache failed:', e && e.message);
         });
     }
-    cacheWrite.then(function () {
-        cshMarkTypeSyncCompleted(len).catch(function (e) {
-            console.warn('cshDb type sync status update failed:', e && e.message);
-        });
-    });
+    cshMetadataCacheWrites.push(cacheWrite);
 
     // Log first few results to see data structure. Gated: the object print
     // stringifies the full record, which is costly when fired per batch.
@@ -882,8 +881,15 @@ function processListResults(response) {
     // During progressive loading, table is already created
     if (numCallsInProgress <= 0 && !changeSetTable) {
         console.log('All metadata calls complete - creating DataTable');
+        cshFinalizeTypeSync(cachedMetadataResults.length).catch(function (e) {
+            console.warn('cshDb type sync finalize failed:', e && e.message);
+        });
         cshHideMetadataLoadingOverlay();
         createDataTable();
+    } else if (numCallsInProgress <= 0) {
+        cshFinalizeTypeSync(cachedMetadataResults.length).catch(function (e) {
+            console.warn('cshDb type sync finalize failed:', e && e.message);
+        });
     }
     console.log('========================================');
 
@@ -992,7 +998,12 @@ function applyMetadataToRows(results) {
     // auto-pagination, the old path executed on the order of 900M DOM
     // visits across all applyMetadataToRows invocations in the session.
     var rowByInputValue = new Map();
-    var dataRowInputs = document.querySelectorAll('table.list tr.dataRow input');
+    cshComponentRows.forEach(function (componentRow) {
+        if (componentRow && componentRow.id && componentRow.rowEl) {
+            rowByInputValue.set(String(componentRow.id).slice(0, 15), componentRow.rowEl);
+        }
+    });
+    var dataRowInputs = rowByInputValue.size ? [] : document.querySelectorAll('table.list tr.dataRow input');
     for (var rbi = 0; rbi < dataRowInputs.length; rbi++) {
         var inp = dataRowInputs[rbi];
         if (!inp || !inp.value) continue;
@@ -1143,6 +1154,8 @@ function cshAppendTargetOnlyRows(records, env) {
     });
     var addedRows = changeSetTable.rows.add(rowArrays);
     addedRows.every(function () {
+        var data = this.data();
+        if (Array.isArray(data)) data._cshTargetOnly = true;
         var node = this.node();
         if (node) {
             node.classList.add('csh-diff-target-only');
@@ -1155,7 +1168,11 @@ function cshAppendTargetOnlyRows(records, env) {
 function cshResetCompareDisplay() {
     if (!changeSetTable) return;
     changeSetTable.rows(function (idx, data, node) {
-        return !!(node && node.getAttribute('data-csh-target-only') === '1');
+        return !!(
+            (node && node.getAttribute('data-csh-target-only') === '1') ||
+            (data && data._cshTargetOnly) ||
+            (Array.isArray(data) && data[0] === '[target only]')
+        );
     }).remove();
     changeSetTable.rows().every(function () {
         var node = this.node();
@@ -1225,6 +1242,12 @@ function processCompareResults(results, env, opts) {
         var key = cell.getAttribute('data-fullName');
         if (key && !(key in fullNameToRowIdx)) fullNameToRowIdx[key] = this.index();
     });
+    cshComponentRows.forEach(function (componentRow) {
+        if (!componentRow || !componentRow.fullName || !componentRow.rowEl) return;
+        if (componentRow.fullName in fullNameToRowIdx) return;
+        var idx = changeSetTable.row(componentRow.rowEl).index();
+        if (typeof idx === 'number') fullNameToRowIdx[componentRow.fullName] = idx;
+    });
 
     // Track rows we actually mutated so a single invalidate+draw at the end
     // can re-sync DataTables' internal cache with what we wrote to the DOM.
@@ -1254,7 +1277,13 @@ function processCompareResults(results, env, opts) {
             var fullNameCellNode = changeSetTable.cell(rowIdx, compareColumnIndices.fullName).node();
             if (dateCellNode) dateCellNode.textContent = convertDate(dateMod);
             if (modByCellNode) modByCellNode.textContent = results[i].lastModifiedByName || '';
-            if (fullNameCellNode) fullNameCellNode.innerHTML = '<a href="#">' + fullName + '</a>';
+            if (fullNameCellNode) {
+                fullNameCellNode.textContent = '';
+                var fullNameLink = document.createElement('a');
+                fullNameLink.href = '#';
+                fullNameLink.textContent = fullName || '';
+                fullNameCellNode.appendChild(fullNameLink);
+            }
 
             // Make Full Name cell clickable for diff. Also stamp the cell
             // with data-fullName so the click handler can resolve the item
@@ -1524,21 +1553,33 @@ function createDataTable() {
         changeSetTable = $(tableSelector).DataTable({
             processing: true,
             paging: enablePaging,
-            pageLength: 100,  // Show 100 rows per page when pagination is enabled
+            pageLength: CSH_DATATABLE_PAGE_LENGTH,
+            lengthMenu: [[100, 250, 500, 1000, -1], [100, 250, 500, 1000, 'All']],
             dom: domLayout,
             "order": [[orderByColumnIndex, "desc"]], // Order by lastModifiedDate if available
             "deferRender": true,  // Performance optimization for large datasets
             "columns": columnConfig,
+            rowCallback: function (row, data) {
+                var targetOnly = !!(
+                    (data && data._cshTargetOnly) ||
+                    (Array.isArray(data) && data[0] === '[target only]')
+                );
+                if (targetOnly) {
+                    row.classList.add('csh-diff-target-only');
+                    row.setAttribute('data-csh-target-only', '1');
+                }
+            },
             initComplete: tableInitComplete
         });
 
         cshInstallToolbarActions();
-        $("#editPage").submit(function (event) {
-            clearFilters();
-            return true;
-        });
+        cshInstallAddPageSubmitBridge();
     } catch (e) {
         console.log(e);
+        window.cshToast && window.cshToast.show(
+            'Enhanced table setup failed. The standard Salesforce table is still usable.',
+            { type: 'warning', duration: 8000 }
+        );
     }
 
     $("#editPage").removeClass("lowOpacity");
@@ -1546,10 +1587,69 @@ function createDataTable() {
 
 function clearFilters() {
     //console.log(changeSetTable);
-    changeSetTable
-        .columns().search('')
-        .draw();
+    if (changeSetTable && changeSetTable.columns) {
+        changeSetTable
+            .columns().search('')
+            .draw();
+    }
     $(".dtsearch").val('');
+}
+
+function cshIsCancelSubmit(event) {
+    var submitter = event && event.originalEvent && event.originalEvent.submitter;
+    if (!submitter) return false;
+    var name = (submitter.getAttribute('name') || '').toLowerCase();
+    var value = (submitter.getAttribute('value') || '').toLowerCase();
+    return name === 'cancel' || value === 'cancel';
+}
+
+function cshInstallAddPageSubmitBridge() {
+    if (!$('#entityType').length) {
+        $("#editPage").off('submit.cshSubmitBridge').on('submit.cshSubmitBridge', function () {
+            clearFilters();
+            return true;
+        });
+        return;
+    }
+    $("#editPage").off('submit.cshSubmitBridge').on('submit.cshSubmitBridge', function (event) {
+        if (cshIsCancelSubmit(event)) return true;
+        clearFilters();
+        if (!window.cshCart || !window.cshCart.getCart || !window.cshCart.runWorker) return true;
+
+        var form = this;
+        event.preventDefault();
+        Promise.resolve()
+            .then(function () {
+                if (window.cshCart.flushNow) return window.cshCart.flushNow();
+            })
+            .then(function () {
+                return window.cshCart.getCart(changeSetId);
+            })
+            .then(function (cartState) {
+                var cart = cartState && cartState.cart;
+                var staged = cart && cart.items ? cart.items.filter(function (it) {
+                    return it && it.status === 'staged' && it.salesforceId;
+                }) : [];
+                if (!staged.length) {
+                    HTMLFormElement.prototype.submit.call(form);
+                    return;
+                }
+                window.cshToast && window.cshToast.show(
+                    'Submitting ' + staged.length.toLocaleString() + ' staged component(s) in the background.',
+                    { type: 'info', duration: 4000 }
+                );
+                return window.cshCart.runWorker(changeSetId);
+            })
+            .catch(function (e) {
+                console.warn('CSH submit bridge failed, falling back to standard submit:', e && e.message);
+                window.cshToast && window.cshToast.show(
+                    'Enhanced submit failed. Using the standard Salesforce submit for visible rows only.',
+                    { type: 'warning', duration: 7000 }
+                );
+                HTMLFormElement.prototype.submit.call(form);
+            });
+        return false;
+    });
 }
 
 // Installs the unified toolbar actions group on the Add Components page.
@@ -1558,58 +1658,126 @@ function clearFilters() {
 // instead of being scattered around Salesforce's rolodex. Safe to call
 // multiple times — idempotent.
 function cshInstallToolbarActions() {
-    if ($('.csh-toolbar-actions').length) return;
-    var $group = $(
-        '<span class="csh-toolbar-actions" style="float:left;display:inline-flex;gap:4px;margin-right:8px;">' +
-          '<input type="button" value="Reset Search Filters"   class="clearFilters btn"     title="Reset search filters" />' +
-          '<input type="button" value="Export CSV"             class="cshExportCsv btn"     title="Download the currently-filtered table as a CSV file" />' +
-          '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
-          '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
-          '<input type="button" value="Refresh Type"           class="cshRefreshType btn"   title="Refresh the selected component type from Salesforce and update the local cache" />' +
-          '<input type="button" value="Full Sync"              class="cshFullSync btn"      title="Refresh the full server-side change set membership cache" />' +
-          '<span class="csh-type-sync-status" style="align-self:center;margin-left:4px;color:#666;font-size:12px;"></span>' +
-          '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
-        '</span>'
-    );
-    $group.prependTo('div.rolodex');
-
-    $group.find('.clearFilters').on('click', clearFilters);
-    $group.find('.cshExportCsv').on('click', cshExportTable);
-    $group.find('.cshExportPkg').on('click', function () {
-        if (!window.cshCart || !window.cshCart.exportCartAsPackageXml) {
-            window.cshToast && window.cshToast.show('Cart is not ready yet — try again in a moment.', { type: 'info' });
-            return;
-        }
-        window.cshCart.exportCartAsPackageXml()
-            .catch(function (e) { window.cshToast && window.cshToast.show('Export failed: ' + e.message, { type: 'error' }); });
-    });
-    $group.find('.cshImportPkg').on('click', function () {
-        $group.find('.cshImportPkgFile').trigger('click');
-    });
-    $group.find('.cshRefreshType').on('click', cshRefreshSelectedType);
-    $group.find('.cshFullSync').on('click', cshRunAddPageFullSync);
+    var $group = $('.csh-toolbar-actions').first();
+    if (!$group.length) {
+        $group = $(
+            '<span class="csh-toolbar-actions" style="float:left;display:inline-flex;gap:4px;margin-right:8px;">' +
+              '<input type="button" value="Reset Search Filters"   class="clearFilters btn"     title="Reset search filters" />' +
+              '<input type="button" value="Export CSV"             class="cshExportCsv btn"     title="Download the currently-filtered table as a CSV file" />' +
+              '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
+              '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
+              '<input type="button" value="Refresh Type"           class="cshRefreshType btn"   title="Refresh the selected component type from Salesforce and update the local cache" />' +
+              '<input type="button" value="Full Sync"              class="cshFullSync btn"      title="Refresh the full server-side change set membership cache" />' +
+              '<span class="csh-type-sync-status" style="align-self:center;margin-left:4px;color:#666;font-size:12px;"></span>' +
+              '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
+            '</span>'
+        );
+        $group.prependTo('div.rolodex');
+    }
+    cshWireToolbarActions();
     cshUpdateTypeSyncStatus();
-    $group.find('.cshImportPkgFile').on('change', async function (ev) {
-        var file = ev.target.files && ev.target.files[0];
-        if (!file) return;
-        try {
-            var text = await file.text();
-            if (!window.cshCart || !window.cshCart.importPackageXml) {
-                throw new Error('Cart module not loaded');
-            }
-            var added = await window.cshCart.importPackageXml(text);
-            window.cshToast && window.cshToast.show(
-                'Imported ' + added + ' item(s) from ' + file.name + '. ' +
-                'Items without a Salesforce Id will resolve when you visit each type.',
-                { type: 'success', duration: 6000 }
-            );
-        } catch (e) {
-            window.cshToast && window.cshToast.show('Import failed: ' + e.message, { type: 'error' });
-        }
-        ev.target.value = '';
-    });
 }
 
+function cshToolbarGroup() {
+    var $group = $('.csh-toolbar-actions').first();
+    if (!$group.length) {
+        cshInstallToolbarActions();
+        $group = $('.csh-toolbar-actions').first();
+    }
+    return $group;
+}
+
+function cshWireToolbarActions() {
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .clearFilters')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .clearFilters', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            clearFilters();
+        });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshExportCsv')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshExportCsv', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cshExportTable();
+        });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshExportPkg')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshExportPkg', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (!window.cshCart || !window.cshCart.exportCartAsPackageXml) {
+                window.cshToast && window.cshToast.show('Cart is not ready yet - try again in a moment.', { type: 'info' });
+                return;
+            }
+            Promise.resolve()
+                .then(function () {
+                    if (window.cshCart.flushNow) return window.cshCart.flushNow();
+                })
+                .then(function () {
+                    return window.cshCart.exportCartAsPackageXml();
+                })
+                .catch(function (e) {
+                    window.cshToast && window.cshToast.show('Export failed: ' + e.message, { type: 'error' });
+                });
+        });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshImportPkg')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshImportPkg', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            var $group = $(this).closest('.csh-toolbar-actions');
+            var input = $group.find('.cshImportPkgFile')[0] || cshToolbarGroup().find('.cshImportPkgFile')[0];
+            if (!input || typeof input.click !== 'function') {
+                window.cshToast && window.cshToast.show('Import file picker is not available on this page.', { type: 'error' });
+                return;
+            }
+            input.value = '';
+            input.click();
+        });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshRefreshType')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshRefreshType', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cshRefreshSelectedType();
+        });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshFullSync')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshFullSync', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cshRunAddPageFullSync();
+        });
+
+    $(document)
+        .off('change.cshToolbarActions', '.csh-toolbar-actions .cshImportPkgFile')
+        .on('change.cshToolbarActions', '.csh-toolbar-actions .cshImportPkgFile', async function (ev) {
+            var file = ev.target.files && ev.target.files[0];
+            if (!file) return;
+            try {
+                var text = await file.text();
+                if (!window.cshCart || !window.cshCart.importPackageXml) {
+                    throw new Error('Cart module not loaded');
+                }
+                var added = await window.cshCart.importPackageXml(text);
+                window.cshToast && window.cshToast.show(
+                    'Imported ' + added + ' item(s) from ' + file.name + '. ' +
+                    'Items without a Salesforce Id will resolve when you visit each type.',
+                    { type: 'success', duration: 6000 }
+                );
+            } catch (e) {
+                window.cshToast && window.cshToast.show('Import failed: ' + e.message, { type: 'error' });
+            }
+            ev.target.value = '';
+        });
+}
 function cshTypeSyncJobKey(orgId, type) {
     return 'component-type-refresh::' + orgId + '::' + (type || 'unknown');
 }
@@ -1633,6 +1801,13 @@ function cshFormatSyncDate(ts) {
     }
 }
 
+function cshFormatSyncStatus(status) {
+    if (status && status.running) return 'refreshing...';
+    var text = cshFormatSyncDate(status && status.latest);
+    if (status && status.count) text += ' (' + status.count.toLocaleString() + ' cached)';
+    return text;
+}
+
 async function cshMarkTypeSyncCompleted(count) {
     if (!window.cshDb || !window.cshDb.putSyncJob) return;
     if (window.cshDb.ready) await window.cshDb.ready();
@@ -1649,24 +1824,51 @@ async function cshMarkTypeSyncCompleted(count) {
     await cshUpdateTypeSyncStatus();
 }
 
+async function cshMarkTypeSyncRunning() {
+    if (!window.cshDb || !window.cshDb.putSyncJob) return;
+    if (window.cshDb.ready) await window.cshDb.ready();
+    var type = (resolvedMetadataType || selectedEntityType || '').trim();
+    if (!type) return;
+    var org = window.cshDb.orgId();
+    await window.cshDb.putSyncJob(cshTypeSyncJobKey(org, type), {
+        status: 'running',
+        startedAt: Date.now(),
+        completedAt: 0,
+        type: type,
+        count: 0,
+        source: 'add-page-type-refresh'
+    });
+    await cshUpdateTypeSyncStatus();
+}
+
+async function cshFinalizeTypeSync(count) {
+    var writes = cshMetadataCacheWrites.slice();
+    cshMetadataCacheWrites = [];
+    if (writes.length) await Promise.all(writes);
+    await cshMarkTypeSyncCompleted(count || cachedMetadataResults.length || 0);
+}
+
 async function cshGetTypeSyncStatus() {
-    var status = { latest: 0, count: 0, fresh: false };
+    var status = { latest: 0, count: 0, fresh: false, running: false };
     if (!window.cshDb) return status;
     if (window.cshDb.ready) await window.cshDb.ready();
     var org = window.cshDb.orgId();
     var types = cshCurrentCacheTypes();
+    var completedAt = 0;
     for (var i = 0; i < types.length; i++) {
         var rows = await window.cshDb.getComponentsByType(types[i]);
         status.count += rows.length;
-        rows.forEach(function (row) {
-            if (row && row.lastSeenAt && row.lastSeenAt > status.latest) status.latest = row.lastSeenAt;
-        });
         if (window.cshDb.getSyncJob) {
             var job = await window.cshDb.getSyncJob(cshTypeSyncJobKey(org, types[i]));
-            if (job && job.completedAt && job.completedAt > status.latest) status.latest = job.completedAt;
+            if (job && job.status === 'running') status.running = true;
+            if (job && job.count) status.count = Math.max(status.count, job.count);
+            if (job && job.status === 'completed' && job.completedAt && job.completedAt > completedAt) {
+                completedAt = job.completedAt;
+            }
         }
     }
-    status.fresh = !!status.latest && ((Date.now() - status.latest) < CSH_TYPE_CACHE_FRESH_MS);
+    status.latest = completedAt;
+    status.fresh = !!completedAt && ((Date.now() - completedAt) < CSH_TYPE_CACHE_FRESH_MS);
     return status;
 }
 
@@ -1675,7 +1877,7 @@ async function cshUpdateTypeSyncStatus() {
     if (!$status.length || !window.cshDb) return;
     try {
         var status = await cshGetTypeSyncStatus();
-        $status.text(cshFormatSyncDate(status.latest));
+        $status.text(cshFormatSyncStatus(status));
     } catch (e) {
         console.warn('cshUpdateTypeSyncStatus failed:', e && e.message);
     }
@@ -1731,21 +1933,35 @@ async function cshRefreshSelectedType() {
         window.cshToast && window.cshToast.show('Refreshing selected component type...', { type: 'info', duration: 1800 });
         await cshEnsureLocalConnection();
         if (cshOptimisticMetadataType) await cshRefreshOptimisticMetadataType();
+        cshMetadataCacheWrites = [];
+        await cshMarkTypeSyncRunning();
         await new Promise(function (resolve, reject) {
             var settled = false;
-            var sawCallback = false;
+            var callbackCount = 0;
+            var timeout = null;
             function done() {
                 if (settled) return;
                 settled = true;
                 clearInterval(watch);
+                clearTimeout(timeout);
                 resolve();
             }
+            function fail(e) {
+                if (settled) return;
+                settled = true;
+                clearInterval(watch);
+                clearTimeout(timeout);
+                reject(e);
+            }
             var watch = setInterval(function () {
-                if (numCallsInProgress <= 0 && sawCallback) done();
+                if (numCallsInProgress <= 0 && callbackCount > 0) done();
             }, 150);
+            timeout = setTimeout(function () {
+                fail(new Error('Timed out waiting for metadata refresh to finish'));
+            }, CSH_METADATA_REFRESH_TIMEOUT_MS);
             try {
                 getMetaData(function (metadataResponse) {
-                    sawCallback = true;
+                    callbackCount++;
                     try {
                         processListResults(metadataResponse);
                         if (changeSetTable && changeSetTable.rows) {
@@ -1753,25 +1969,27 @@ async function cshRefreshSelectedType() {
                         }
                         if (numCallsInProgress <= 0) done();
                     } catch (e) {
-                        clearInterval(watch);
-                        reject(e);
+                        fail(e);
                     }
                 });
                 setTimeout(function () {
-                    if (!sawCallback && numCallsInProgress <= 0) done();
-                }, 500);
+                    if (callbackCount === 0 && numCallsInProgress <= 0) done();
+                }, 1500);
             } catch (e) {
-                clearInterval(watch);
-                reject(e);
+                fail(e);
             }
         });
+        await cshFinalizeTypeSync(cachedMetadataResults.length);
         if (cshShouldPageThroughPicker() && !isLoadingMorePages) {
             shouldContinuePagination = true;
             isLoadingMorePages = true;
             startPaginationWithMetadata();
         }
         await cshUpdateTypeSyncStatus();
-        window.cshToast && window.cshToast.show('Selected component type refreshed.', { type: 'success', duration: 2500 });
+        window.cshToast && window.cshToast.show(
+            'Selected component type refreshed (' + cachedMetadataResults.length.toLocaleString() + ' metadata record(s)).',
+            { type: 'success', duration: 3000 }
+        );
     } catch (e) {
         window.cshToast && window.cshToast.show('Refresh Type failed: ' + ((e && e.message) || e), { type: 'error' });
         await cshUpdateTypeSyncStatus();
@@ -2813,6 +3031,10 @@ function cshCompareOnConnectSavedOrg() {
         $btn.prop('disabled', false).val(original);
         if (!response || !response.ok) {
             var msg = (response && response.error) || 'Unknown error';
+            if (response && response.userCancelled) {
+                window.cshToast && window.cshToast.show('Target org sign-in was cancelled.', { type: 'info' });
+                return;
+            }
             if (response && response.needsReauth) {
                 var orgData = $('#compareSavedOrgsSelect option:selected').data('org') || {};
                 var host = orgData.host || '';
@@ -2886,6 +3108,10 @@ async function cshCompareStartNewOrgLogin(env, customHost) {
     }, function (response) {
         if (!response || !response.ok) {
             var err = (response && response.error) || 'Unknown error';
+            if (response && response.userCancelled) {
+                window.cshToast && window.cshToast.show('Target org sign-in was cancelled.', { type: 'info' });
+                return;
+            }
             console.log('Problem logging in: ' + err);
             window.cshToast && window.cshToast.show('Problem logging in: ' + err, { type: 'error' });
             return;
@@ -3250,6 +3476,10 @@ function runEnhancedFlow() {
                     return;
                 }
                 // Custom callback that waits for all metadata calls to complete
+                cshMetadataCacheWrites = [];
+                cshMarkTypeSyncRunning().catch(function (e) {
+                    console.warn('cshDb type sync running marker failed:', e && e.message);
+                });
                 getMetaData(cshHandleMetadataResponse);
             } catch (error) {
                 console.error('Error during metadata fetch:', error);
@@ -3582,10 +3812,7 @@ $(document).ready(function () {
     $(".clearFilters").on('click', clearFilters);
 	$( "#logoutLink" ).on('click', deployLogout);
 
-    $("#editPage").on('submit', function (event) {
-        clearFilters();
-        return true;
-    });
+    cshInstallAddPageSubmitBridge();
 
     $('input[name="cancel"]').parent().on('click','#compareorg' , oauthLogin);
     // Saved-orgs wiring for Compare. These handlers mirror the Validate

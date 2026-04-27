@@ -303,7 +303,14 @@ async function cshRunOauthLogin(host) {
             chrome.identity.launchWebAuthFlow(
                 { url: authUrl, interactive: true },
                 function (url) {
-                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    if (chrome.runtime.lastError) {
+                        var msg = chrome.runtime.lastError.message || 'OAuth authorization was cancelled';
+                        var err = new Error(msg);
+                        if (/did not approve|cancel|denied|closed/i.test(msg)) {
+                            err.code = 'user-cancelled';
+                        }
+                        return reject(err);
+                    }
                     if (!url) return reject(new Error('No redirect URL returned'));
                     resolve(url);
                 }
@@ -805,6 +812,22 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return false;
     }
 
+    if (request.type === 'cshComparePopupReady') {
+        startCompareRetrieves(request.requestId).catch(function (err) {
+            console.error('Compare retrieve startup failed:', err);
+            chrome.runtime.sendMessage({
+                'setSide': 'lhs',
+                'err': err && err.message ? err.message : String(err)
+            });
+            chrome.runtime.sendMessage({
+                'setSide': 'rhs',
+                'err': err && err.message ? err.message : String(err)
+            });
+        });
+        sendResponse({ ok: true });
+        return false;
+    }
+
     // Handle OAuth requests (these stay in service worker as chrome.identity works here)
     if (request.oauth == "request") {
         getSfdcOauth2(sendResponse, request.environment);
@@ -1175,11 +1198,16 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                     freshlyLoggedIn: !!res.freshlyLoggedIn
                 });
             } catch (err) {
-                console.error('connectToDeploy failed:', err);
+                if (err && err.code === 'user-cancelled') {
+                    console.warn('connectToDeploy cancelled by user:', err.message || err);
+                } else {
+                    console.error('connectToDeploy failed:', err);
+                }
                 sendResponse({
                     oauth: 'response',
                     ok: false,
                     needsReauth: err && err.code === 'needs-reauth',
+                    userCancelled: err && err.code === 'user-cancelled',
                     error: err && err.message ? err.message : String(err)
                 });
             }
@@ -1581,19 +1609,47 @@ async function quickDeploy(port, currentId) {
     }
 }
 
+const cshPendingCompareRequests = {};
+
 function compareContents(type, item, localOrg, targetOrg) {
     // Encode every piece — item names can contain &, #, space, ? or / (e.g.
     // "FolderA/MyReport"); org labels are hostnames/usernames and usually
     // safe but encoding them keeps the URL parser honest if a label ever
     // includes a space or symbol. The popup decodes with decodeURIComponent.
-    var url = "compare.html?item=" + encodeURIComponent(item);
+    var requestId = 'cmp-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    cshPendingCompareRequests[requestId] = {
+        type: type,
+        item: item,
+        createdAt: Date.now()
+    };
+    var url = "compare.html?item=" + encodeURIComponent(item) +
+        "&requestId=" + encodeURIComponent(requestId);
     if (localOrg) url += "&localOrg=" + encodeURIComponent(localOrg);
     if (targetOrg) url += "&targetOrg=" + encodeURIComponent(targetOrg);
-    chrome.windows.create({'url': url, 'type': "popup", "focused": false},
-        async function (newWin) {
-            await getContents(type, item, 'local', "lhs");
-            await getContents(type, item, 'deploy', "rhs");
+    chrome.windows.create({ 'url': url, 'type': "popup", "focused": false });
+    setTimeout(function () {
+        if (cshPendingCompareRequests[requestId]) delete cshPendingCompareRequests[requestId];
+    }, 10 * 60 * 1000);
+}
+
+async function startCompareRetrieves(requestId) {
+    var req = cshPendingCompareRequests[requestId];
+    if (!req) {
+        chrome.runtime.sendMessage({
+            'setSide': 'lhs',
+            'err': 'Compare request expired or was not found. Re-open the compare popup.'
         });
+        chrome.runtime.sendMessage({
+            'setSide': 'rhs',
+            'err': 'Compare request expired or was not found. Re-open the compare popup.'
+        });
+        return;
+    }
+    delete cshPendingCompareRequests[requestId];
+    await Promise.all([
+        getContents(req.type, req.item, 'local', "lhs"),
+        getContents(req.type, req.item, 'deploy', "rhs")
+    ]);
 }
 
 async function getContents(type, item, connType, side) {

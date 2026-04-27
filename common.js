@@ -178,11 +178,18 @@ window.cshAuth = (function () {
                     '<div style="display:grid;gap:10px;margin-top:12px;">' +
                       '<div style="border:1px solid #dddbda;border-radius:6px;padding:12px;">' +
                         '<strong>Option 1: Use the extension connected app</strong>' +
-                        '<p style="margin:6px 0 0;color:#444;">Fastest setup. You will be redirected to Salesforce and asked to approve the connected app used by this extension.</p>' +
+                        '<p style="margin:6px 0 0;color:#444;">Fastest setup. You will be redirected to Salesforce and asked to approve the connected app used by this extension. Change-set and metadata data is loaded and processed locally in your browser; the extension does not save that data to any external system.</p>' +
                       '</div>' +
                       '<div style="border:1px solid #dddbda;border-radius:6px;padding:12px;">' +
                         '<strong>Option 2: Use your own connected app</strong>' +
-                        '<p style="margin:6px 0 0;color:#444;">Recommended for orgs that require admin-owned OAuth apps. Open Options, copy the callback URL, configure your connected app scopes, save your Consumer Key, then return here and sign in.</p>' +
+                        '<p style="margin:6px 0 8px;color:#444;">Recommended for orgs that require admin-owned OAuth apps.</p>' +
+                        '<ol style="margin:0 0 0 18px;padding:0;color:#444;">' +
+                          '<li>In Salesforce, go to <strong>Setup &gt; App Manager &gt; New Connected App</strong>.</li>' +
+                          '<li>Enable <strong>OAuth Settings</strong> and paste the callback URL from this extension&apos;s Options page.</li>' +
+                          '<li>Add OAuth scopes: <strong>Manage user data via APIs (api)</strong>, <strong>Access the identity URL service</strong>, and <strong>Perform requests at any time (refresh_token, offline_access)</strong>.</li>' +
+                          '<li>For browser-extension PKCE flow, leave client-secret requirements unchecked and enable PKCE if your org supports it.</li>' +
+                          '<li>Save the connected app, copy its <strong>Consumer Key</strong>, paste it in Options, then return here and sign in.</li>' +
+                        '</ol>' +
                       '</div>' +
                     '</div>' +
                   '</div>' +

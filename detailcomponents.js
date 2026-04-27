@@ -26,6 +26,12 @@
     var pendingDeletes = {};     // mid -> {resolve, reject}
     var pageBridgeInjected = false;
     var bulkCancelled = false;
+    var currentComponentsTable = null;
+    var delegatedEventsWired = false;
+    var tableObserver = null;
+    var pageObserverInstalled = false;
+    var initialAuthoritativeSyncStarted = false;
+    var cartSyncRequestWired = false;
 
     // Column indices resolved by scanning the header row once the table is
     // found. Keyed by header text lowercased; -1 if that header isn't present.
@@ -79,6 +85,8 @@
     var FILTER_TOOLBAR_ENABLED = false;
 
     function setupPage(table) {
+        if (!table || currentComponentsTable === table) return;
+        currentComponentsTable = table;
         var canBulkRemove = BULK_REMOVE_ENABLED && !!table.querySelector(REMOVE_LINK_SEL);
         injectPageBridge();
         if (canBulkRemove) injectSelectionColumn(table);
@@ -88,9 +96,57 @@
         hijackRemoveLinks(table);
         observeTableChanges(table);
         wireDelegatedEvents(table);
+        wireCartSyncRequest();
         if (FILTER_TOOLBAR_ENABLED) applyFilters(table); // populates the "N components" counter
-        backgroundSyncCart(table);
+        var forceInitialSync = !initialAuthoritativeSyncStarted;
+        initialAuthoritativeSyncStarted = true;
+        backgroundSyncCart(table, { force: forceInitialSync });
+        installPageObserver();
         console.log('detailcomponents: initialized on', table);
+    }
+
+    function wireCartSyncRequest() {
+        if (cartSyncRequestWired) return;
+        cartSyncRequestWired = true;
+        window.addEventListener('csh:cart-sync-request', async function (ev) {
+            if (ev.detail) ev.detail.handled = true;
+            var table = getCurrentTable();
+            if (!table) return;
+            var ok = await backgroundSyncCart(table, { force: true });
+            if (window.cshToast) {
+                window.cshToast.show(
+                    ok ? 'Change Set Details synced from Salesforce.' : 'Change Set Details sync failed.',
+                    { type: ok ? 'success' : 'error', duration: ok ? 3000 : 7000 }
+                );
+            }
+        });
+    }
+
+    function getCurrentTable() {
+        if (currentComponentsTable && document.documentElement.contains(currentComponentsTable)) {
+            return currentComponentsTable;
+        }
+        var table = document.querySelector(COMPONENTS_TABLE_SEL);
+        if (table && table.querySelector('tr.headerRow')) currentComponentsTable = table;
+        return currentComponentsTable;
+    }
+
+    function installPageObserver() {
+        if (pageObserverInstalled || !document.body) return;
+        pageObserverInstalled = true;
+        var scheduled = false;
+        function scheduleSetup() {
+            if (scheduled) return;
+            scheduled = true;
+            setTimeout(function () {
+                scheduled = false;
+                var table = document.querySelector(COMPONENTS_TABLE_SEL);
+                if (table && table.querySelector('tr.headerRow') && table !== currentComponentsTable) {
+                    setupPage(table);
+                }
+            }, 80);
+        }
+        new MutationObserver(scheduleSetup).observe(document.body, { childList: true, subtree: true });
     }
 
     // -----------------------------------------------------------------------
@@ -281,9 +337,7 @@
                 if (window.cshCart.hydrateFromIndexedDb) {
                     await window.cshCart.hydrateFromIndexedDb(keys);
                 }
-                console.log('[CSH] background authoritative sync skipped: using IndexedDB membership cache');
-                setSync('idle');
-                return true;
+                console.log('[CSH] hydrated from IndexedDB membership cache; checking authoritative sync freshness');
             }
             syncClaim = window.cshCart.beginAuthoritativeSync
                 ? await window.cshCart.beginAuthoritativeSync(keys, { force: !!opts.force })
@@ -324,6 +378,8 @@
     }
 
     async function forceFullSync(table) {
+        table = table || getCurrentTable();
+        if (!table) return;
         var btn = document.querySelector('.csh-dc-full-sync-btn');
         if (btn) {
             btn.disabled = true;
@@ -340,6 +396,27 @@
                 btn.textContent = 'Full Sync';
             }
         }
+    }
+
+    async function currentChangeSetKeys() {
+        var csId = urlChangeSetId();
+        if (!csId) return [];
+        var keys = [csId];
+        try {
+            var packageId = await resolvePackageId(csId);
+            if (packageId && packageId !== csId) keys.push(packageId);
+        } catch (e) {
+            console.warn('[CSH] could not resolve package id for cart removal:', e && e.message);
+        }
+        return keys;
+    }
+
+    async function removeFromCartPanel(items) {
+        if (!items || !items.length || !window.cshCart || !window.cshCart.removeServerItems) return;
+        var keys = await currentChangeSetKeys();
+        if (!keys.length) return;
+        var result = await window.cshCart.removeServerItems(keys, items);
+        console.log('[CSH] removed deleted component(s) from cart panel:', result && result.removed);
     }
 
     // Scan the header row once to locate Name / Parent Object / Type / Full
@@ -497,6 +574,10 @@
             var name = nameCell ? (nameCell.textContent || '').trim() : '';
             if (name) label = name;
         }
+        var type = '';
+        if (row && colIndex.type >= 0 && row.children[colIndex.type]) {
+            type = (row.children[colIndex.type].textContent || '').trim();
+        }
         if (!confirm('Remove "' + label + '" from this change set? This cannot be undone.')) return;
         if (!window.cshChangeSetOps || !window.cshChangeSetOps.removeById) {
             console.error('[CSH] cshChangeSetOps not available for single remove');
@@ -506,11 +587,15 @@
         if (row) row.style.opacity = '0.5';
         try {
             await window.cshChangeSetOps.removeById(cid);
+            await removeFromCartPanel([{ id: cid, type: type, name: label }]);
             // removeOne() inside cshChangeSetOps already purges the row from
             // the DOM, so there's nothing more to do on success.
             if (window.cshToast) {
                 window.cshToast.show('Removed "' + label + '"', { type: 'success', duration: 3000 });
             }
+            backgroundSyncCart(getCurrentTable(), { force: true }).catch(function (e) {
+                console.warn('[CSH] post-remove authoritative sync failed:', e && e.message);
+            });
         } catch (err) {
             if (row) row.style.opacity = '';
             var msg = (err && err.message) || 'Remove failed';
@@ -661,7 +746,11 @@
     // Event wiring (delegated so rows added later by A4J refreshes work too).
     // -----------------------------------------------------------------------
     function wireDelegatedEvents(table) {
+        if (delegatedEventsWired) return;
+        delegatedEventsWired = true;
         document.addEventListener('change', function (ev) {
+            var table = getCurrentTable();
+            if (!table) return;
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all')) {
                 // Header checkbox — only ticks currently-visible rows. Updates
@@ -686,6 +775,8 @@
         // 'input' event fires on every keystroke / clear for <input type="search">
         document.addEventListener('input', function (ev) {
             if (ev.target.classList.contains('csh-dc-search')) {
+                var table = getCurrentTable();
+                if (!table) return;
                 applyFilters(table);
                 updateSelectionCount();
             }
@@ -696,6 +787,8 @@
         // a row rendered between setupPage() and the MutationObserver's
         // next tick).
         document.addEventListener('click', function (ev) {
+            var table = getCurrentTable();
+            if (!table) return;
             var link = ev.target && ev.target.closest && ev.target.closest(REMOVE_LINK_SEL);
             if (!link || !table.contains(link)) return;
             ev.preventDefault();
@@ -708,6 +801,8 @@
         }, true);
 
         document.addEventListener('click', function (ev) {
+            var table = getCurrentTable();
+            if (!table) return;
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all-btn')) {
                 // Select visible — does NOT tick rows hidden by the filter
@@ -731,7 +826,9 @@
     }
 
     function visibleSelectCheckboxes() {
-        return Array.from(document.querySelectorAll('.csh-dc-select-row:not([disabled])'))
+        var table = getCurrentTable();
+        if (!table) return [];
+        return Array.from(table.querySelectorAll('.csh-dc-select-row:not([disabled])'))
             .filter(function (cb) {
                 var row = cb.closest('tr');
                 return row && row.style.display !== 'none';
@@ -776,6 +873,10 @@
     // to re-annotate any newly-inserted rows so they get our select column.
     // -----------------------------------------------------------------------
     function observeTableChanges(table) {
+        if (tableObserver) {
+            try { tableObserver.disconnect(); } catch (_) {}
+            tableObserver = null;
+        }
         var refreshPending = false;
         function scheduleRefresh() {
             if (refreshPending) return;
@@ -792,7 +893,7 @@
             }, 80);
         }
 
-        var observer = new MutationObserver(function (mutations) {
+        tableObserver = new MutationObserver(function (mutations) {
             var sawRowMutation = false;
             mutations.forEach(function (m) {
                 m.addedNodes.forEach(function (node) {
@@ -822,7 +923,7 @@
             if (sawRowMutation) scheduleRefresh();
             updateSelectionCount();
         });
-        observer.observe(table, { childList: true, subtree: true });
+        tableObserver.observe(table, { childList: true, subtree: true });
     }
 
     // -----------------------------------------------------------------------
@@ -1359,6 +1460,7 @@
 
         var byCid = {};
         items.forEach(function (it) { byCid[it.cid] = it; });
+        var removedItems = [];
 
         var result = await window.cshChangeSetOps.removeManyByIds(
             items.map(function (i) { return i.cid; }),
@@ -1368,6 +1470,7 @@
                     var name = (byCid[cid] && byCid[cid].name) || cid;
                     if (ok) {
                         selectedItems.delete(cid);
+                        removedItems.push({ id: cid, type: (byCid[cid] && byCid[cid].type) || '', name: name });
                         appendLog('✓ ' + name, 'ok');
                     } else {
                         appendLog('✗ ' + name + ' — ' + (err && err.message || 'unknown'), 'fail');
@@ -1379,6 +1482,12 @@
             }
         );
 
+        if (removedItems.length) {
+            await removeFromCartPanel(removedItems);
+            backgroundSyncCart(getCurrentTable(), { force: true }).catch(function (e) {
+                console.warn('[CSH] post-bulk-remove authoritative sync failed:', e && e.message);
+            });
+        }
         finishProgressModal(result.done, result.failed);
         updateSelectionCount();
     }

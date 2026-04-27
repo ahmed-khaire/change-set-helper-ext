@@ -86,6 +86,7 @@
 }
 
 #csh-cart-panel .csh-cart-close,
+#csh-cart-panel .csh-cart-sync-now,
 #csh-cart-panel .csh-cart-toggle-all {
     background: transparent;
     border: 0;
@@ -102,7 +103,19 @@
     opacity: 0.85;
 }
 
+#csh-cart-panel .csh-cart-sync-now {
+    font-size: 16px;
+    margin-right: 2px;
+    opacity: 0.85;
+}
+
+#csh-cart-panel .csh-cart-sync-now:hover,
 #csh-cart-panel .csh-cart-toggle-all:hover { opacity: 1; }
+
+#csh-cart-panel .csh-cart-sync-now:disabled {
+    cursor: default;
+    opacity: 0.45;
+}
 
 #csh-cart-panel .csh-cart-body {
     padding: 8px 10px;

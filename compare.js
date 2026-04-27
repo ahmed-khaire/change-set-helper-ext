@@ -6,6 +6,7 @@ $(document).ready(function () {
 	// decodes each field individually and handles missing params cleanly.
 	var params = new URLSearchParams(window.location.search);
 	var compareItem = params.get('item') || '';
+	var requestId = params.get('requestId') || '';
 	var localOrg = params.get('localOrg') || 'This org';
 	var targetOrg = params.get('targetOrg') || 'Other org';
 	window.document.title = "COMPARING " + compareItem + " — " + localOrg + " < — > " + targetOrg;
@@ -189,4 +190,16 @@ $(document).ready(function () {
 			}
 
 	});
+	if (requestId) {
+		chrome.runtime.sendMessage({ type: 'cshComparePopupReady', requestId: requestId }, function (resp) {
+			if (!resp || !resp.ok) {
+				progress.lhs = 'error';
+				progress.rhs = 'error';
+				$('.csh-compare-progress-phase').append(
+					'<div style="color:#c23934;margin-top:4px;">Compare startup failed. Re-open the popup.</div>'
+				);
+				updateProgressPanel();
+			}
+		});
+	}
 });
