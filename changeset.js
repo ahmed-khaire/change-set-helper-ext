@@ -8,6 +8,12 @@ var cachedMetadataResults = []; // Store metadata results to reuse during pagina
 var cachedMetadataIds = new Set(); // Companion to cachedMetadataResults for O(1) dedup
 var dynamicColumns = null; // Store dynamic column configuration based on metadata properties
 var resolvedMetadataType = null; // Metadata API type name resolved via override map or describeMetadata cache
+var cshOptimisticMetadataType = false; // true when trying an unmapped future picker value
+var cshAddPageChangeSetId = null;
+var cshAddPagePackageId = null;
+var cshTypeRefreshRunning = false;
+var cshMetadataOverlayTimer = null;
+var CSH_TYPE_CACHE_FRESH_MS = 15 * 60 * 1000;
 
 // Verbose per-call diagnostic logs. Off in production because on big orgs
 // (Custom Fields / Layouts / RecordTypes) processListResults and
@@ -227,6 +233,57 @@ function addColumnsToRows(rows) {
     });
 }
 
+function cshNormalizeNameHeader() {
+    var $headers = $("table.list tr.headerRow").children('th,td');
+    if (!$headers.length) return;
+
+    var hasName = false;
+    $headers.each(function () {
+        var text = ($(this).find('a').text() || $(this).text() || '').trim();
+        if (text === 'Name' || text === 'Component Name') hasName = true;
+    });
+    if (hasName) return;
+
+    var $sortedNameHeader = $headers.filter(function () {
+        var text = ($(this).text() || '').replace(/\s+/g, ' ').trim();
+        return /^(Sorted\s+)?(Ascending|Descending)$/i.test(text) ||
+            /^Sorted\s+(Ascending|Descending)$/i.test(text);
+    }).first();
+
+    if ($sortedNameHeader.length) {
+        $sortedNameHeader.text('Name');
+        return;
+    }
+
+    var dataCellCount = cshOriginalRowCellCount || $("table.list tr.dataRow:first").children('td').length;
+    var nameIndex = ($headers.length === dataCellCount + 1) ? 1 : 0;
+    if ($headers.eq(nameIndex).length) {
+        $headers.eq(nameIndex).text('Name');
+    }
+}
+
+function cshNormalizeRenderedNameHeader(tableApi) {
+    var api = tableApi || changeSetTable;
+    if (!api || !api.column) return;
+
+    var header = api.column(1).header();
+    if (!header) return;
+
+    var $allHeaders = $(api.table().header()).find('th,td');
+    var alreadyHasName = false;
+    $allHeaders.each(function () {
+        var text = ($(this).find('a').text() || $(this).text() || '').replace(/\s+/g, ' ').trim();
+        if (text === 'Name' || text === 'Component Name') alreadyHasName = true;
+    });
+    if (alreadyHasName) return;
+
+    var $header = $(header);
+    var text = ($header.text() || '').replace(/\s+/g, ' ').trim();
+    if (!text || /^(Sorted\s+)?(Ascending|Descending)$/i.test(text)) {
+        $header.text('Name');
+    }
+}
+
 function setupTable() {
     console.log('========================================');
     console.log('setupTable: Starting table setup');
@@ -251,6 +308,7 @@ function setupTable() {
     cshOriginalRowCellCount = widestDataRow;
     console.log('setupTable: original header cells =', cshOriginalHeaderCount,
                 ', widest data row =', widestDataRow);
+    cshNormalizeNameHeader();
 
     // Log original header structure
     var originalHeaders = [];
@@ -462,7 +520,22 @@ function determineMetadataColumns(metadataRecordOrArray) {
     // fullName is skipped in the generic union loop because we've already
     // handled it as the Developer Name column above (types where it matters)
     // or intentionally omitted it (types where it'd duplicate the Name cell).
-    var skipProperties = ['id', 'type', 'fileName', 'manageableState', 'namespacePrefix', 'fullName'];
+    var skipProperties = [
+        'id',
+        'type',
+        'fileName',
+        'manageableState',
+        'namespacePrefix',
+        'fullName',
+        // IndexedDB cache bookkeeping. Cached rows are normalized before being
+        // reused on the Add page, but these fields are not Salesforce metadata
+        // columns and should never be shown in the component table.
+        'key',
+        'orgId',
+        'name',
+        'source',
+        'lastSeenAt'
+    ];
 
     // Preferred order for common properties
     // Note: ID columns (createdById, lastModifiedById) are automatically filtered out
@@ -539,6 +612,10 @@ function determineMetadataColumns(metadataRecordOrArray) {
 
 
 function processListResults(response) {
+    response = response || {};
+    if (response.err || response.error) {
+        console.warn('processListResults: metadata response error:', response.err || response.error);
+    }
     console.log('========================================');
     console.log('processListResults: Received response from JSforce');
     console.log('Response type:', typeof response);
@@ -558,6 +635,20 @@ function processListResults(response) {
     results = cshApplyPostFilter(results) || results;
     var len = results ? results.length : 0;
     console.log('Processing', len, 'metadata results from JSforce');
+    var cacheWrite = Promise.resolve();
+    if (window.cshDb && len > 0) {
+        cacheWrite = window.cshDb.upsertComponents(results, {
+            type: resolvedMetadataType || selectedEntityType,
+            source: 'add-page-metadata'
+        }).catch(function (e) {
+            console.warn('cshDb add-page metadata cache failed:', e && e.message);
+        });
+    }
+    cacheWrite.then(function () {
+        cshMarkTypeSyncCompleted(len).catch(function (e) {
+            console.warn('cshDb type sync status update failed:', e && e.message);
+        });
+    });
 
     // Log first few results to see data structure. Gated: the object print
     // stringifies the full record, which is costly when fired per batch.
@@ -657,10 +748,55 @@ function processListResults(response) {
     // During progressive loading, table is already created
     if (numCallsInProgress <= 0 && !changeSetTable) {
         console.log('All metadata calls complete - creating DataTable');
+        cshHideMetadataLoadingOverlay();
         createDataTable();
     }
     console.log('========================================');
 
+}
+
+async function cshHydrateFromIndexedDbCache() {
+    if (!window.cshDb || !resolvedMetadataType) return 0;
+    try {
+        var cached = await window.cshDb.getComponentsByType(resolvedMetadataType);
+        if ((!cached || !cached.length) && selectedEntityType && selectedEntityType !== resolvedMetadataType) {
+            cached = await window.cshDb.getComponentsByType(selectedEntityType);
+        }
+        if ((!cached || !cached.length) && resolvedMetadataType === 'FlowDefinition') {
+            cached = await window.cshDb.getComponentsByType('Flow');
+        }
+        if (!cached || !cached.length) return 0;
+        console.log('[CSH] applying cached IndexedDB metadata for', resolvedMetadataType, cached.length, 'record(s)');
+        cshUpdateTypeSyncStatus();
+
+        if (!dynamicColumns && cached[0]) {
+            dynamicColumns = determineMetadataColumns(cached);
+            setupTable();
+        }
+        for (var i = 0; i < cached.length; i++) {
+            var rid = cached[i] && cached[i].id;
+            if (rid && !cachedMetadataIds.has(rid)) {
+                cachedMetadataIds.add(rid);
+                cachedMetadataResults.push(cached[i]);
+            }
+        }
+        applyMetadataToRows(cached);
+        if (!changeSetTable) {
+            totalComponentCount = listTableLength;
+            createDataTable();
+        } else if (changeSetTable.rows) {
+            changeSetTable.rows().invalidate('dom').draw(false);
+        }
+        cshHideMetadataLoadingOverlay();
+        window.cshToast && window.cshToast.show(
+            'Loaded cached metadata for this component type.',
+            { type: 'info', duration: 2500 }
+        );
+        return cached.length;
+    } catch (e) {
+        console.warn('cshHydrateFromIndexedDbCache failed:', e && e.message);
+        return 0;
+    }
 }
 
 // Apply metadata to rows in the table
@@ -881,9 +1017,42 @@ function cshAppendTargetOnlyRows(records, env) {
     console.log('cshAppendTargetOnlyRows: added', records.length, 'ghost rows');
 }
 
-function processCompareResults(results, env) {
+function cshResetCompareDisplay() {
+    if (!changeSetTable) return;
+    changeSetTable.rows(function (idx, data, node) {
+        return !!(node && node.getAttribute('data-csh-target-only') === '1');
+    }).remove();
+    changeSetTable.rows().every(function () {
+        var node = this.node();
+        if (!node) return;
+        node.classList.remove('csh-diff-newer-local', 'csh-diff-newer-target', 'csh-diff-same');
+        var icon = node.querySelector('.csh-compare-icon');
+        if (icon && icon.parentNode) icon.parentNode.removeChild(icon);
+    });
+    [compareColumnIndices.compareDateMod, compareColumnIndices.compareModBy, compareColumnIndices.fullName].forEach(function (idx) {
+        if (idx < 0) return;
+        changeSetTable.cells(null, idx).every(function () {
+            var node = this.node();
+            if (node) node.textContent = '';
+        });
+    });
+}
+
+function processCompareResults(results, env, opts) {
+    opts = opts || {};
+    results = Array.isArray(results) ? results : [];
     console.log('processCompareResults: Processing', results.length, 'compare results');
     console.log('processCompareResults: Using column indices:', compareColumnIndices);
+    cshResetCompareDisplay();
+    if (window.cshDb && results.length && !opts.skipCacheWrite) {
+        window.cshDb.upsertComponents(results, {
+            type: resolvedMetadataType || selectedEntityType,
+            orgId: opts.orgId || cshLastCompareOrgId || undefined,
+            source: 'compare-' + (env || 'target')
+        }).catch(function (e) {
+            console.warn('cshDb compare metadata cache failed:', e && e.message);
+        });
+    }
 
     // Show compare columns (use dynamic indices)
     changeSetTable.column(compareColumnIndices.folder).visible(true);  // Folder (temporarily shown for processing)
@@ -1055,12 +1224,72 @@ function processCompareResults(results, env) {
     console.log('processCompareResults: Completed');
 }
 
+async function cshHydrateCompareFromIndexedDb(orgId, env) {
+    if (!window.cshDb || !orgId || !resolvedMetadataType || !changeSetTable) return 0;
+    try {
+        var cached = await window.cshDb.getComponentsByType(resolvedMetadataType, { orgId: orgId });
+        if ((!cached || !cached.length) && selectedEntityType && selectedEntityType !== resolvedMetadataType) {
+            cached = await window.cshDb.getComponentsByType(selectedEntityType, { orgId: orgId });
+        }
+        if ((!cached || !cached.length) && resolvedMetadataType === 'FlowDefinition') {
+            cached = await window.cshDb.getComponentsByType('Flow', { orgId: orgId });
+        }
+        if (!cached || !cached.length) return 0;
+        processCompareResults(cached, env, {
+            orgId: orgId,
+            skipCacheWrite: true
+        });
+        window.cshToast && window.cshToast.show(
+            'Loaded cached compare metadata. Refreshing latest target data in the background...',
+            { type: 'info', duration: 2500 }
+        );
+        return cached.length;
+    } catch (e) {
+        console.warn('cshDb compare hydrate failed:', e && e.message);
+        return 0;
+    }
+}
+
+function cshShowMetadataLoadingOverlayDelayed() {
+    clearTimeout(cshMetadataOverlayTimer);
+    cshMetadataOverlayTimer = setTimeout(function () {
+        if ($('#csh-loading-overlay').length) return;
+        var loadingHtml = `
+        <style>
+            @keyframes csh-spinner {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+        </style>
+        <div id="csh-loading-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+             background: rgba(0,0,0,0.35); z-index: 9999; display: flex; align-items: center; justify-content: center;">
+            <div style="background: white; border: 3px solid #0070d2; border-radius: 8px; padding: 30px;
+                 text-align: center; box-shadow: 0 4px 16px rgba(0,0,0,0.3);">
+                <div style="width: 60px; height: 60px; border: 6px solid #f3f3f3; border-top: 6px solid #0070d2;
+                     border-radius: 50%; margin: 0 auto 20px; animation: csh-spinner 1s linear infinite;"></div>
+                <h3 style="margin: 0 0 10px 0; color: #0070d2;">Loading Metadata...</h3>
+                <p style="margin: 0; color: #666;">Please wait while we fetch component details</p>
+            </div>
+        </div>`;
+        $('body').append(loadingHtml);
+        $("#editPage").addClass("lowOpacity");
+    }, 450);
+}
+
+function cshHideMetadataLoadingOverlay() {
+    clearTimeout(cshMetadataOverlayTimer);
+    cshMetadataOverlayTimer = null;
+    $('#csh-loading-overlay').remove();
+    $("#editPage").removeClass("lowOpacity");
+}
+
 function createDataTable() {
     // Prevent double initialization
     var tableSelector = 'div.bPageBlock > div.pbBody > table.list';
     if ($.fn.DataTable.isDataTable(tableSelector)) {
         console.log('createDataTable: Table already initialized, getting existing instance');
         changeSetTable = $(tableSelector).DataTable(); // Get existing instance
+        cshNormalizeRenderedNameHeader(changeSetTable);
 
         // Filters should already exist from first init via initComplete callback
         // If they're missing, log a warning (shouldn't happen)
@@ -1201,6 +1430,9 @@ function cshInstallToolbarActions() {
           '<input type="button" value="Export CSV"             class="cshExportCsv btn"     title="Download the currently-filtered table as a CSV file" />' +
           '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
           '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
+          '<input type="button" value="Refresh Type"           class="cshRefreshType btn"   title="Refresh the selected component type from Salesforce and update the local cache" />' +
+          '<input type="button" value="Full Sync"              class="cshFullSync btn"      title="Refresh the full server-side change set membership cache" />' +
+          '<span class="csh-type-sync-status" style="align-self:center;margin-left:4px;color:#666;font-size:12px;"></span>' +
           '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
         '</span>'
     );
@@ -1219,6 +1451,9 @@ function cshInstallToolbarActions() {
     $group.find('.cshImportPkg').on('click', function () {
         $group.find('.cshImportPkgFile').trigger('click');
     });
+    $group.find('.cshRefreshType').on('click', cshRefreshSelectedType);
+    $group.find('.cshFullSync').on('click', cshRunAddPageFullSync);
+    cshUpdateTypeSyncStatus();
     $group.find('.cshImportPkgFile').on('change', async function (ev) {
         var file = ev.target.files && ev.target.files[0];
         if (!file) return;
@@ -1238,6 +1473,206 @@ function cshInstallToolbarActions() {
         }
         ev.target.value = '';
     });
+}
+
+function cshTypeSyncJobKey(orgId, type) {
+    return 'component-type-refresh::' + orgId + '::' + (type || 'unknown');
+}
+
+function cshCurrentCacheTypes() {
+    var types = [];
+    if (resolvedMetadataType) types.push(resolvedMetadataType);
+    if (selectedEntityType && selectedEntityType !== resolvedMetadataType) types.push(selectedEntityType);
+    if (resolvedMetadataType === 'FlowDefinition') types.push('Flow');
+    return types.filter(function (type, idx) {
+        return type && types.indexOf(type) === idx;
+    });
+}
+
+function cshFormatSyncDate(ts) {
+    if (!ts) return 'never refreshed';
+    try {
+        return 'last refreshed ' + new Date(ts).toLocaleString();
+    } catch (_) {
+        return 'last refreshed ' + new Date(ts).toString();
+    }
+}
+
+async function cshMarkTypeSyncCompleted(count) {
+    if (!window.cshDb || !window.cshDb.putSyncJob) return;
+    if (window.cshDb.ready) await window.cshDb.ready();
+    var type = (resolvedMetadataType || selectedEntityType || '').trim();
+    if (!type) return;
+    var org = window.cshDb.orgId();
+    await window.cshDb.putSyncJob(cshTypeSyncJobKey(org, type), {
+        status: 'completed',
+        completedAt: Date.now(),
+        type: type,
+        count: count || 0,
+        source: 'add-page-type-refresh'
+    });
+    await cshUpdateTypeSyncStatus();
+}
+
+async function cshGetTypeSyncStatus() {
+    var status = { latest: 0, count: 0, fresh: false };
+    if (!window.cshDb) return status;
+    if (window.cshDb.ready) await window.cshDb.ready();
+    var org = window.cshDb.orgId();
+    var types = cshCurrentCacheTypes();
+    for (var i = 0; i < types.length; i++) {
+        var rows = await window.cshDb.getComponentsByType(types[i]);
+        status.count += rows.length;
+        rows.forEach(function (row) {
+            if (row && row.lastSeenAt && row.lastSeenAt > status.latest) status.latest = row.lastSeenAt;
+        });
+        if (window.cshDb.getSyncJob) {
+            var job = await window.cshDb.getSyncJob(cshTypeSyncJobKey(org, types[i]));
+            if (job && job.completedAt && job.completedAt > status.latest) status.latest = job.completedAt;
+        }
+    }
+    status.fresh = !!status.latest && ((Date.now() - status.latest) < CSH_TYPE_CACHE_FRESH_MS);
+    return status;
+}
+
+async function cshUpdateTypeSyncStatus() {
+    var $status = $('.csh-type-sync-status');
+    if (!$status.length || !window.cshDb) return;
+    try {
+        var status = await cshGetTypeSyncStatus();
+        $status.text(cshFormatSyncDate(status.latest));
+    } catch (e) {
+        console.warn('cshUpdateTypeSyncStatus failed:', e && e.message);
+    }
+}
+
+function cshEnsureLocalConnection() {
+    return new Promise(function (resolve, reject) {
+        if (!window.cshSession || !window.cshSession.ready) {
+            reject(new Error('Salesforce session helper is not available'));
+            return;
+        }
+        window.cshSession.ready.then(function (sid) {
+            if (!sid) {
+                reject(new Error('Salesforce session not available'));
+                return;
+            }
+            chrome.runtime.sendMessage({
+                oauth: 'connectToLocal',
+                sessionId: sid,
+                serverUrl: serverUrl,
+                authMode: window.cshSession.mode ? window.cshSession.mode() : 'sid',
+                instanceUrl: window.cshSession.instanceUrl ? window.cshSession.instanceUrl() : serverUrl
+            }, function (response) {
+                if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                    return;
+                }
+                if (response && response.error) {
+                    reject(new Error(response.error));
+                    return;
+                }
+                resolve();
+            });
+        }).catch(reject);
+    });
+}
+
+async function cshRefreshSelectedType() {
+    if (cshTypeRefreshRunning) return;
+    if (!resolvedMetadataType && !selectedEntityType) {
+        window.cshToast && window.cshToast.show('No selected component type to refresh.', { type: 'error' });
+        return;
+    }
+    if (numCallsInProgress > 0) {
+        window.cshToast && window.cshToast.show('Metadata is already refreshing for this type.', { type: 'info' });
+        return;
+    }
+    var $btn = $('.cshRefreshType');
+    cshTypeRefreshRunning = true;
+    try {
+        $btn.prop('disabled', true).val('Refreshing...');
+        $('.csh-type-sync-status').text('refreshing...');
+        window.cshToast && window.cshToast.show('Refreshing selected component type...', { type: 'info', duration: 1800 });
+        await cshEnsureLocalConnection();
+        if (cshOptimisticMetadataType) await cshRefreshOptimisticMetadataType();
+        await new Promise(function (resolve, reject) {
+            var settled = false;
+            var sawCallback = false;
+            function done() {
+                if (settled) return;
+                settled = true;
+                clearInterval(watch);
+                resolve();
+            }
+            var watch = setInterval(function () {
+                if (numCallsInProgress <= 0 && sawCallback) done();
+            }, 150);
+            try {
+                getMetaData(function (metadataResponse) {
+                    sawCallback = true;
+                    try {
+                        processListResults(metadataResponse);
+                        if (changeSetTable && changeSetTable.rows) {
+                            changeSetTable.rows().invalidate('dom').draw(false);
+                        }
+                        if (numCallsInProgress <= 0) done();
+                    } catch (e) {
+                        clearInterval(watch);
+                        reject(e);
+                    }
+                });
+                setTimeout(function () {
+                    if (!sawCallback && numCallsInProgress <= 0) done();
+                }, 500);
+            } catch (e) {
+                clearInterval(watch);
+                reject(e);
+            }
+        });
+        if (cshShouldPageThroughPicker() && !isLoadingMorePages) {
+            shouldContinuePagination = true;
+            isLoadingMorePages = true;
+            startPaginationWithMetadata();
+        }
+        await cshUpdateTypeSyncStatus();
+        window.cshToast && window.cshToast.show('Selected component type refreshed.', { type: 'success', duration: 2500 });
+    } catch (e) {
+        window.cshToast && window.cshToast.show('Refresh Type failed: ' + ((e && e.message) || e), { type: 'error' });
+        await cshUpdateTypeSyncStatus();
+    } finally {
+        cshTypeRefreshRunning = false;
+        $btn.prop('disabled', false).val('Refresh Type');
+    }
+}
+
+async function cshRunAddPageFullSync() {
+    var $btn = $('.cshFullSync');
+    if (!window.cshCart || !window.cshCart.syncFromChangeSetView) {
+        window.cshToast && window.cshToast.show('Cart sync is not ready yet - try again in a moment.', { type: 'info' });
+        return;
+    }
+    if (!cshAddPagePackageId) {
+        window.cshToast && window.cshToast.show('Full Sync is not available yet because the change-set package id was not resolved.', { type: 'error' });
+        return;
+    }
+    var syncKey = cshAddPageChangeSetId || cshAddPagePackageId;
+    var setSync = window.cshCart.setSyncState || function () {};
+    try {
+        $btn.prop('disabled', true).val('Syncing...');
+        setSync('syncing');
+        var result = await window.cshCart.syncFromChangeSetView(syncKey, cshAddPagePackageId, { force: true });
+        setSync('idle');
+        window.cshToast && window.cshToast.show(
+            'Full change set sync completed (' + ((result && result.count) || 0) + ' item(s)).',
+            { type: 'success', duration: 3000 }
+        );
+    } catch (e) {
+        setSync('error', (e && e.message) || 'Sync failed');
+        window.cshToast && window.cshToast.show('Full Sync failed: ' + ((e && e.message) || e), { type: 'error' });
+    } finally {
+        $btn.prop('disabled', false).val('Full Sync');
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,6 +1743,7 @@ function cshExportTable() {
  When the list table is added, these functionas are added to the make the columns searchable and selectable.
  **/
 function basicTableInitComplete() {
+    cshNormalizeRenderedNameHeader(this.api());
     this.api().columns().every(function () {
         var column = this;
         if ((column.index() == 1)) {
@@ -1345,6 +1781,8 @@ function basicTableInitComplete() {
  When the list table is added, these functionas are added to the make the columns searchable and selectable.
  **/
 function tableInitComplete() {
+    cshNormalizeRenderedNameHeader(this.api());
+
     // Dynamic columns start after the checkbox + every original header cell.
     // cshOriginalHeaderCount already counts the checkbox, so it IS the start.
     var dynamicColumnsStartIndex = (typeof cshOriginalHeaderCount === 'number' && cshOriginalHeaderCount > 0)
@@ -1755,6 +2193,7 @@ function cshFilterOutManaged(records) {
 // Stashed so the compare refresh button can re-run the last compare listing
 // against the same environment without prompting the user to reconnect.
 var cshLastCompareEnv = null;
+var cshLastCompareOrgId = null;
 
 function cshNormalizeToolingRecord(rec, cfg, ctx) {
     var ns = rec.NamespacePrefix || '';
@@ -1955,6 +2394,26 @@ function getMetaData(processResultsFunction) {
 
 }
 
+async function cshRefreshOptimisticMetadataType() {
+    if (!cshOptimisticMetadataType || !window.cshMetadata || !window.cshMetadata.warmDescribeCache) {
+        return resolvedMetadataType;
+    }
+    try {
+        var describeData = await window.cshMetadata.warmDescribeCache();
+        var resolved = window.cshMetadata.resolveEntityType(selectedEntityType, describeData, entityTypeMap);
+        if (resolved && resolved !== resolvedMetadataType) {
+            console.log('Entity type re-resolved from describeMetadata:', selectedEntityType, '->', resolved);
+            resolvedMetadataType = resolved;
+            cshOptimisticMetadataType = false;
+        } else if (resolved) {
+            cshOptimisticMetadataType = false;
+        }
+    } catch (e) {
+        console.warn('Optimistic metadata type refresh failed:', e && e.message);
+    }
+    return resolvedMetadataType;
+}
+
 function listMetaDataProxy(data, retFunc, isDefault) {
     if (isDefault) {
         chrome.runtime.sendMessage({'proxyFunction': "listLocalMetaData", 'proxydata': data}, function (response) {
@@ -2062,12 +2521,14 @@ function cshCompareStartMetadataList(env) {
     // Folder-based types (Report, Dashboard, Document, EmailTemplate) have
     // a cap per folder, not per type — listing per folder aggregates the
     // whole org even when the total count exceeds CSH_LIST_META_LIMIT.
-    var folderType = entityFolderMap[selectedEntityType];
-    if (folderType) {
-        cshCompareListFolderScoped(folderType, env);
-    } else {
-        cshCompareListFlat(env);
-    }
+    cshHydrateCompareFromIndexedDb(cshLastCompareOrgId, env).then(function () {
+        var folderType = entityFolderMap[selectedEntityType];
+        if (folderType) {
+            cshCompareListFolderScoped(folderType, env);
+        } else {
+            cshCompareListFlat(env);
+        }
+    });
 }
 
 function cshCompareListFlat(env) {
@@ -2232,6 +2693,7 @@ function cshCompareOnConnectSavedOrg() {
             return;
         }
         $("#loggedInUsername").html(response.username || '');
+        cshLastCompareOrgId = response.orgId || orgId;
         // Fresh connection — nuke any entity-map cache from a previous
         // deploy org so Tier-2 composites (Layout, WorkflowRule) don't
         // resolve Ids against the wrong org.
@@ -2266,7 +2728,21 @@ function cshCompareOnDeleteSavedOrg() {
     });
 }
 
-function cshCompareStartNewOrgLogin(env, customHost) {
+async function cshCompareStartNewOrgLogin(env, customHost) {
+    if (window.cshAuth && typeof window.cshAuth.showInstructions === 'function') {
+        var choice = await window.cshAuth.showInstructions({
+            message: 'Connect the target org so Change Set Helper can compare metadata and retrieve component contents.'
+        });
+        if (choice !== 'default') {
+            if (choice === 'options') {
+                window.cshToast && window.cshToast.show(
+                    'Options opened. Configure your connected app, then return here to connect the target org.',
+                    { type: 'info', duration: 5000 }
+                );
+            }
+            return;
+        }
+    }
     chrome.runtime.sendMessage({
         oauth: 'connectToDeploy',
         environment: env,
@@ -2280,6 +2756,7 @@ function cshCompareStartNewOrgLogin(env, customHost) {
             return;
         }
         $("#loggedInUsername").html(response.username || '');
+        cshLastCompareOrgId = response.orgId || null;
         // Fresh connection — clear the deploy entity-map cache so Tier-2
         // composite resolution doesn't use Ids from a previous org.
         cshEntityApiCache.deploy = null;
@@ -2402,6 +2879,7 @@ function deployLogout() {
     // action can't re-trigger an orphaned listing against a logged-out conn.
     $('#csh-compare-refresh').hide();
     cshLastCompareEnv = null;
+    cshLastCompareOrgId = null;
     // Refresh the saved-orgs picker — if the user has one or more saved
     // orgs they'll see the dropdown; otherwise they fall back to the classic
     // env-select form. Makes a silent no-op if the Compare UI isn't mounted
@@ -2416,6 +2894,15 @@ function deployLogout() {
     }
 
 
+}
+
+function cshShowOAuthInstructions() {
+    if (!window.cshAuth || typeof window.cshAuth.showInstructions !== 'function') {
+        return Promise.resolve('cancel');
+    }
+    return window.cshAuth.showInstructions({
+        message: 'Your Salesforce session cookie is not readable, so the extension needs OAuth access to call Salesforce APIs for metadata, compare, and cache refresh.'
+    });
 }
 
 //This is the part that runs when loaded!
@@ -2438,6 +2925,10 @@ if (nextPageHref) {
 var nextPageLsr = 1000;
 var shouldContinuePagination = false;
 var ENABLE_PAGINATION_THRESHOLD = 1500; // Enable DataTables paging above this threshold
+
+function cshShouldPageThroughPicker() {
+    return listTableLength >= 1000 && !!nextPageHref;
+}
 
 // Resolve the UI entity name (e.g. "ApexClass", "CustomEntityDefinition",
 // "LightningMessageChannel") to a Metadata API type name:
@@ -2501,6 +2992,12 @@ window.cshMetadata.getDescribe().then(function (describeCache) {
                 describeCache ? '(describe cache warm)' : '(describe cache cold)');
 
     if (resolvedMetadataType == null) {
+        resolvedMetadataType = selectedEntityType;
+        cshOptimisticMetadataType = true;
+        console.log('Entity type resolution fallback: trying picker value as Metadata API type:', resolvedMetadataType);
+    }
+
+    if (resolvedMetadataType == null) {
         // Coverage gap — toast the user so they know why the table isn't enhanced.
         window.cshToast && window.cshToast.show(
             'Metadata enhancement is not available for "' + selectedEntityType + '".\n\n' +
@@ -2517,41 +3014,35 @@ window.cshMetadata.getDescribe().then(function (describeCache) {
     runEnhancedFlow();
 });
 
-function runEnhancedFlow() {
-    // Show loading spinner
-    var loadingHtml = `
-        <style>
-            @keyframes csh-spinner {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
-        </style>
-        <div id="csh-loading-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-             background: rgba(0,0,0,0.5); z-index: 9999; display: flex; align-items: center; justify-content: center;">
-            <div style="background: white; border: 3px solid #0070d2; border-radius: 8px; padding: 30px;
-                 text-align: center; box-shadow: 0 4px 16px rgba(0,0,0,0.3);">
-                <div style="width: 60px; height: 60px; border: 6px solid #f3f3f3; border-top: 6px solid #0070d2;
-                     border-radius: 50%; margin: 0 auto 20px; animation: csh-spinner 1s linear infinite;"></div>
-                <h3 style="margin: 0 0 10px 0; color: #0070d2;">Loading Metadata...</h3>
-                <p style="margin: 0; color: #666;">Please wait while we fetch component details</p>
-            </div>
-        </div>
-    `;
-    $('body').append(loadingHtml);
+function cshHandleMetadataResponse(metadataResponse) {
+    processListResults(metadataResponse);
+    if (numCallsInProgress <= 0) {
+        console.log('All metadata loaded and cached!');
+        cshHideMetadataLoadingOverlay();
+        if (cshShouldPageThroughPicker()) {
+            shouldContinuePagination = true;
+            isLoadingMorePages = true;
+            startPaginationWithMetadata();
+        } else {
+            totalComponentCount = listTableLength;
+            initializeTableWithMetadata();
+        }
+    }
+}
 
-    $("#editPage").addClass("lowOpacity");
+function runEnhancedFlow() {
+    cshShowMetadataLoadingOverlayDelayed();
 
     // Wait for the session id. On HttpOnly-on orgs the fast sync read is
     // empty, but cshSession.ready resolves via the cookies API fallback.
     window.cshSession.ready.then(function (sid) {
         if (!sid) {
-            $('#csh-loading-overlay').remove();
+            cshHideMetadataLoadingOverlay();
             window.cshToast && window.cshToast.show(
                 'Could not read your Salesforce session cookie. Ensure the Change Set Helper ' +
                 'has the "cookies" permission enabled, or uncheck Session Settings → Require HttpOnly.',
                 { type: 'error' }
             );
-            $("#editPage").removeClass("lowOpacity");
                     return;
         }
         // Fetch metadata FIRST. Pass the chosen auth mode so offscreen uses
@@ -2567,75 +3058,73 @@ function runEnhancedFlow() {
         // Check for Chrome runtime errors only
         if (chrome.runtime.lastError) {
             console.error('OAuth connection failed:', chrome.runtime.lastError);
-            $('#csh-loading-overlay').remove();
+            cshHideMetadataLoadingOverlay();
             window.cshToast && window.cshToast.show(
                 'Failed to connect to Salesforce. Please refresh the page and try again.\n\nError: ' +
                 chrome.runtime.lastError.message,
                 { type: 'error' }
             );
-            $("#editPage").removeClass("lowOpacity");
                     return;
         }
 
         // Check for explicit error in response
         if (response && response.error) {
             console.error('OAuth connection failed:', response.error);
-            $('#csh-loading-overlay').remove();
+            cshHideMetadataLoadingOverlay();
             window.cshToast && window.cshToast.show(
                 'Failed to connect to Salesforce. Please refresh the page and try again.\n\nError: ' + response.error,
                 { type: 'error' }
             );
-            $("#editPage").removeClass("lowOpacity");
                     return;
         }
 
-        console.log('Fetching metadata before loading rows for type:', selectedEntityType);
+        console.log('Checking cached metadata before loading rows for type:', selectedEntityType);
+        if (cshShouldPageThroughPicker()) {
+            shouldContinuePagination = true;
+            isLoadingMorePages = true;
+        }
+
+        var hydratePromise = cshHydrateFromIndexedDbCache().catch(function (e) {
+            console.warn('IndexedDB cache hydrate failed:', e && e.message);
+            return 0;
+        });
+
+        var metadataReady = cshOptimisticMetadataType
+            ? cshRefreshOptimisticMetadataType()
+            : Promise.resolve(resolvedMetadataType);
 
         // Warm the describeMetadata cache in the background — doesn't block
         // list fetching. Fresh cache feeds resolveEntityType() on the next visit,
         // so newly added Salesforce types become supported without a release.
-        if (window.cshMetadata && window.cshMetadata.warmDescribeCache) {
+        if (!cshOptimisticMetadataType && window.cshMetadata && window.cshMetadata.warmDescribeCache) {
             window.cshMetadata.warmDescribeCache().catch(function (e) {
                 console.warn('warmDescribeCache failed:', e && e.message);
             });
         }
 
-        try {
-            // Custom callback that waits for all metadata calls to complete
-            getMetaData(function(metadataResponse) {
-                // Process and cache the metadata!
-                processListResults(metadataResponse);
-
-                // Check if ALL metadata calls are complete
-                if (numCallsInProgress <= 0) {
-                    console.log('All metadata loaded and cached!');
-
-                    // Metadata successfully loaded and cached!
-                    $('#csh-loading-overlay').remove();
-
-                    // Check if we need pagination
-                    if (listTableLength >= 1000) {
-                        // Automatically load all pages without confirmation
-                        shouldContinuePagination = true;
-                        isLoadingMorePages = true;
+        metadataReady.then(async function () {
+            try {
+                var hydratedCount = await hydratePromise;
+                var typeStatus = await cshGetTypeSyncStatus();
+                if (hydratedCount > 0 && typeStatus.fresh) {
+                    cshHideMetadataLoadingOverlay();
+                    console.log('[CSH] using fresh cached metadata for type:', selectedEntityType);
+                    if (cshShouldPageThroughPicker()) {
                         startPaginationWithMetadata();
-                    } else {
-                        // Less than 1000 rows - show immediately with metadata
-                        totalComponentCount = listTableLength;
-                        initializeTableWithMetadata();
                     }
+                    return;
                 }
-                // Otherwise, wait for more metadata calls to complete
-            });
-        } catch (error) {
-            console.error('Error during metadata fetch:', error);
-            $('#csh-loading-overlay').remove();
-            window.cshToast && window.cshToast.show(
-                'An error occurred while fetching metadata. Please try again.\n\nError: ' + error.message,
-                { type: 'error' }
-            );
-            $("#editPage").removeClass("lowOpacity");
-                }
+                // Custom callback that waits for all metadata calls to complete
+                getMetaData(cshHandleMetadataResponse);
+            } catch (error) {
+                console.error('Error during metadata fetch:', error);
+                cshHideMetadataLoadingOverlay();
+                window.cshToast && window.cshToast.show(
+                    'An error occurred while fetching metadata. Please try again.\n\nError: ' + error.message,
+                    { type: 'error' }
+                );
+            }
+        });
         }); // end chrome.runtime.sendMessage connectToLocal
     }); // end window.cshSession.ready.then
 }
@@ -2663,10 +3152,10 @@ function startPaginationWithMetadata() {
                 transition: width 0.3s ease;
             }
         </style>
-        <div id="csh-pagination-progress" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-             background: white; border: 3px solid #0070d2; border-radius: 8px; padding: 20px; z-index: 10000;
-             box-shadow: 0 4px 16px rgba(0,0,0,0.3); min-width: 400px;">
-            <h3 style="margin: 0 0 15px 0; color: #0070d2;">Loading Components...</h3>
+        <div id="csh-pagination-progress" style="position: fixed; right: 16px; bottom: 16px;
+             background: white; border: 1px solid #0070d2; border-radius: 6px; padding: 12px; z-index: 10000;
+             box-shadow: 0 4px 14px rgba(0,0,0,0.18); width: 360px; max-width: calc(100vw - 32px);">
+            <h3 style="margin: 0 0 10px 0; color: #0070d2; font-size: 14px;">Loading more components</h3>
             <div style="margin-bottom: 10px;">
                 <div style="background: #f3f3f3; border-radius: 4px; height: 24px; overflow: hidden; position: relative;">
                     <div id="csh-progress-bar" class="csh-progress-indeterminate"></div>
@@ -2683,8 +3172,6 @@ function startPaginationWithMetadata() {
                 Cancel Loading
             </button>
         </div>
-        <div id="csh-pagination-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-             background: rgba(0,0,0,0.5); z-index: 9999;"></div>
     `;
     $('body').append(progressHtml);
 
@@ -2700,13 +3187,9 @@ function startPaginationWithMetadata() {
         }
 
         $('#csh-pagination-progress').remove();
-        $('#csh-pagination-overlay').remove();
-        $("#editPage").removeClass("lowOpacity");
     
         console.log(`Pagination cancelled by user. Table finalized with ${totalComponentCount} rows.`);
     });
-
-    $("#editPage").addClass("lowOpacity");
 
     // Async recursive function to fetch pages (metadata already loaded!)
     var totalRowsLoaded = 1000;
@@ -2734,7 +3217,6 @@ function startPaginationWithMetadata() {
         if (!shouldContinuePagination || listTableLength < 1000) {
             // Done loading all pages - cleanup
             $('#csh-pagination-progress').remove();
-            $('#csh-pagination-overlay').remove();
 
             // Final update
             totalComponentCount = totalRowsLoaded;
@@ -2746,8 +3228,6 @@ function startPaginationWithMetadata() {
                 changeSetTable.draw();
             }
 
-            $("#editPage").removeClass("lowOpacity");
-        
             return;
         }
 
@@ -2892,12 +3372,12 @@ function startMetadataLoading() {
     if (resolvedMetadataType != null) {
         // Don't call setupTable yet - wait until first metadata batch returns
         // so we can determine dynamic columns from the metadata properties
-        $("#editPage").addClass("lowOpacity");
+        cshShowMetadataLoadingOverlayDelayed();
 
         window.cshSession.ready.then(function (sid) {
             if (!sid) {
                 console.warn('startMetadataLoading: no session id resolved');
-                $("#editPage").removeClass("lowOpacity");
+                cshHideMetadataLoadingOverlay();
                             return;
             }
             chrome.runtime.sendMessage({
@@ -2907,6 +3387,14 @@ function startMetadataLoading() {
                 "authMode": window.cshSession.mode ? window.cshSession.mode() : 'sid',
                 "instanceUrl": window.cshSession.instanceUrl ? window.cshSession.instanceUrl() : serverUrl
             }, function (response) {
+                if (chrome.runtime.lastError || (response && response.error)) {
+                    cshHideMetadataLoadingOverlay();
+                    window.cshToast && window.cshToast.show(
+                        'Failed to connect to Salesforce. Please refresh the page and try again.',
+                        { type: 'error' }
+                    );
+                    return;
+                }
                 console.log('Fetching metadata to determine table columns for type:', selectedEntityType);
                 getMetaData(processListResults);
             });
@@ -3019,6 +3507,16 @@ $(document).ready(function () {
             $('.bDescription').append(banner);
             banner.find('#csh-signin-btn').on('click', async function () {
                 var btn = $(this);
+                var choice = await cshShowOAuthInstructions();
+                if (choice !== 'default') {
+                    if (choice === 'options') {
+                        window.cshToast && window.cshToast.show(
+                            'Options opened. Configure your connected app, then return here to sign in.',
+                            { type: 'info', duration: 5000 }
+                        );
+                    }
+                    return;
+                }
                 btn.prop('disabled', true).text('Opening popup…');
                 var resp = await window.cshAuth.login();
                 if (resp && resp.ok && resp.accessToken) {
@@ -3094,6 +3592,8 @@ $(document).ready(function () {
         var __cshBodyMatch = (document.body && document.body.innerHTML || '').match(/033[A-Za-z0-9]{12,15}/);
         if (__cshBodyMatch) __cshPkgId = __cshBodyMatch[0];
     }
+    cshAddPageChangeSetId = __cshCsId || null;
+    cshAddPagePackageId = __cshPkgId || null;
 
     // Persist the 0A2 ↔ 033 mapping so the Detail page's authoritative cart
     // sync can resolve the package id without bouncing through a hidden

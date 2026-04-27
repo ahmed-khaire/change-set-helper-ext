@@ -916,7 +916,21 @@ function cshOnDeleteSavedOrg() {
 
 // Launch the OAuth popup for a new (or re-authorized) org. customHost is
 // only used when env === 'mydomain'.
-function cshStartNewOrgLogin(env, customHost) {
+async function cshStartNewOrgLogin(env, customHost) {
+	if (window.cshAuth && typeof window.cshAuth.showInstructions === 'function') {
+		var choice = await window.cshAuth.showInstructions({
+			message: 'Connect the target org so Change Set Helper can validate or deploy this change set.'
+		});
+		if (choice !== 'default') {
+			if (choice === 'options') {
+				window.cshToast && window.cshToast.show(
+					'Options opened. Configure your connected app, then return here to connect the target org.',
+					{ type: 'info', duration: 5000 }
+				);
+			}
+			return;
+		}
+	}
 	chrome.runtime.sendMessage({
 		oauth: 'connectToDeploy',
 		environment: env,

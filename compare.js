@@ -159,6 +159,22 @@ $(document).ready(function () {
 						// One mergely write per side, after all reads — no
 						// race, no partial-write flicker.
 						$('#compare').mergely(request.setSide, out);
+						if (window.cshDb) {
+							var snapshotOrg = request.setSide === 'lhs' ? localOrg : targetOrg;
+							window.cshDb.upsertMetadataSnapshot({
+								type: request.type || 'unknown',
+								fullName: request.compareItem || compareItem,
+								side: request.setSide,
+								text: out,
+								size: out.length
+							}, {
+								orgId: snapshotOrg,
+								source: 'compare-retrieve',
+								side: request.setSide
+							}).catch(function (e) {
+								console.warn('cshDb compare snapshot cache failed:', e && e.message);
+							});
+						}
 						progress[request.setSide] = 'done';
 						updateProgressPanel();
 					});

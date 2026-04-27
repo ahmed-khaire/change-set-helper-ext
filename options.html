@@ -58,6 +58,30 @@
 <input type="submit" value="Save">
 </form>
 
+<h2>Diagnostics</h2>
+<fieldset>
+  <legend>Console logging</legend>
+  <label style="display:flex;gap:8px;align-items:flex-start;margin-top:0">
+    <input type="checkbox" id="cshDevLogs" style="margin-top:2px">
+    <span>
+      Enable development console logs and warnings
+      <span class="muted" style="display:block">Leave this off for normal use and release testing. Errors still appear when this is off. The injected Salesforce-page bridge has one MAIN-world debug line that only follows the Salesforce page's localStorage flag.</span>
+    </span>
+  </label>
+  <div id="devLogsStatus" class="muted" style="margin-top:6px"></div>
+</fieldset>
+
+<h2>Cache Storage</h2>
+<fieldset>
+  <legend>IndexedDB cache</legend>
+  <p class="muted">
+    Clears cached org metadata, warmed change-set membership, compare snapshots, and sync job state.
+    The cache will be rebuilt when you visit the outbound change set list again.
+  </p>
+  <button type="button" class="secondary" id="clearIndexedDbCache">Clear Cache Storage</button>
+  <div id="cacheClearStatus" class="muted" style="margin-top:6px"></div>
+</fieldset>
+
 <h2>Connected App &mdash; OAuth Diagnostic</h2>
 <p class="muted">
   Test whether the connected app this extension uses can return <strong>refresh tokens</strong>
@@ -138,6 +162,7 @@
   </p>
 </details>
 
+<script src="cshlogger.js"></script>
 <script src="options.js"></script>
 </body>
 </html>

@@ -1,5 +1,6 @@
 // Manifest V3 service worker
 // JSforce operations are handled in offscreen.html/offscreen.js due to XMLHttpRequest requirement
+importScripts('cshlogger.js');
 
 var CSH_APIVERSION = "66.0";
 var CSH_APIVERSION_IS_USER_PREF = false;
@@ -1614,6 +1615,7 @@ async function getContents(type, item, connType, side) {
         } else {
             chrome.runtime.sendMessage({
                 'setSide': side,
+                'type': type,
                 'content': {zipFile: response.zipData},
                 'compareItem': item
             });

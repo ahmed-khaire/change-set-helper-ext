@@ -153,10 +153,103 @@ window.cshAuth = (function () {
         return resp;
     }
 
+    function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+    }
+
+    function showInstructions(opts) {
+        opts = opts || {};
+        return new Promise(function (resolve) {
+            var existing = document.getElementById('csh-oauth-instructions');
+            if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+            var previousFocus = document.activeElement;
+            var modal = document.createElement('div');
+            modal.id = 'csh-oauth-instructions';
+            modal.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(8,7,7,.45);display:flex;align-items:center;justify-content:center;padding:16px;';
+            modal.innerHTML =
+                '<div role="dialog" aria-modal="true" aria-labelledby="csh-oauth-title" style="background:#fff;color:#181818;width:min(640px,100%);max-height:90vh;overflow:auto;border-radius:6px;box-shadow:0 8px 28px rgba(0,0,0,.28);font:13px/1.45 Arial,sans-serif;">' +
+                  '<div style="padding:16px 18px;border-bottom:1px solid #dddbda;">' +
+                    '<h2 id="csh-oauth-title" style="margin:0;font-size:18px;color:#032d60;">Connect Change Set Helper to Salesforce</h2>' +
+                  '</div>' +
+                  '<div style="padding:16px 18px;">' +
+                    '<p style="margin:0 0 12px;">' + escapeHtml(opts.message || 'The extension needs OAuth access to call Salesforce APIs for metadata, compare, validation, deployment, and cache refresh.') + '</p>' +
+                    '<div style="display:grid;gap:10px;margin-top:12px;">' +
+                      '<div style="border:1px solid #dddbda;border-radius:6px;padding:12px;">' +
+                        '<strong>Option 1: Use the extension connected app</strong>' +
+                        '<p style="margin:6px 0 0;color:#444;">Fastest setup. You will be redirected to Salesforce and asked to approve the connected app used by this extension.</p>' +
+                      '</div>' +
+                      '<div style="border:1px solid #dddbda;border-radius:6px;padding:12px;">' +
+                        '<strong>Option 2: Use your own connected app</strong>' +
+                        '<p style="margin:6px 0 0;color:#444;">Recommended for orgs that require admin-owned OAuth apps. Open Options, copy the callback URL, configure your connected app scopes, save your Consumer Key, then return here and sign in.</p>' +
+                      '</div>' +
+                    '</div>' +
+                  '</div>' +
+                  '<div style="padding:12px 18px;border-top:1px solid #dddbda;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">' +
+                    '<button type="button" class="csh-oauth-cancel" style="padding:7px 14px;border:1px solid #c9c9c9;background:#fff;border-radius:4px;cursor:pointer;">Cancel</button>' +
+                    '<button type="button" class="csh-oauth-options" style="padding:7px 14px;border:1px solid #0176d3;background:#fff;color:#0176d3;border-radius:4px;cursor:pointer;">Configure My Own App</button>' +
+                    '<button type="button" class="csh-oauth-default" style="padding:7px 14px;border:1px solid #0176d3;background:#0176d3;color:#fff;border-radius:4px;cursor:pointer;">Use Extension App</button>' +
+                  '</div>' +
+                '</div>';
+            function focusableElements() {
+                return Array.prototype.slice.call(modal.querySelectorAll(
+                    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+                )).filter(function (el) {
+                    return !el.disabled && el.offsetParent !== null;
+                });
+            }
+            function close(value) {
+                document.removeEventListener('keydown', onKeyDown, true);
+                if (modal.parentNode) modal.parentNode.removeChild(modal);
+                if (previousFocus && previousFocus.focus) {
+                    try { previousFocus.focus(); } catch (_) {}
+                }
+                resolve(value);
+            }
+            function onKeyDown(ev) {
+                if (ev.key === 'Escape') {
+                    ev.preventDefault();
+                    close('cancel');
+                    return;
+                }
+                if (ev.key !== 'Tab') return;
+                var focusables = focusableElements();
+                if (!focusables.length) return;
+                var first = focusables[0];
+                var last = focusables[focusables.length - 1];
+                if (ev.shiftKey && document.activeElement === first) {
+                    ev.preventDefault();
+                    last.focus();
+                } else if (!ev.shiftKey && document.activeElement === last) {
+                    ev.preventDefault();
+                    first.focus();
+                }
+            }
+            modal.addEventListener('click', function (ev) {
+                if (ev.target === modal) close('cancel');
+            });
+            document.addEventListener('keydown', onKeyDown, true);
+            modal.querySelector('.csh-oauth-cancel').addEventListener('click', function () { close('cancel'); });
+            modal.querySelector('.csh-oauth-default').addEventListener('click', function () { close('default'); });
+            modal.querySelector('.csh-oauth-options').addEventListener('click', function () {
+                try {
+                    window.open(chrome.runtime.getURL('options.html'), '_blank');
+                } catch (_) {
+                    window.open('/options.html', '_blank');
+                }
+                close('options');
+            });
+            document.body.appendChild(modal);
+            modal.querySelector('.csh-oauth-default').focus();
+        });
+    }
+
     return {
         login: login,
         logout: logout,
-        getAccessToken: getAccessToken
+        getAccessToken: getAccessToken,
+        showInstructions: showInstructions
     };
 })();
 

@@ -71,7 +71,7 @@ jobs:
             changeset.js changeview.js \
             deployhelper.js metadatahelper.js \
             detailcomponents.js detailpagebridge.js \
-            common.js cart.js \
+            common.js cart.js cshlogger.js cshdb.js outboundlist.js \
             compare.js compare.html \
             options.html options.js \
             popup.html \

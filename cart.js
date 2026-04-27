@@ -33,11 +33,14 @@
 (function () {
     var CART_KEY = 'cshCart';
     var JOBS_KEY = 'cshJobs';
+    var SYNC_STATE_KEY = 'cshCartAuthoritativeSync';
 
     // Salesforce caps POST form size; keep each batch conservative.
     var BATCH_SIZE = 100;
     var MAX_ATTEMPTS = 3;
     var RETRY_BASE_MS = 2000;
+    var AUTHORITATIVE_SYNC_FRESH_MS = 10 * 60 * 1000;
+    var AUTHORITATIVE_SYNC_RUNNING_TTL_MS = 15 * 60 * 1000;
 
     // -----------------------------------------------------------------------
     // Extension-alive guard
@@ -91,6 +94,131 @@
                 });
             } catch (_) { markExtDead(); resolve(); }
         });
+    }
+
+    function uniqueSyncKeys(keys) {
+        var out = [];
+        var seen = {};
+        (keys || []).forEach(function (k) {
+            if (!k || seen[k]) return;
+            seen[k] = true;
+            out.push(k);
+        });
+        return out;
+    }
+
+    function syncStateKey(id) {
+        return String(serverUrl || location.host || '') + '::' + id;
+    }
+
+    async function readAuthoritativeSyncState() {
+        var s = await storageGet([SYNC_STATE_KEY]);
+        return s[SYNC_STATE_KEY] || {};
+    }
+
+    async function writeAuthoritativeSyncState(state) {
+        await storageSet({ [SYNC_STATE_KEY]: state || {} });
+    }
+
+    function findFreshSyncEntry(state, keys, now) {
+        for (var i = 0; i < keys.length; i++) {
+            var entry = state[syncStateKey(keys[i])];
+            if (entry && entry.completedAt && (now - entry.completedAt) < AUTHORITATIVE_SYNC_FRESH_MS) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    function findRunningSyncEntry(state, keys, now) {
+        for (var i = 0; i < keys.length; i++) {
+            var entry = state[syncStateKey(keys[i])];
+            if (entry && entry.running && entry.startedAt &&
+                    (now - entry.startedAt) < AUTHORITATIVE_SYNC_RUNNING_TTL_MS) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    async function beginAuthoritativeSync(keys, opts) {
+        opts = opts || {};
+        keys = uniqueSyncKeys(keys);
+        if (!keys.length) return { started: false, reason: 'no-keys' };
+        var state = await readAuthoritativeSyncState();
+        var now = Date.now();
+        var running = findRunningSyncEntry(state, keys, now);
+        if (running && !opts.force) {
+            return { started: false, reason: 'running', entry: running };
+        }
+        var fresh = findFreshSyncEntry(state, keys, now);
+        if (fresh && !opts.force) {
+            return { started: false, reason: 'fresh', entry: fresh };
+        }
+        if (!opts.force) {
+            state = await readAuthoritativeSyncState();
+            running = findRunningSyncEntry(state, keys, Date.now());
+            if (running) {
+                return { started: false, reason: 'running', entry: running };
+            }
+            fresh = findFreshSyncEntry(state, keys, Date.now());
+            if (fresh) {
+                return { started: false, reason: 'fresh', entry: fresh };
+            }
+        }
+        var claimId = String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+        var marker = {
+            running: true,
+            startedAt: now,
+            host: serverUrl || location.host || '',
+            keys: keys,
+            claimId: claimId
+        };
+        keys.forEach(function (k) {
+            state[syncStateKey(k)] = Object.assign({}, state[syncStateKey(k)] || {}, marker);
+        });
+        await writeAuthoritativeSyncState(state);
+        var verify = await readAuthoritativeSyncState();
+        for (var i = 0; i < keys.length; i++) {
+            var entry = verify[syncStateKey(keys[i])];
+            if (!entry || entry.claimId !== claimId) {
+                return { started: false, reason: 'running', entry: entry || null };
+            }
+        }
+        return { started: true, keys: keys };
+    }
+
+    async function finishAuthoritativeSync(keys, count) {
+        keys = uniqueSyncKeys(keys);
+        if (!keys.length) return;
+        var state = await readAuthoritativeSyncState();
+        var now = Date.now();
+        keys.forEach(function (k) {
+            state[syncStateKey(k)] = {
+                running: false,
+                startedAt: state[syncStateKey(k)] && state[syncStateKey(k)].startedAt,
+                completedAt: now,
+                count: count || 0,
+                host: serverUrl || location.host || '',
+                keys: keys
+            };
+        });
+        await writeAuthoritativeSyncState(state);
+    }
+
+    async function failAuthoritativeSync(keys, error) {
+        keys = uniqueSyncKeys(keys);
+        if (!keys.length) return;
+        var state = await readAuthoritativeSyncState();
+        var now = Date.now();
+        keys.forEach(function (k) {
+            var prev = state[syncStateKey(k)] || {};
+            prev.running = false;
+            prev.failedAt = now;
+            prev.error = error || 'Sync failed';
+            state[syncStateKey(k)] = prev;
+        });
+        await writeAuthoritativeSyncState(state);
     }
 
     // Debounced write layer. saveCart() used to fire a full-blob chrome.storage
@@ -217,6 +345,13 @@
             added++;
         });
         await saveCart(all);
+        if (window.cshDb && added > 0) {
+            window.cshDb.markMembers(changeSetId, items.map(function (it) {
+                return { id: it.id, type: type, name: it.name };
+            }), 'pending_add', { source: 'cart-add' }).catch(function (e) {
+                console.warn('cshDb cart add cache failed:', e && e.message);
+            });
+        }
         return added;
     }
 
@@ -250,6 +385,10 @@
             added++;
         });
         await saveCart(all);
+        if (window.cshDb && added > 0) {
+            window.cshDb.markMembers(changeSetId, items, 'pending_add', { source: 'cart-batch-add' })
+                .catch(function (e) { console.warn('cshDb batch add cache failed:', e && e.message); });
+        }
         return added;
     }
 
@@ -349,6 +488,10 @@
             var existing = byKey[key(it.type, canonicalId)];
             if (existing) {
                 if (existing.status === 'done') {
+                    if (it.name && (!existing.name || existing.name === existing.salesforceId)) {
+                        existing.name = it.name;
+                    }
+                    if (it.extra) existing.extra = Object.assign({}, existing.extra || {}, it.extra);
                     kept++;
                     return;
                 }
@@ -366,7 +509,7 @@
                 if (it.name && (!existing.name || existing.name === existing.salesforceId)) {
                     existing.name = it.name;
                 }
-                if (it.extra) Object.assign(existing, it.extra);
+                if (it.extra) existing.extra = Object.assign({}, existing.extra || {}, it.extra);
                 promoted++;
                 return;
             }
@@ -395,7 +538,69 @@
             pruned = beforeLen - cart.items.length;
         }
         await saveCart(all);
+        if (window.cshDb) {
+            window.cshDb.upsertChangeSetMembers(
+                [changeSetId],
+                items.map(function (it) {
+                    var out = {
+                        id: it.id,
+                        type: it.type,
+                        name: it.name,
+                        source: 'server-sync'
+                    };
+                    if (it.extra) Object.assign(out, it.extra);
+                    return out;
+                }),
+                { authoritative: !!options.authoritative, source: 'server-sync', status: 'present' }
+            ).catch(function (e) {
+                console.warn('cshDb change-set member cache failed:', e && e.message);
+            });
+        }
         return { inserted: inserted, promoted: promoted, kept: kept, pruned: pruned };
+    }
+
+    async function hydrateFromIndexedDb(changeSetIds) {
+        if (!window.cshDb || !window.cshDb.getChangeSetMembers) {
+            return { count: 0, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
+        }
+        var keys = uniqueSyncKeys(Array.isArray(changeSetIds) ? changeSetIds : [changeSetIds]);
+        if (window.cshDb.markChangeSetsUsed) {
+            window.cshDb.markChangeSetsUsed(keys, { source: 'cart-hydrate' }).catch(function (e) {
+                console.warn('cshDb change-set usage update failed:', e && e.message);
+            });
+        }
+        var cached = [];
+        var seen = {};
+        for (var i = 0; i < keys.length; i++) {
+            var rows = await window.cshDb.getChangeSetMembers(keys[i], { status: 'present' });
+            rows.forEach(function (row) {
+                var itemKey = [row.type, row.componentId || row.fullName || row.name].join('::');
+                if (seen[itemKey]) return;
+                seen[itemKey] = true;
+                cached.push({
+                    id: row.componentId || row.id,
+                    type: row.type,
+                    name: row.name || row.fullName || row.componentId,
+                    extra: {
+                        fullName: row.fullName || undefined,
+                        removeHref: row.removeHref || undefined
+                    }
+                });
+            });
+        }
+        if (!cached.length) {
+            return { count: 0, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
+        }
+        var summary = { count: cached.length, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
+        for (var k = 0; k < keys.length; k++) {
+            var r = await syncItemsFromServer(keys[k], cached, { authoritative: false });
+            summary.inserted += r.inserted;
+            summary.promoted += r.promoted;
+            summary.kept += r.kept;
+            summary.pruned += r.pruned;
+        }
+        console.log('[CSH] hydrated cart from IndexedDB membership:', summary);
+        return summary;
     }
 
     async function removeItem(changeSetId, uid) {
@@ -723,10 +928,11 @@
         });
 
         // Add newly-checked visible items not yet in the cart.
+        var newlyChecked = [];
         Object.keys(visibleChecked).forEach(function (id) {
             if (seen[id]) return;
             var info = visibleChecked[id];
-            kept.push({
+            var row = {
                 uid: uid(),
                 type: type,
                 salesforceId: id,
@@ -734,11 +940,17 @@
                 fullName: info.fullName,
                 status: 'staged',
                 addedAt: Date.now()
-            });
+            };
+            kept.push(row);
+            newlyChecked.push(row);
         });
 
         cart.items = kept;
         await saveCart(all);
+        if (window.cshDb && newlyChecked.length) {
+            window.cshDb.markMembers(changeSetId, newlyChecked, 'pending_add', { source: 'add-page-selection' })
+                .catch(function (e) { console.warn('cshDb selection cache failed:', e && e.message); });
+        }
     }
 
     // After a DataTable draw (filter / sort / page), re-apply the cart's
@@ -911,6 +1123,10 @@
                         function (it) { return it.batchId === batchId; },
                         { status: 'done' }
                     );
+                    if (window.cshDb) {
+                        window.cshDb.markMembers(changeSetId, batchItems, 'present', { source: 'cart-submit' })
+                            .catch(function (e) { console.warn('cshDb submit cache failed:', e && e.message); });
+                    }
                     window.cshToast && window.cshToast.show(
                         'Cart: added ' + batchItems.length + ' ' + type + ' item(s) to change set.',
                         { type: 'success', duration: 4000 }
@@ -1389,8 +1605,50 @@
             });
         });
     }
-    async function syncFromChangeSetView(changeSetId, packageId) {
+    async function syncFromChangeSetView(changeSetId, packageId, opts) {
+        opts = opts || {};
         if (!packageId) throw new Error('syncFromChangeSetView: packageId required');
+        var keys = uniqueSyncKeys([changeSetId, packageId]);
+        if (window.cshDb && !opts.force) {
+            try {
+                if (window.cshDb.markChangeSetsUsed) {
+                    window.cshDb.markChangeSetsUsed(keys, { source: 'add-page-change-set-use' }).catch(function (e) {
+                        console.warn('cshDb change-set usage update failed:', e && e.message);
+                    });
+                }
+                for (var ck = 0; ck < keys.length; ck++) {
+                    var cachedMembers = await window.cshDb.getChangeSetMembers(keys[ck], { status: 'present' });
+                    if (cachedMembers && cachedMembers.length) {
+                        var hydrated = await hydrateFromIndexedDb(keys);
+                        console.log('[CSH] Add-page authoritative sync skipped: IndexedDB has',
+                            cachedMembers.length, 'cached member(s)');
+                        return {
+                            count: hydrated.count || cachedMembers.length,
+                            inserted: hydrated.inserted || 0,
+                            promoted: hydrated.promoted || 0,
+                            kept: hydrated.kept || 0,
+                            pruned: hydrated.pruned || 0,
+                            skipped: 'cached-members'
+                        };
+                    }
+                }
+            } catch (e) {
+                console.warn('cshDb cached member check failed:', e && e.message);
+            }
+        }
+        var syncClaim = await beginAuthoritativeSync(keys, { force: !!opts.force });
+        if (!syncClaim.started) {
+            console.log('[CSH] Add-page authoritative sync skipped:', syncClaim.reason);
+            return {
+                count: (syncClaim.entry && syncClaim.entry.count) || 0,
+                inserted: 0,
+                promoted: 0,
+                kept: 0,
+                pruned: 0,
+                skipped: syncClaim.reason
+            };
+        }
+        try {
         var items = [];
         var appOrigin = _appOriginForChangeSetView();
         var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
@@ -1441,7 +1699,11 @@
                 var fullName = idx.fullName >= 0 && cells[idx.fullName] ? (cells[idx.fullName].textContent || '').trim() : '';
                 if (!type) { dropped.noType++; return; }
                 var it = { id: cid, type: type, name: name || cid };
-                if (fullName) it.extra = { fullName: fullName };
+                if (fullName || href) {
+                    it.extra = {};
+                    if (fullName) it.extra.fullName = fullName;
+                    if (href) it.extra.removeHref = new URL(href, nextUrl).href;
+                }
                 items.push(it);
             });
             console.log('[CSH] Add-page authoritative sync page', pageNum,
@@ -1465,27 +1727,30 @@
                          ' — skipping authoritative prune to preserve cart state. ' +
                          'Likely causes: Lightning-shell response, wrong id kind (0A2 vs 033), ' +
                          'or classic-DOM selectors not matching this org\'s rendered rows.');
+            await failAuthoritativeSync(syncClaim.keys, 'zero rows scraped');
             return { count: 0, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
         }
         // Write to every distinct key so both the Add page (033 MetadataPackage
         // id) and the Detail page (0A2 outbound change-set id) see the same
         // authoritative state.
-        var keys = [];
-        if (changeSetId) keys.push(changeSetId);
-        if (packageId && packageId !== changeSetId) keys.push(packageId);
         var summary = { count: items.length, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
-        for (var k = 0; k < keys.length; k++) {
-            var r2 = await syncItemsFromServer(keys[k], items, { authoritative: true });
+        for (var k = 0; k < syncClaim.keys.length; k++) {
+            var r2 = await syncItemsFromServer(syncClaim.keys[k], items, { authoritative: true });
             summary.inserted += r2.inserted;
             summary.promoted += r2.promoted;
             summary.kept += r2.kept;
             summary.pruned += r2.pruned;
-            console.log('[CSH] Add-page sync key=' + keys[k] +
+            console.log('[CSH] Add-page sync key=' + syncClaim.keys[k] +
                 ': inserted=' + r2.inserted + ' promoted=' + r2.promoted +
                 ' kept=' + r2.kept + ' pruned=' + (r2.pruned || 0) +
                 ' (scanned=' + items.length + ')');
         }
+        await finishAuthoritativeSync(syncClaim.keys, items.length);
         return summary;
+        } catch (e) {
+            await failAuthoritativeSync(syncClaim.keys, (e && e.message) || String(e));
+            throw e;
+        }
     }
 
     function _id15(id) {
@@ -1622,8 +1887,12 @@
         if (!packageId) {
             throw new Error('Could not resolve 033 MetadataPackage id for server-side removal');
         }
-        var href = await _findClassicRemoveHref(packageId, item);
+        var href = item.removeHref || await _findClassicRemoveHref(packageId, item);
         await _deleteViaClassicHref(href);
+        if (window.cshDb) {
+            window.cshDb.markMembers(changeSetId, [item], 'removed', { source: 'cart-remove' })
+                .catch(function (e) { console.warn('cshDb remove cache failed:', e && e.message); });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2581,6 +2850,10 @@
         restoreFromCart: restoreFromCart,
         getCart: getCart,
         flushNow: flushNow,
+        hydrateFromIndexedDb: hydrateFromIndexedDb,
+        beginAuthoritativeSync: beginAuthoritativeSync,
+        finishAuthoritativeSync: finishAuthoritativeSync,
+        failAuthoritativeSync: failAuthoritativeSync,
         // Phase 6 additions
         listPresets: listPresets,
         savePreset: savePreset,
