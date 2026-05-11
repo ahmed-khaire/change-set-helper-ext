@@ -66,19 +66,19 @@ jobs:
           zipname="change-set-helper-ext-${{ steps.ver.outputs.tag }}.zip"
           zip -r "${zipname}" \
             manifest.json \
-            background.js \
-            offscreen.html offscreen.js \
-            changeset.js changeview.js \
-            deployhelper.js metadatahelper.js \
-            detailcomponents.js detailpagebridge.js \
-            common.js cart.js \
-            compare.js compare.html \
-            options.html options.js \
-            popup.html \
-            changeset.css cart.css \
+            js/background.js \
+            pages/offscreen.html js/offscreen.js \
+            js/changeset.js js/changeview.js \
+            js/deployhelper.js js/metadatahelper.js \
+            js/detailcomponents.js js/detailpagebridge.js \
+            js/common.js js/cart.js js/cshlogger.js js/cshdb.js js/outboundlist.js \
+            js/compare.js pages/compare.html \
+            pages/options.html js/options.js \
+            pages/popup.html \
+            css/changeset.css css/cart.css \
             lib \
-            brainbulb128.png brainbulb48.png braincloudsmall.png \
-            loading.gif
+            assets/icons/brainbulb128.png assets/icons/brainbulb48.png assets/icons/braincloudsmall.png \
+            assets/images/loading.gif
           ls -lh "${zipname}"
           echo "zipname=${zipname}" >> "$GITHUB_OUTPUT"
 

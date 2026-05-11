@@ -35,6 +35,10 @@ function restore_options() {
                 ? 'Using the default client id baked into the extension.'
                 : 'Using a saved custom client id (differs from the default).';
     });
+    chrome.storage.local.get(['cshDevLogs'], function (items) {
+        var checkbox = document.getElementById('cshDevLogs');
+        if (checkbox) checkbox.checked = !!(items && items.cshDevLogs);
+    });
 }
 
 // -------------------------------------------------------------- Helpers
@@ -372,10 +376,60 @@ function wireDiagnostic() {
     });
 }
 
+function wireDevLogsOption() {
+    var checkbox = byId('cshDevLogs');
+    if (!checkbox) return;
+    checkbox.addEventListener('change', function () {
+        var enabled = !!checkbox.checked;
+        chrome.storage.local.set({ cshDevLogs: enabled }, function () {
+            var status = byId('devLogsStatus');
+            if (status) {
+                status.textContent = enabled
+                    ? 'Development logs are enabled.'
+                    : 'Development logs are disabled.';
+                setTimeout(function () { status.textContent = ''; }, 1400);
+            }
+            if (window.cshLogger && typeof window.cshLogger.setEnabled === 'function') {
+                window.cshLogger.setEnabled(enabled);
+            }
+        });
+    });
+}
+
+function clearIndexedDbCache() {
+    var status = byId('cacheClearStatus');
+    if (!window.indexedDB) {
+        if (status) status.textContent = 'IndexedDB is not available in this browser.';
+        return;
+    }
+    if (!confirm('Clear Change Set Helper cache storage?\n\nThis removes cached metadata, warmed change-set membership, compare snapshots, and sync job state. It does not remove saved options, OAuth settings, or current cart selections.')) {
+        return;
+    }
+    if (status) status.textContent = 'Clearing cache...';
+    var req = indexedDB.deleteDatabase('cshIndexedCache');
+    req.onsuccess = function () {
+        chrome.storage.local.remove(['cshOrgIdByOrigin'], function () {});
+        if (status) status.textContent = 'Cache storage cleared. It will rebuild from the outbound change set list.';
+    };
+    req.onerror = function () {
+        if (status) status.textContent = 'Could not clear cache storage: ' + ((req.error && req.error.message) || 'unknown error');
+    };
+    req.onblocked = function () {
+        if (status) status.textContent = 'Cache clear is blocked by an open Salesforce tab. Close Salesforce tabs and try again.';
+    };
+}
+
+function wireCacheStorageOption() {
+    var button = byId('clearIndexedDbCache');
+    if (button) button.addEventListener('click', clearIndexedDbCache);
+}
+
 // -------------------------------------------------------------- Boot
 document.addEventListener('DOMContentLoaded', function () {
     restore_options();
     wireDiagnostic();
+    wireDevLogsOption();
+    wireCacheStorageOption();
     var form = document.getElementById('form');
     if (form) form.onsubmit = save_options;
 });

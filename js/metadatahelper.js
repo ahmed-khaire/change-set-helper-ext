@@ -29,7 +29,9 @@ function downloadPackage() {
     chrome.runtime.sendMessage({
             "oauth": "connectToLocal",
             "sessionId": sid,
-            "serverUrl": serverUrl
+            "serverUrl": serverUrl,
+            "authMode": window.cshSession.mode ? window.cshSession.mode() : 'sid',
+            "instanceUrl": window.cshSession.instanceUrl ? window.cshSession.instanceUrl() : serverUrl
     }, function (response) {
         chrome.runtime.sendMessage({
                 'proxyFunction': "downloadLocalMetadata",
@@ -79,7 +81,9 @@ function exportPackageXmlOnly() {
         chrome.runtime.sendMessage({
             'oauth': 'connectToLocal',
             'sessionId': sid,
-            'serverUrl': serverUrl
+            'serverUrl': serverUrl,
+            'authMode': window.cshSession.mode ? window.cshSession.mode() : 'sid',
+            'instanceUrl': window.cshSession.instanceUrl ? window.cshSession.instanceUrl() : serverUrl
         }, function () {
             chrome.runtime.sendMessage({
                 'proxyFunction': 'downloadLocalMetadata',
@@ -220,12 +224,30 @@ function cshRenderMetadataHelper() {
         $('.bDescription').append(banner);
         banner.find('#csh-signin-btn-md').on('click', async function () {
             var btn = $(this);
+            if (window.cshAuth && typeof window.cshAuth.showInstructions === 'function') {
+                var choice = await window.cshAuth.showInstructions({
+                    message: 'Your Salesforce session cookie is not readable, so the extension needs OAuth access to download change-set metadata.'
+                });
+                if (choice !== 'default') {
+                    if (choice === 'options') {
+                        window.cshToast && window.cshToast.show(
+                            'Options opened. Configure your connected app, then return here to sign in.',
+                            { type: 'info', duration: 5000 }
+                        );
+                    }
+                    return;
+                }
+            }
             btn.prop('disabled', true).text('Opening popup…');
             var resp = window.cshAuth ? await window.cshAuth.login() : null;
             if (resp && resp.ok && resp.accessToken) {
                 setTimeout(function () { location.reload(); }, 600);
             } else {
                 btn.prop('disabled', false).text('Sign in via OAuth');
+                if (resp && resp.userCancelled) {
+                    window.cshToast && window.cshToast.show('Sign-in was cancelled.', { type: 'info' });
+                    return;
+                }
                 window.cshToast && window.cshToast.show(
                     'Sign in failed: ' + ((resp && resp.error) || 'unknown error'),
                     { type: 'error' }

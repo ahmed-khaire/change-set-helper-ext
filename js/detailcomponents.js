@@ -19,6 +19,10 @@
 (function () {
     'use strict';
 
+    if (isOutboundChangeSetWrapperUrl()) {
+        return;
+    }
+
     var COMPONENTS_TABLE_SEL = 'table.list';
     var REMOVE_LINK_SEL = 'a[id*="removeLink"]';
     var CONFIRM_REGEX = /confirmRemoveComponent\(\s*['"]([^'"]+)['"]\s*\)/;
@@ -26,6 +30,24 @@
     var pendingDeletes = {};     // mid -> {resolve, reject}
     var pageBridgeInjected = false;
     var bulkCancelled = false;
+    var currentComponentsTable = null;
+    var delegatedEventsWired = false;
+    var tableObserver = null;
+    var pageObserverInstalled = false;
+    var initialAuthoritativeSyncStarted = false;
+    var cartSyncRequestWired = false;
+    var cartDetailInitStarted = false;
+
+    ensureDetailCartReady();
+    if (isWrappedDetailUrl()) {
+        setTimeout(function () {
+            if (initialAuthoritativeSyncStarted) return;
+            initialAuthoritativeSyncStarted = true;
+            backgroundSyncCart(null, { force: false }).catch(function (e) {
+                console.warn('[CSH] wrapped detail initial sync failed:', e && e.message);
+            });
+        }, 0);
+    }
 
     // Column indices resolved by scanning the header row once the table is
     // found. Keyed by header text lowercased; -1 if that header isn't present.
@@ -48,7 +70,7 @@
     var pollTimer = setInterval(function () {
         pollAttempts++;
         var table = document.querySelector(COMPONENTS_TABLE_SEL);
-        if (table && table.querySelector(REMOVE_LINK_SEL)) {
+        if (table && table.querySelector('tr.headerRow')) {
             clearInterval(pollTimer);
             setupPage(table);
         } else if (pollAttempts > 40) { // 8 seconds
@@ -66,6 +88,7 @@
     // annotateRow's re-tick on partial refresh, so users can accumulate across
     // pages before hitting "Remove selected".
     var BULK_REMOVE_ENABLED = true;
+    var FULL_SYNC_ENABLED = true;
 
     // Filter toolbar is disabled until we implement cross-page client-side
     // filter+sort. The current implementation only filters the currently-
@@ -78,17 +101,76 @@
     var FILTER_TOOLBAR_ENABLED = false;
 
     function setupPage(table) {
+        if (!table || currentComponentsTable === table) return;
+        currentComponentsTable = table;
+        var canBulkRemove = BULK_REMOVE_ENABLED && !!table.querySelector(REMOVE_LINK_SEL);
         injectPageBridge();
-        if (BULK_REMOVE_ENABLED) injectSelectionColumn(table);
+        if (canBulkRemove) injectSelectionColumn(table);
         resolveColumnIndices(table);
-        if (FILTER_TOOLBAR_ENABLED || BULK_REMOVE_ENABLED) injectToolbar(table);
+        if (FILTER_TOOLBAR_ENABLED || canBulkRemove || FULL_SYNC_ENABLED) injectToolbar(table, canBulkRemove);
         if (FILTER_TOOLBAR_ENABLED) populateFilterDropdowns(table);
         hijackRemoveLinks(table);
         observeTableChanges(table);
         wireDelegatedEvents(table);
+        ensureDetailCartReady();
         if (FILTER_TOOLBAR_ENABLED) applyFilters(table); // populates the "N components" counter
-        backgroundSyncCart(table);
+        var forceInitialSync = !initialAuthoritativeSyncStarted;
+        initialAuthoritativeSyncStarted = true;
+        backgroundSyncCart(table, { force: forceInitialSync });
+        installPageObserver();
         console.log('detailcomponents: initialized on', table);
+    }
+
+    function ensureDetailCartReady() {
+        wireCartSyncRequest();
+        if (!cartDetailInitStarted && window.cshCart && window.cshCart.init) {
+            cartDetailInitStarted = true;
+            window.cshCart.init({ changeSetId: urlChangeSetId() })
+                .catch(function (e) { console.warn('cshCart detail init failed:', e && e.message); });
+        }
+    }
+
+    function wireCartSyncRequest() {
+        if (cartSyncRequestWired) return;
+        cartSyncRequestWired = true;
+        window.addEventListener('csh:cart-sync-request', async function (ev) {
+            if (ev.detail) ev.detail.handled = true;
+            var table = getCurrentTable();
+            var ok = await backgroundSyncCart(table, { force: true });
+            if (window.cshToast) {
+                window.cshToast.show(
+                    ok ? 'Change Set Details synced from Salesforce.' : 'Change Set Details sync failed.',
+                    { type: ok ? 'success' : 'error', duration: ok ? 3000 : 7000 }
+                );
+            }
+        });
+    }
+
+    function getCurrentTable() {
+        if (currentComponentsTable && document.documentElement.contains(currentComponentsTable)) {
+            return currentComponentsTable;
+        }
+        var table = document.querySelector(COMPONENTS_TABLE_SEL);
+        if (table && table.querySelector('tr.headerRow')) currentComponentsTable = table;
+        return currentComponentsTable;
+    }
+
+    function installPageObserver() {
+        if (pageObserverInstalled || !document.body) return;
+        pageObserverInstalled = true;
+        var scheduled = false;
+        function scheduleSetup() {
+            if (scheduled) return;
+            scheduled = true;
+            setTimeout(function () {
+                scheduled = false;
+                var table = document.querySelector(COMPONENTS_TABLE_SEL);
+                if (table && table.querySelector('tr.headerRow') && table !== currentComponentsTable) {
+                    setupPage(table);
+                }
+            }, 80);
+        }
+        new MutationObserver(scheduleSetup).observe(document.body, { childList: true, subtree: true });
     }
 
     // -----------------------------------------------------------------------
@@ -142,7 +224,21 @@
 
     function urlChangeSetId() {
         var m = location.search.match(/[?&]id=([^&]+)/);
-        return m ? decodeURIComponent(m[1]) : null;
+        if (m) return decodeURIComponent(m[1]);
+        var address = new URLSearchParams(location.search).get('address');
+        if (!address) return null;
+        var decoded = decodeURIComponent(address);
+        var inner = decoded.match(/[?&]id=([^&]+)/);
+        return inner ? decodeURIComponent(inner[1]) : null;
+    }
+
+    function isWrappedDetailUrl() {
+        var address = new URLSearchParams(location.search).get('address');
+        return !!(address && /\/changemgmt\/outboundChangeSetDetailPage\.apexp/i.test(decodeURIComponent(address)));
+    }
+
+    function isOutboundChangeSetWrapperUrl() {
+        return /\/lightning\/setup\/OutboundChangeSet\/page/i.test(location.pathname || '');
     }
 
     // Walks the classic /<033id>?tab=PackageComponents view across every
@@ -151,10 +247,10 @@
     // name) rather than Del URLs. rowsperpage=5000 normally returns the
     // whole change set in a single page; the next-page loop is here as
     // safety for very large sets.
-    async function fetchAllChangeSetComponents(csId) {
-        var urlId = new URLSearchParams(location.search).get('id');
+    async function fetchAllChangeSetComponents(csId, resolvedPackageId) {
+        var urlId = urlChangeSetId();
         if (!urlId) throw new Error('No change-set id in URL');
-        var packageId = await resolvePackageId(urlId);
+        var packageId = resolvedPackageId || await resolvePackageId(urlId);
         if (!packageId) {
             throw new Error('Could not resolve 033 MetadataPackage id for authoritative sync');
         }
@@ -198,12 +294,10 @@
                 // remove affordance — fall back to SF-id-shaped anchor hrefs,
                 // preferring the Name column cell so we don't pick up any
                 // Parent Object / Included By cross-reference.
-                var cid = null;
+                // Prefer componentId below; href is kept for removeHref only.
                 var href = findDelLinkInRow(row);
-                if (href) {
-                    cid = extractCidFromDelHref(href);
-                }
-                if (!cid) cid = findCidInRowAnchors(row, packageId, idx.name);
+                var componentId = findCidInRowAnchors(row, packageId, idx.name);
+                var cid = componentId || extractCidFromDelHref(href);
                 if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
@@ -211,7 +305,11 @@
                 var fullName = idx.fullName >= 0 && cells[idx.fullName] ? (cells[idx.fullName].textContent || '').trim() : '';
                 if (!type) { dropped.noType++; return; }
                 var it = { id: cid, type: type, name: name || cid };
-                if (fullName) it.extra = { fullName: fullName };
+                if (fullName || href) {
+                    it.extra = {};
+                    if (fullName) it.extra.fullName = fullName;
+                    if (href) it.extra.removeHref = new URL(href, nextUrl).href;
+                }
                 items.push(it);
             });
             console.log('[CSH] authoritative sync page', pageNum,
@@ -224,13 +322,31 @@
         return items;
     }
 
-    async function backgroundSyncCart(table) {
+    async function hasCachedMembership(keys) {
+        if (!window.cshDb || !window.cshDb.getChangeSetMembers) return false;
+        try {
+            for (var i = 0; i < keys.length; i++) {
+                var rows = await window.cshDb.getChangeSetMembers(keys[i], { status: 'present' });
+                if (rows && rows.length) {
+                    console.log('[CSH] IndexedDB has cached change-set membership for', keys[i], rows.length, 'row(s)');
+                    return true;
+                }
+            }
+        } catch (e) {
+            console.warn('[CSH] cached membership check failed:', e && e.message);
+        }
+        return false;
+    }
+
+    async function backgroundSyncCart(table, opts) {
+        opts = opts || {};
         if (!window.cshCart || !window.cshCart.syncItemsFromServer) return;
         var csId = urlChangeSetId();
         if (!csId) return;
         var setSync = window.cshCart.setSyncState || function () {};
-        var visible = extractSyncItems(table);
-        setSync('syncing', '(' + visible.length + ')');
+        var visible = table ? extractSyncItems(table) : [];
+        var syncClaim = null;
+        setSync('syncing');
         try {
             // Phase 1: fast sync of visible rows. Skipped when the
             // rendered table is empty (e.g. the user is on a filter view
@@ -241,28 +357,109 @@
                     ' promoted=' + p1.promoted + ' kept=' + p1.kept +
                     ' (scanned=' + visible.length + ')');
             }
-            // Phase 2: authoritative paginated fetch.
-            var all = await fetchAllChangeSetComponents(csId);
+            // Phase 2: authoritative paginated fetch. This is intentionally
+            // guarded because large orgs can spend a long time scraping every
+            // Package Components page; navigation should not restart the same
+            // scan over and over.
+            var packageId = await resolvePackageId(csId);
+            var keys = [csId];
+            if (packageId && packageId !== csId) keys.push(packageId);
+            if (window.cshCart.mergeRelatedCarts) {
+                await window.cshCart.mergeRelatedCarts(keys);
+            }
+            if (window.cshDb && window.cshDb.markChangeSetsUsed) {
+                window.cshDb.markChangeSetsUsed(keys, { source: 'detail-page-change-set-use' }).catch(function (e) {
+                    console.warn('cshDb change-set usage update failed:', e && e.message);
+                });
+            }
+            if (!opts.force && await hasCachedMembership(keys)) {
+                if (window.cshCart.hydrateFromIndexedDb) {
+                    await window.cshCart.hydrateFromIndexedDb(keys);
+                }
+                console.log('[CSH] hydrated from IndexedDB membership cache; checking authoritative sync freshness');
+            }
+            syncClaim = window.cshCart.beginAuthoritativeSync
+                ? await window.cshCart.beginAuthoritativeSync(keys, { force: !!opts.force })
+                : { started: true, keys: keys };
+            if (!syncClaim.started) {
+                console.log('[CSH] background authoritative sync skipped:', syncClaim.reason);
+                setSync('idle');
+                return true;
+            }
+            var all = await fetchAllChangeSetComponents(csId, packageId);
             // Write to both cart keys: the 0A2 outbound change-set id used
             // by this Detail page and the 033 MetadataPackage id used by
             // the Add page. Historically these were two divergent storage
             // entries for the same change set; this convergence keeps them
             // aligned so the Add page's cart card matches reality once the
             // user navigates over.
-            var keys = [csId];
-            if (packageIdCache && packageIdCache !== csId) keys.push(packageIdCache);
-            for (var i = 0; i < keys.length; i++) {
-                var p2 = await window.cshCart.syncItemsFromServer(keys[i], all, { authoritative: true });
-                console.log('[CSH] background sync (authoritative) key=' + keys[i] +
+            for (var i = 0; i < syncClaim.keys.length; i++) {
+                var p2 = await window.cshCart.syncItemsFromServer(
+                    syncClaim.keys[i],
+                    all,
+                    { authoritative: true, allowEmptyAuthoritative: true }
+                );
+                console.log('[CSH] background sync (authoritative) key=' + syncClaim.keys[i] +
                     ': inserted=' + p2.inserted + ' promoted=' + p2.promoted +
                     ' kept=' + p2.kept + ' pruned=' + (p2.pruned || 0) +
                     ' (scanned=' + all.length + ')');
             }
+            if (window.cshCart.finishAuthoritativeSync) {
+                await window.cshCart.finishAuthoritativeSync(syncClaim.keys, all.length);
+            }
             setSync('idle');
+            return true;
         } catch (e) {
             console.warn('[CSH] authoritative sync failed:', e && e.message);
+            if (syncClaim && syncClaim.started && window.cshCart && window.cshCart.failAuthoritativeSync) {
+                window.cshCart.failAuthoritativeSync(syncClaim.keys, (e && e.message) || 'Sync failed')
+                    .catch(function () {});
+            }
             setSync('error', (e && e.message) || 'Sync failed');
+            return false;
         }
+    }
+
+    async function forceFullSync(table) {
+        table = table || getCurrentTable();
+        if (!table) return;
+        var btn = document.querySelector('.csh-dc-full-sync-btn');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Syncing...';
+        }
+        try {
+            var ok = await backgroundSyncCart(table, { force: true });
+            if (ok && window.cshToast) {
+                window.cshToast.show('Full change set sync completed.', { type: 'success', duration: 3000 });
+            }
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Full Sync';
+            }
+        }
+    }
+
+    async function currentChangeSetKeys() {
+        var csId = urlChangeSetId();
+        if (!csId) return [];
+        var keys = [csId];
+        try {
+            var packageId = await resolvePackageId(csId);
+            if (packageId && packageId !== csId) keys.push(packageId);
+        } catch (e) {
+            console.warn('[CSH] could not resolve package id for cart removal:', e && e.message);
+        }
+        return keys;
+    }
+
+    async function removeFromCartPanel(items) {
+        if (!items || !items.length || !window.cshCart || !window.cshCart.removeServerItems) return;
+        var keys = await currentChangeSetKeys();
+        if (!keys.length) return;
+        var result = await window.cshCart.removeServerItems(keys, items);
+        console.log('[CSH] removed deleted component(s) from cart panel:', result && result.removed);
     }
 
     // Scan the header row once to locate Name / Parent Object / Type / Full
@@ -420,6 +617,10 @@
             var name = nameCell ? (nameCell.textContent || '').trim() : '';
             if (name) label = name;
         }
+        var type = '';
+        if (row && colIndex.type >= 0 && row.children[colIndex.type]) {
+            type = (row.children[colIndex.type].textContent || '').trim();
+        }
         if (!confirm('Remove "' + label + '" from this change set? This cannot be undone.')) return;
         if (!window.cshChangeSetOps || !window.cshChangeSetOps.removeById) {
             console.error('[CSH] cshChangeSetOps not available for single remove');
@@ -429,11 +630,15 @@
         if (row) row.style.opacity = '0.5';
         try {
             await window.cshChangeSetOps.removeById(cid);
+            await removeFromCartPanel([{ id: cid, type: type, name: label }]);
             // removeOne() inside cshChangeSetOps already purges the row from
             // the DOM, so there's nothing more to do on success.
             if (window.cshToast) {
                 window.cshToast.show('Removed "' + label + '"', { type: 'success', duration: 3000 });
             }
+            backgroundSyncCart(getCurrentTable(), { force: true }).catch(function (e) {
+                console.warn('[CSH] post-remove authoritative sync failed:', e && e.message);
+            });
         } catch (err) {
             if (row) row.style.opacity = '';
             var msg = (err && err.message) || 'Remove failed';
@@ -450,7 +655,7 @@
     // -----------------------------------------------------------------------
     // Toolbar.
     // -----------------------------------------------------------------------
-    function injectToolbar(table) {
+    function injectToolbar(table, canBulkRemove) {
         if (document.querySelector('.csh-dc-toolbar')) return;
         // Filter row and bulk action row are independently gated. Either or
         // both may render; when neither flag is on, the toolbar itself is
@@ -463,13 +668,20 @@
                 '<span class="csh-dc-visible-count"></span>' +
               '</div>'
             : '';
-        var actionRow = BULK_REMOVE_ENABLED
-            ? '<div class="csh-dc-action-row">' +
-                '<span class="csh-dc-label">Bulk:</span>' +
+        var bulkControls = canBulkRemove
+            ? '<span class="csh-dc-label">Bulk:</span>' +
                 '<button type="button" class="csh-dc-select-all-btn">Select visible</button>' +
                 '<button type="button" class="csh-dc-select-none-btn">Clear selection</button>' +
                 '<span class="csh-dc-count">0 selected</span>' +
-                '<button type="button" class="csh-dc-remove-btn" disabled>Remove selected</button>' +
+                '<button type="button" class="csh-dc-remove-btn" disabled>Remove selected</button>'
+            : '';
+        var fullSyncControl = FULL_SYNC_ENABLED
+            ? '<button type="button" class="csh-dc-full-sync-btn" title="Refresh the full server-side change set membership cache">Full Sync</button>'
+            : '';
+        var actionRow = (bulkControls || fullSyncControl)
+            ? '<div class="csh-dc-action-row">' +
+                bulkControls +
+                fullSyncControl +
               '</div>'
             : '';
         var toolbar = document.createElement('div');
@@ -577,7 +789,11 @@
     // Event wiring (delegated so rows added later by A4J refreshes work too).
     // -----------------------------------------------------------------------
     function wireDelegatedEvents(table) {
+        if (delegatedEventsWired) return;
+        delegatedEventsWired = true;
         document.addEventListener('change', function (ev) {
+            var table = getCurrentTable();
+            if (!table) return;
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all')) {
                 // Header checkbox — only ticks currently-visible rows. Updates
@@ -602,6 +818,8 @@
         // 'input' event fires on every keystroke / clear for <input type="search">
         document.addEventListener('input', function (ev) {
             if (ev.target.classList.contains('csh-dc-search')) {
+                var table = getCurrentTable();
+                if (!table) return;
                 applyFilters(table);
                 updateSelectionCount();
             }
@@ -612,6 +830,8 @@
         // a row rendered between setupPage() and the MutationObserver's
         // next tick).
         document.addEventListener('click', function (ev) {
+            var table = getCurrentTable();
+            if (!table) return;
             var link = ev.target && ev.target.closest && ev.target.closest(REMOVE_LINK_SEL);
             if (!link || !table.contains(link)) return;
             ev.preventDefault();
@@ -624,6 +844,8 @@
         }, true);
 
         document.addEventListener('click', function (ev) {
+            var table = getCurrentTable();
+            if (!table) return;
             var t = ev.target;
             if (t.classList.contains('csh-dc-select-all-btn')) {
                 // Select visible — does NOT tick rows hidden by the filter
@@ -640,12 +862,16 @@
                 updateSelectionCount();
             } else if (t.classList.contains('csh-dc-remove-btn')) {
                 handleRemoveSelected();
+            } else if (t.classList.contains('csh-dc-full-sync-btn')) {
+                forceFullSync(table);
             }
         });
     }
 
     function visibleSelectCheckboxes() {
-        return Array.from(document.querySelectorAll('.csh-dc-select-row:not([disabled])'))
+        var table = getCurrentTable();
+        if (!table) return [];
+        return Array.from(table.querySelectorAll('.csh-dc-select-row:not([disabled])'))
             .filter(function (cb) {
                 var row = cb.closest('tr');
                 return row && row.style.display !== 'none';
@@ -690,6 +916,10 @@
     // to re-annotate any newly-inserted rows so they get our select column.
     // -----------------------------------------------------------------------
     function observeTableChanges(table) {
+        if (tableObserver) {
+            try { tableObserver.disconnect(); } catch (_) {}
+            tableObserver = null;
+        }
         var refreshPending = false;
         function scheduleRefresh() {
             if (refreshPending) return;
@@ -706,7 +936,7 @@
             }, 80);
         }
 
-        var observer = new MutationObserver(function (mutations) {
+        tableObserver = new MutationObserver(function (mutations) {
             var sawRowMutation = false;
             mutations.forEach(function (m) {
                 m.addedNodes.forEach(function (node) {
@@ -736,7 +966,7 @@
             if (sawRowMutation) scheduleRefresh();
             updateSelectionCount();
         });
-        observer.observe(table, { childList: true, subtree: true });
+        tableObserver.observe(table, { childList: true, subtree: true });
     }
 
     // -----------------------------------------------------------------------
@@ -1009,7 +1239,7 @@
 
     async function buildDelHrefMap() {
         if (delHrefCache) return delHrefCache;
-        var urlId = new URLSearchParams(location.search).get('id');
+        var urlId = urlChangeSetId();
         if (!urlId) throw new Error('No change-set id in URL');
         var csId = await resolvePackageId(urlId);
         if (!csId) {
@@ -1273,6 +1503,7 @@
 
         var byCid = {};
         items.forEach(function (it) { byCid[it.cid] = it; });
+        var removedItems = [];
 
         var result = await window.cshChangeSetOps.removeManyByIds(
             items.map(function (i) { return i.cid; }),
@@ -1282,6 +1513,7 @@
                     var name = (byCid[cid] && byCid[cid].name) || cid;
                     if (ok) {
                         selectedItems.delete(cid);
+                        removedItems.push({ id: cid, type: (byCid[cid] && byCid[cid].type) || '', name: name });
                         appendLog('✓ ' + name, 'ok');
                     } else {
                         appendLog('✗ ' + name + ' — ' + (err && err.message || 'unknown'), 'fail');
@@ -1293,6 +1525,12 @@
             }
         );
 
+        if (removedItems.length) {
+            await removeFromCartPanel(removedItems);
+            backgroundSyncCart(getCurrentTable(), { force: true }).catch(function (e) {
+                console.warn('[CSH] post-bulk-remove authoritative sync failed:', e && e.message);
+            });
+        }
         finishProgressModal(result.done, result.failed);
         updateSelectionCount();
     }

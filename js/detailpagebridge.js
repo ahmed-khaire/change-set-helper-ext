@@ -57,5 +57,9 @@
         };
     };
 
-    console.log('[CSH bridge] MAIN-world bridge installed on', location.href.slice(0, 120));
+    try {
+        if (/^(1|true|yes)$/i.test(localStorage.getItem('cshDevLogs') || '')) {
+            console.log('[CSH bridge] MAIN-world bridge installed on', location.href.slice(0, 120));
+        }
+    } catch (_) {}
 })();

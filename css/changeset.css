@@ -269,6 +269,7 @@ table.list th.csh-dc-select-col {
     border-radius: 3px;
     cursor: pointer;
     font: inherit;
+    color: #000;
 }
 .csh-dc-modal .csh-dc-modal-close {
     background: #0176d3;

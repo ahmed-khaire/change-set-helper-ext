@@ -1,9 +1,10 @@
 // Manifest V3 service worker
-// JSforce operations are handled in offscreen.html/offscreen.js due to XMLHttpRequest requirement
+// JSforce operations are handled in pages/offscreen.html and js/offscreen.js due to XMLHttpRequest requirement
+importScripts('cshlogger.js');
 
 var CSH_APIVERSION = "66.0";
 var CSH_APIVERSION_IS_USER_PREF = false;
-const versionPattern = RegExp('^[0-9][0-9]\.0$');
+const versionPattern = RegExp('^[0-9][0-9]\\.0$');
 
 // Priority:
 //   1. chrome.storage.sync.salesforceApiVersion  — user-set from options page
@@ -233,6 +234,20 @@ function cshValidateSalesforceProxyRequest(requestUrl, sender) {
     return null;
 }
 
+function cshValidateCartSubmitAction(actionUrl, sender) {
+    var validationError = cshValidateSalesforceProxyRequest(actionUrl, sender);
+    if (validationError) return validationError;
+    try {
+        var u = new URL(actionUrl);
+        if (!/^\/p\/mfpkg\/AddToPackage(FromChangeMgmtUi|Ui)?$/i.test(u.pathname)) {
+            return 'unexpected add-components endpoint';
+        }
+    } catch (_) {
+        return 'invalid url';
+    }
+    return null;
+}
+
 async function cshExchangeCodeForToken(host, code, codeVerifier) {
     var body = new URLSearchParams();
     body.append('grant_type', 'authorization_code');
@@ -302,7 +317,14 @@ async function cshRunOauthLogin(host) {
             chrome.identity.launchWebAuthFlow(
                 { url: authUrl, interactive: true },
                 function (url) {
-                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    if (chrome.runtime.lastError) {
+                        var msg = chrome.runtime.lastError.message || 'OAuth authorization was cancelled';
+                        var err = new Error(msg);
+                        if (/did not approve|cancel|denied|closed/i.test(msg)) {
+                            err.code = 'user-cancelled';
+                        }
+                        return reject(err);
+                    }
                     if (!url) return reject(new Error('No redirect URL returned'));
                     resolve(url);
                 }
@@ -602,8 +624,10 @@ async function cshGetFreshDeployToken(orgId) {
 
 // Keep service worker alive during long-running operations
 let keepAliveInterval = null;
+let keepAliveRefCount = 0;
 
 function startKeepAlive() {
+    keepAliveRefCount++;
     if (!keepAliveInterval) {
         keepAliveInterval = setInterval(() => {
             chrome.runtime.getPlatformInfo(() => {
@@ -614,15 +638,71 @@ function startKeepAlive() {
 }
 
 function stopKeepAlive() {
+    keepAliveRefCount = Math.max(0, keepAliveRefCount - 1);
+    if (keepAliveRefCount > 0) return;
     if (keepAliveInterval) {
         clearInterval(keepAliveInterval);
         keepAliveInterval = null;
     }
 }
 
+async function cshSubmitCartBatch(request, sender) {
+    var shape = request.formShape;
+    var ids = request.ids || [];
+    if (!shape || !shape.action) {
+        return { ok: false, error: 'No form shape available' };
+    }
+    var submitValidationError = cshValidateCartSubmitAction(shape.action, sender);
+    if (submitValidationError) {
+        return { ok: false, error: 'cshCartSubmit: ' + submitValidationError };
+    }
+    var body = new URLSearchParams();
+    Object.keys(shape.hidden || {}).forEach(function (k) {
+        body.append(k, shape.hidden[k]);
+    });
+    // The Salesforce form names its row checkboxes `ids`; appending one entry
+    // per selected id produces the same POST shape as a real user tick.
+    ids.forEach(function (id) { body.append('ids', id); });
+    // Include the submit button's own name/value so the server-side handler
+    // treats it as a Save (not a filter / search submission).
+    if (shape.submitName) body.append(shape.submitName, shape.submitValue || 'Save');
+
+    var startedAt = Date.now();
+    var resp = await fetch(shape.action, {
+        method: shape.method || 'POST',
+        credentials: 'include',
+        body: body.toString(),
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            // Hint the server this is an async submission; Salesforce tolerates
+            // it and it avoids full HTML shells in some cases.
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+    });
+    console.log('[CSH cart submit]', {
+        actionPath: new URL(shape.action).pathname,
+        idsCount: ids.length,
+        status: resp.status,
+        elapsedMs: Date.now() - startedAt,
+        finalUrl: resp.url
+    });
+    // Successful add-to-change-set usually returns a 302 redirect to the
+    // Outbound Change Set detail page. fetch follows redirects by default; a
+    // 200 on the detail URL is our success signal.
+    if (resp.ok || (resp.status >= 300 && resp.status < 400)) {
+        return { ok: true, finalUrl: resp.url };
+    }
+    var text = await resp.text().catch(function () { return ''; });
+    return {
+        ok: false,
+        error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
+    };
+}
+
 // Offscreen document management
 let creating; // A global promise to avoid concurrency issues
 let offscreenReady = false;
+let offscreenReadyWaiters = [];
 let offscreenInactivityTimer = null;
 let offscreenPendingCount = 0; // in-flight sendToOffscreen calls
 const OFFSCREEN_INACTIVITY_TIMEOUT = 5 * 60 * 1000; // Close after 5 minutes of inactivity
@@ -676,7 +756,7 @@ function resetOffscreenInactivityTimer() {
     }, OFFSCREEN_INACTIVITY_TIMEOUT);
 }
 
-//offscreen.html
+// pages/offscreen.html
 async function setupOffscreenDocument(path) {
     try {
         // Check if offscreen API is available
@@ -698,6 +778,7 @@ async function setupOffscreenDocument(path) {
 
         if (existingContexts.length > 0) {
             console.log('Offscreen document already exists');
+            offscreenReady = true;
             return;
         }
 
@@ -730,6 +811,26 @@ async function setupOffscreenDocument(path) {
     }
 }
 
+function waitForOffscreenReady(timeoutMs) {
+    if (offscreenReady) return Promise.resolve(true);
+    return new Promise(function (resolve) {
+        var settled = false;
+        var timer = setTimeout(function () {
+            if (settled) return;
+            settled = true;
+            offscreenReadyWaiters = offscreenReadyWaiters.filter(function (fn) { return fn !== done; });
+            resolve(false);
+        }, timeoutMs || 5000);
+        function done() {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(true);
+        }
+        offscreenReadyWaiters.push(done);
+    });
+}
+
 async function sendToOffscreen(message) {
     // Track in-flight ops so resetOffscreenInactivityTimer won't schedule a
     // close while we're still waiting on this call. Without this a long
@@ -737,13 +838,16 @@ async function sendToOffscreen(message) {
     // own message listener torn down mid-response.
     offscreenPendingCount++;
     try {
-        await setupOffscreenDocument('offscreen.html');
+        await setupOffscreenDocument('pages/offscreen.html');
         resetOffscreenInactivityTimer();
 
         if (!offscreenReady) {
-            // Wait for offscreen document to fully load and JSforce to initialize
-            await new Promise(resolve => setTimeout(resolve, 500));
-            offscreenReady = true;
+            // Wait for the offscreen document's explicit ready signal instead
+            // of assuming a fixed delay is enough on slow startup.
+            var ready = await waitForOffscreenReady(5000);
+            if (!ready) {
+                console.warn('Offscreen document did not signal ready before timeout; sending message anyway');
+            }
         }
 
         return await new Promise((resolve, reject) => {
@@ -794,6 +898,26 @@ chrome.runtime.onConnect.addListener(function (port) {
             stopKeepAlive();
         });
     }
+
+    if (port.name == "cartSubmitHandler") {
+        startKeepAlive();
+        port.onMessage.addListener(async function (request) {
+            if (request.type !== "cshCartSubmit") return;
+            try {
+                var response = await cshSubmitCartBatch(request, port.sender);
+                port.postMessage({ type: 'cshCartSubmitResult', response: response });
+            } catch (err) {
+                console.error('cshCartSubmit failed:', err);
+                port.postMessage({
+                    type: 'cshCartSubmitResult',
+                    response: { ok: false, error: err.message || String(err) }
+                });
+            }
+        });
+        port.onDisconnect.addListener(() => {
+            stopKeepAlive();
+        });
+    }
 });
 
 chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
@@ -801,6 +925,44 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     if (request.action === 'offscreenReady') {
         console.log('Offscreen document signaled ready!');
         offscreenReady = true;
+        offscreenReadyWaiters.splice(0).forEach(function (resolve) { resolve(); });
+        return false;
+    }
+
+    if (request.type === 'cshComparePopupReady') {
+        startCompareRetrieves(request.requestId, ['lhs', 'rhs'], request.runId).catch(function (err) {
+            console.error('Compare retrieve startup failed:', err);
+            chrome.runtime.sendMessage({
+                'requestId': request.requestId,
+                'runId': request.runId,
+                'setSide': 'lhs',
+                'err': err && err.message ? err.message : String(err)
+            });
+            chrome.runtime.sendMessage({
+                'requestId': request.requestId,
+                'runId': request.runId,
+                'setSide': 'rhs',
+                'err': err && err.message ? err.message : String(err)
+            });
+        });
+        sendResponse({ ok: true });
+        return false;
+    }
+
+    if (request.type === 'cshCompareRefresh') {
+        var refreshSides = Array.isArray(request.sides) && request.sides.length ? request.sides : ['lhs', 'rhs'];
+        startCompareRetrieves(request.requestId, refreshSides, request.runId).catch(function (err) {
+            console.error('Compare refresh failed:', err);
+            refreshSides.forEach(function (side) {
+                chrome.runtime.sendMessage({
+                    'requestId': request.requestId,
+                    'runId': request.runId,
+                    'setSide': side,
+                    'err': err && err.message ? err.message : String(err)
+                });
+            });
+        });
+        sendResponse({ ok: true });
         return false;
     }
 
@@ -829,8 +991,16 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                 });
             })
             .catch(function (err) {
-                console.error('cshAuthLogin failed:', err);
-                sendResponse({ ok: false, error: err.message });
+                if (err && err.code === 'user-cancelled') {
+                    console.warn('cshAuthLogin cancelled by user:', err.message || err);
+                } else {
+                    console.error('cshAuthLogin failed:', err);
+                }
+                sendResponse({
+                    ok: false,
+                    userCancelled: err && err.code === 'user-cancelled',
+                    error: err.message
+                });
             });
         return true;
     }
@@ -1054,51 +1224,14 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         // the user's checkbox selections. fetch() from the service worker
         // includes cookies for any origin we have host_permissions for.
         (async function () {
+            startKeepAlive();
             try {
-                var shape = request.formShape;
-                var ids = request.ids || [];
-                if (!shape || !shape.action) {
-                    sendResponse({ ok: false, error: 'No form shape available' });
-                    return;
-                }
-                var body = new URLSearchParams();
-                Object.keys(shape.hidden || {}).forEach(function (k) {
-                    body.append(k, shape.hidden[k]);
-                });
-                // The Salesforce form names its row checkboxes `ids`; appending
-                // one entry per selected id produces the same POST shape as a
-                // real user tick.
-                ids.forEach(function (id) { body.append('ids', id); });
-                // Include the submit button's own name/value so the server-side
-                // handler treats it as a Save (not a filter / search submission).
-                if (shape.submitName) body.append(shape.submitName, shape.submitValue || 'Save');
-
-                var resp = await fetch(shape.action, {
-                    method: shape.method || 'POST',
-                    credentials: 'include',
-                    body: body.toString(),
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        // Hint the server this is an async submission; Salesforce
-                        // tolerates it and it avoids full HTML shells in some cases.
-                        'X-Requested-With': 'XMLHttpRequest'
-                    }
-                });
-                // Successful add-to-change-set usually returns a 302 redirect
-                // to the Outbound Change Set detail page. fetch follows redirects
-                // by default; a 200 on the detail URL is our success signal.
-                if (resp.ok || (resp.status >= 300 && resp.status < 400)) {
-                    sendResponse({ ok: true, finalUrl: resp.url });
-                    return;
-                }
-                var text = await resp.text().catch(function () { return ''; });
-                sendResponse({
-                    ok: false,
-                    error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
-                });
+                sendResponse(await cshSubmitCartBatch(request, sender));
             } catch (err) {
                 console.error('cshCartSubmit failed:', err);
                 sendResponse({ ok: false, error: err.message || String(err) });
+            } finally {
+                stopKeepAlive();
             }
         })();
         return true;
@@ -1174,11 +1307,16 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                     freshlyLoggedIn: !!res.freshlyLoggedIn
                 });
             } catch (err) {
-                console.error('connectToDeploy failed:', err);
+                if (err && err.code === 'user-cancelled') {
+                    console.warn('connectToDeploy cancelled by user:', err.message || err);
+                } else {
+                    console.error('connectToDeploy failed:', err);
+                }
                 sendResponse({
                     oauth: 'response',
                     ok: false,
                     needsReauth: err && err.code === 'needs-reauth',
+                    userCancelled: err && err.code === 'user-cancelled',
                     error: err && err.message ? err.message : String(err)
                 });
             }
@@ -1580,22 +1718,54 @@ async function quickDeploy(port, currentId) {
     }
 }
 
+const cshPendingCompareRequests = {};
+
 function compareContents(type, item, localOrg, targetOrg) {
     // Encode every piece — item names can contain &, #, space, ? or / (e.g.
     // "FolderA/MyReport"); org labels are hostnames/usernames and usually
     // safe but encoding them keeps the URL parser honest if a label ever
     // includes a space or symbol. The popup decodes with decodeURIComponent.
-    var url = "compare.html?item=" + encodeURIComponent(item);
+    var requestId = 'cmp-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    cshPendingCompareRequests[requestId] = {
+        type: type,
+        item: item,
+        createdAt: Date.now()
+    };
+    var url = "pages/compare.html?item=" + encodeURIComponent(item) +
+        "&requestId=" + encodeURIComponent(requestId);
     if (localOrg) url += "&localOrg=" + encodeURIComponent(localOrg);
     if (targetOrg) url += "&targetOrg=" + encodeURIComponent(targetOrg);
-    chrome.windows.create({'url': url, 'type': "popup", "focused": false},
-        async function (newWin) {
-            await getContents(type, item, 'local', "lhs");
-            await getContents(type, item, 'deploy', "rhs");
-        });
+    chrome.windows.create({ 'url': url, 'type': "popup", "focused": false });
+    setTimeout(function () {
+        var req = cshPendingCompareRequests[requestId];
+        if (req && Date.now() - (req.lastUsedAt || req.createdAt || 0) > 60 * 60 * 1000) {
+            delete cshPendingCompareRequests[requestId];
+        }
+    }, 60 * 60 * 1000);
 }
 
-async function getContents(type, item, connType, side) {
+async function startCompareRetrieves(requestId, sides, runId) {
+    var req = cshPendingCompareRequests[requestId];
+    if (!req) {
+        (Array.isArray(sides) && sides.length ? sides : ['lhs', 'rhs']).forEach(function (side) {
+            chrome.runtime.sendMessage({
+                'requestId': requestId,
+                'runId': runId,
+                'setSide': side,
+                'err': 'Compare request expired or was not found. Re-open the compare popup.'
+            });
+        });
+        return;
+    }
+    req.lastUsedAt = Date.now();
+    sides = Array.isArray(sides) && sides.length ? sides : ['lhs', 'rhs'];
+    var jobs = [];
+    if (sides.indexOf('lhs') !== -1) jobs.push(getContents(req.type, req.item, 'local', "lhs", requestId, runId));
+    if (sides.indexOf('rhs') !== -1) jobs.push(getContents(req.type, req.item, 'deploy', "rhs", requestId, runId));
+    await Promise.all(jobs);
+}
+
+async function getContents(type, item, connType, side, requestId, runId) {
     try {
         const response = await sendToOffscreen({
             action: 'retrieveMetadata',
@@ -1610,19 +1780,22 @@ async function getContents(type, item, connType, side) {
         });
 
         if (response.error) {
-            chrome.runtime.sendMessage({'setSide': side, 'err': response.error});
+            chrome.runtime.sendMessage({ 'requestId': requestId, 'runId': runId, 'setSide': side, 'err': response.error });
         } else {
             chrome.runtime.sendMessage({
+                'requestId': requestId,
+                'runId': runId,
                 'setSide': side,
+                'type': type,
                 'content': {zipFile: response.zipData},
                 'compareItem': item
             });
         }
     } catch (err) {
         console.error(err);
-        chrome.runtime.sendMessage({'setSide': side, 'err': err.toString()});
+        chrome.runtime.sendMessage({ 'requestId': requestId, 'runId': runId, 'setSide': side, 'err': err.toString() });
     }
 }
 
 console.log('Service worker ready');
-setupOffscreenDocument('offscreen.html');
+setupOffscreenDocument('pages/offscreen.html');

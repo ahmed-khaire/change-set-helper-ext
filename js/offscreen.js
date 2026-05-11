@@ -1,7 +1,7 @@
 // Offscreen document for JSforce operations (has access to XMLHttpRequest)
 
 var CSH_APIVERSION = "66.0";
-const versionPattern = RegExp('^[0-9][0-9]\.0$');
+const versionPattern = RegExp('^[0-9][0-9]\\.0$');
 
 const POLLTIMEOUT = 20*60*1000; // 20 minutes
 const POLLINTERVAL = 5000; //5 seconds

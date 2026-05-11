@@ -200,52 +200,46 @@ From the **Outbound Change Set Detail** page:
 
 ### Project Structure
 
-The extension uses a **flat directory structure** for simplicity and performance:
+The extension keeps the Chrome entry point in the root and groups implementation files by type:
 
 ```
 change-set-helper-ext/
-├── manifest.json              # Manifest V3 configuration
-├── background.js              # Service worker
-├── offscreen.js               # JSforce operations handler
-├── offscreen.html             # Offscreen document wrapper
-├── changeset.js               # Main change set page enhancement (33KB)
-├── changeview.js              # Package view page handler
-├── deployhelper.js            # Validation & deployment UI
-├── metadatahelper.js          # Package download functionality
-├── common.js                  # Shared utilities
-├── compare.js                 # Cross-org comparison logic
-├── compare.html               # Comparison modal template
-├── options.html               # Settings page
-├── options.js                 # Settings logic
-├── popup.html                 # Extension popup
-├── changeset.css              # Main stylesheet
-├── lib/                       # External libraries
-│   ├── jquery.min.js
-│   ├── jquery.dataTables.js
-│   ├── jsforce.js             # Salesforce API client
-│   ├── moment.js              # Date handling
-│   ├── jszip.js               # ZIP operations
-│   ├── codemirror.js          # Code editor
-│   ├── mergely.js             # Diff viewer
-│   └── [other libraries...]
-├── *.png                      # Icons and screenshots
-├── loading.gif                # Loading animation
-└── README.md                  # This file
-
+|-- manifest.json              # Manifest V3 configuration
+|-- js/                        # Extension scripts and content scripts
+|   |-- background.js           # Service worker
+|   |-- offscreen.js            # JSforce operations handler
+|   |-- changeset.js            # Main change set page enhancement
+|   |-- changeview.js           # Package view page handler
+|   |-- deployhelper.js         # Validation and deployment UI
+|   `-- [other extension scripts...]
+|-- css/                       # Extension stylesheets
+|-- pages/                     # Popup, options, compare, and offscreen pages
+|-- assets/                    # Icons, screenshots, and loading animation
+|-- lib/                       # External libraries
+|   |-- jquery.min.js
+|   |-- jquery.dataTables.js
+|   |-- jsforce.js              # Salesforce API client
+|   |-- moment.js               # Date handling
+|   |-- jszip.js                # ZIP operations
+|   |-- codemirror.js           # Code editor
+|   |-- mergely.js              # Diff viewer
+|   `-- [other libraries...]
+|-- docs/                      # Project notes and historical restructure docs
+`-- README.md                  # This file
 ```
 
 ### Architecture
 
 #### Manifest V3 Chrome Extension
-- **Service Worker** (`background.js`): Non-persistent background script for OAuth and API proxying
-- **Offscreen Document** (`offscreen.js`): Isolated context for JSforce operations (requires XMLHttpRequest)
+- **Service Worker** (`js/background.js`): Non-persistent background script for OAuth and API proxying
+- **Offscreen Document** (`js/offscreen.js` via `pages/offscreen.html`): Isolated context for JSforce operations (requires XMLHttpRequest)
 - **Content Scripts**: Inject UI enhancements into Salesforce pages
 
-**Why Flat Structure?**
-- ✅ Faster browser loading (no nested path resolution)
-- ✅ Simpler manifest.json references
-- ✅ Easier debugging and testing
-- ✅ Standard Chrome extension pattern
+**Why This Structure?**
+- Keeps `manifest.json` at the Chrome load point
+- Groups extension code by file type
+- Separates runtime assets from documentation screenshots
+- Keeps third-party libraries isolated in `lib/`
 
 #### Three Injection Points
 
@@ -419,7 +413,7 @@ cd change-set-helper-ext
 # Enable Developer Mode
 # Click "Load unpacked" and select the root directory
 
-# Make changes to files (all in root directory)
+# Make changes under js/, css/, pages/, or assets/
 # Click the refresh icon in chrome://extensions/ to reload
 
 # Test in a Salesforce sandbox environment
@@ -427,14 +421,14 @@ cd change-set-helper-ext
 
 ### File Organization
 
-All source files are in the **root directory** except for external libraries which are in `lib/`:
+Source files are grouped so the root stays small while `manifest.json` remains at the extension load point:
 
-- **Extension Core**: `manifest.json`, `background.js`, `offscreen.js`
-- **Content Scripts**: `changeset.js`, `changeview.js`, `deployhelper.js`, `metadatahelper.js`
-- **UI Pages**: `options.html`, `popup.html`, `compare.html`
-- **Utilities**: `common.js`, `compare.js`
-- **Styling**: `changeset.css`
-- **Assets**: `*.png`, `loading.gif`
+- **Extension Core**: `manifest.json`, `js/background.js`, `js/offscreen.js`
+- **Content Scripts**: `js/changeset.js`, `js/changeview.js`, `js/deployhelper.js`, `js/metadatahelper.js`
+- **UI Pages**: `pages/options.html`, `pages/popup.html`, `pages/compare.html`
+- **Utilities**: `js/common.js`, `js/compare.js`, `js/cshdb.js`
+- **Styling**: `css/changeset.css`, `css/cart.css`
+- **Assets**: `assets/icons/`, `assets/images/`, `assets/screenshots/`
 - **Libraries**: `lib/*.js`, `lib/*.css`
 
 ### Code Style

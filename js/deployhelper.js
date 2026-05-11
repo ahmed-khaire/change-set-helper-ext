@@ -853,6 +853,10 @@ function cshOnConnectSavedOrg() {
 		$btn.prop('disabled', false).val(originalLabel);
 		if (!response || !response.ok) {
 			var msg = (response && response.error) || 'Unknown error';
+			if (response && response.userCancelled) {
+				window.cshToast && window.cshToast.show('Target org sign-in was cancelled.', { type: 'info' });
+				return;
+			}
 			if (response && response.needsReauth) {
 				// Refresh token was revoked / expired. Invite the user to
 				// re-OAuth for this org without deleting the saved record —
@@ -916,7 +920,21 @@ function cshOnDeleteSavedOrg() {
 
 // Launch the OAuth popup for a new (or re-authorized) org. customHost is
 // only used when env === 'mydomain'.
-function cshStartNewOrgLogin(env, customHost) {
+async function cshStartNewOrgLogin(env, customHost) {
+	if (window.cshAuth && typeof window.cshAuth.showInstructions === 'function') {
+		var choice = await window.cshAuth.showInstructions({
+			message: 'Connect the target org so Change Set Helper can validate or deploy this change set.'
+		});
+		if (choice !== 'default') {
+			if (choice === 'options') {
+				window.cshToast && window.cshToast.show(
+					'Options opened. Configure your connected app, then return here to connect the target org.',
+					{ type: 'info', duration: 5000 }
+				);
+			}
+			return;
+		}
+	}
 	chrome.runtime.sendMessage({
 		oauth: 'connectToDeploy',
 		environment: env,
@@ -925,6 +943,10 @@ function cshStartNewOrgLogin(env, customHost) {
 	}, function (response) {
 		if (!response || !response.ok) {
 			var err = (response && response.error) || 'Unknown error';
+			if (response && response.userCancelled) {
+				window.cshToast && window.cshToast.show('Target org sign-in was cancelled.', { type: 'info' });
+				return;
+			}
 			console.log('Problem logging in:', err);
 			window.cshToast && window.cshToast.show('Problem logging in: ' + err, { type: 'error' });
 			return;
