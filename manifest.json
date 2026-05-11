@@ -4,15 +4,15 @@
   "manifest_version": 3,
   "name": "Salesforce Change Set Helper",
   "description": "Enhances the Salesforce change set. Adds last changed date and allows sorting, searching, validation and comparison with other orgs.",
-  "version": "3.1.3",
-  "options_page": "options.html",
+  "version": "3.1.4",
+  "options_page": "pages/options.html",
   "action": {
-    "default_icon": "braincloudsmall.png",
-    "default_popup": "popup.html"
+    "default_icon": "assets/icons/braincloudsmall.png",
+    "default_popup": "pages/popup.html"
   },
   "icons": {
-	 "128": "brainbulb128.png",
-	 "48": "brainbulb48.png"
+	 "128": "assets/icons/brainbulb128.png",
+	 "48": "assets/icons/brainbulb48.png"
   },
   "content_scripts": [
     {
@@ -34,11 +34,11 @@
         "lib/jquery-ui.structure.min.css",
         "lib/jquery-ui.theme.min.css",
         "lib/dataTables.checkboxes.css",
-        "changeset.css",
-        "cart.css"
+        "css/changeset.css",
+        "css/cart.css"
       ],
       "js": [
-        "cshlogger.js",
+        "js/cshlogger.js",
         "lib/jquery.min.js",
         "lib/jquery.dataTables.js",
         "lib/jquery-ui.min.js",
@@ -52,10 +52,10 @@
         "lib/select2.min.js",
         "lib/mergely.js",
         "lib/jszip.js",
-        "common.js",
-        "cshdb.js",
-        "cart.js",
-        "changeset.js"
+        "js/common.js",
+        "js/cshdb.js",
+        "js/cart.js",
+        "js/changeset.js"
       ],
       "all_frames": true
     },
@@ -68,25 +68,29 @@
       ],
       "css": [
         "lib/jquery.dataTables.css",
-        "changeset.css"
+        "css/changeset.css"
       ],
       "js": [
-        "cshlogger.js",
+        "js/cshlogger.js",
         "lib/jquery.min.js",
         "lib/jquery.dataTables.js",
         "lib/moment.js",
-        "common.js",
-        "cshdb.js",
-        "changeview.js"
+        "js/common.js",
+        "js/cshdb.js",
+        "js/changeview.js"
       ],
       "all_frames": true
     },
     {
       "matches": [
         "https://*.salesforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.salesforce.com/lightning/setup/OutboundChangeSet/page*",
         "https://*.force.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.force.com/lightning/setup/OutboundChangeSet/page*",
         "https://*.cloudforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
-        "https://*.salesforce-setup.com/changemgmt/outboundChangeSetDetailPage.apexp*"
+        "https://*.cloudforce.com/lightning/setup/OutboundChangeSet/page*",
+        "https://*.salesforce-setup.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.salesforce-setup.com/lightning/setup/OutboundChangeSet/page*"
       ],
       "css": [
         "lib/jquery.dataTables.css",
@@ -94,11 +98,11 @@
         "lib/select2.min.css",
         "lib/codemirror.css",
         "lib/dataTables.checkboxes.css",
-        "changeset.css",
-        "cart.css"
+        "css/changeset.css",
+        "css/cart.css"
       ],
       "js": [
-        "cshlogger.js",
+        "js/cshlogger.js",
         "lib/jquery.min.js",
         "lib/jquery.dataTables.js",
         "lib/jquery-ui.min.js",
@@ -110,12 +114,12 @@
         "lib/select2.min.js",
         "lib/FileSaver.js",
         "lib/jszip.js",
-        "common.js",
-        "cshdb.js",
-        "cart.js",
-        "metadatahelper.js",
-        "deployhelper.js",
-        "detailcomponents.js"
+        "js/common.js",
+        "js/cshdb.js",
+        "js/cart.js",
+        "js/metadatahelper.js",
+        "js/deployhelper.js",
+        "js/detailcomponents.js"
       ],
       "all_frames": true
     },
@@ -131,22 +135,26 @@
         "https://*.salesforce-setup.com/changemgmt/listOutboundChangeSet.apexp*"
       ],
       "js": [
-        "cshlogger.js",
-        "common.js",
-        "cshdb.js",
-        "outboundlist.js"
+        "js/cshlogger.js",
+        "js/common.js",
+        "js/cshdb.js",
+        "js/outboundlist.js"
       ],
       "all_frames": false
     },
     {
       "matches": [
         "https://*.salesforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.salesforce.com/lightning/setup/OutboundChangeSet/page*",
         "https://*.force.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.force.com/lightning/setup/OutboundChangeSet/page*",
         "https://*.cloudforce.com/changemgmt/outboundChangeSetDetailPage.apexp*",
-        "https://*.salesforce-setup.com/changemgmt/outboundChangeSetDetailPage.apexp*"
+        "https://*.cloudforce.com/lightning/setup/OutboundChangeSet/page*",
+        "https://*.salesforce-setup.com/changemgmt/outboundChangeSetDetailPage.apexp*",
+        "https://*.salesforce-setup.com/lightning/setup/OutboundChangeSet/page*"
       ],
       "js": [
-        "detailpagebridge.js"
+        "js/detailpagebridge.js"
       ],
       "world": "MAIN",
       "all_frames": true
@@ -165,11 +173,11 @@
     "https://*.salesforce-setup.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "js/background.js"
   },
   "web_accessible_resources": [
     {
-      "resources": ["loading.gif"],
+      "resources": ["assets/images/loading.gif"],
       "matches": ["https://*.salesforce.com/*", "https://*.force.com/*"]
     }
   ]

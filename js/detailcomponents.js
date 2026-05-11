@@ -19,6 +19,10 @@
 (function () {
     'use strict';
 
+    if (isOutboundChangeSetWrapperUrl()) {
+        return;
+    }
+
     var COMPONENTS_TABLE_SEL = 'table.list';
     var REMOVE_LINK_SEL = 'a[id*="removeLink"]';
     var CONFIRM_REGEX = /confirmRemoveComponent\(\s*['"]([^'"]+)['"]\s*\)/;
@@ -32,6 +36,18 @@
     var pageObserverInstalled = false;
     var initialAuthoritativeSyncStarted = false;
     var cartSyncRequestWired = false;
+    var cartDetailInitStarted = false;
+
+    ensureDetailCartReady();
+    if (isWrappedDetailUrl()) {
+        setTimeout(function () {
+            if (initialAuthoritativeSyncStarted) return;
+            initialAuthoritativeSyncStarted = true;
+            backgroundSyncCart(null, { force: false }).catch(function (e) {
+                console.warn('[CSH] wrapped detail initial sync failed:', e && e.message);
+            });
+        }, 0);
+    }
 
     // Column indices resolved by scanning the header row once the table is
     // found. Keyed by header text lowercased; -1 if that header isn't present.
@@ -96,7 +112,7 @@
         hijackRemoveLinks(table);
         observeTableChanges(table);
         wireDelegatedEvents(table);
-        wireCartSyncRequest();
+        ensureDetailCartReady();
         if (FILTER_TOOLBAR_ENABLED) applyFilters(table); // populates the "N components" counter
         var forceInitialSync = !initialAuthoritativeSyncStarted;
         initialAuthoritativeSyncStarted = true;
@@ -105,13 +121,21 @@
         console.log('detailcomponents: initialized on', table);
     }
 
+    function ensureDetailCartReady() {
+        wireCartSyncRequest();
+        if (!cartDetailInitStarted && window.cshCart && window.cshCart.init) {
+            cartDetailInitStarted = true;
+            window.cshCart.init({ changeSetId: urlChangeSetId() })
+                .catch(function (e) { console.warn('cshCart detail init failed:', e && e.message); });
+        }
+    }
+
     function wireCartSyncRequest() {
         if (cartSyncRequestWired) return;
         cartSyncRequestWired = true;
         window.addEventListener('csh:cart-sync-request', async function (ev) {
             if (ev.detail) ev.detail.handled = true;
             var table = getCurrentTable();
-            if (!table) return;
             var ok = await backgroundSyncCart(table, { force: true });
             if (window.cshToast) {
                 window.cshToast.show(
@@ -200,7 +224,21 @@
 
     function urlChangeSetId() {
         var m = location.search.match(/[?&]id=([^&]+)/);
-        return m ? decodeURIComponent(m[1]) : null;
+        if (m) return decodeURIComponent(m[1]);
+        var address = new URLSearchParams(location.search).get('address');
+        if (!address) return null;
+        var decoded = decodeURIComponent(address);
+        var inner = decoded.match(/[?&]id=([^&]+)/);
+        return inner ? decodeURIComponent(inner[1]) : null;
+    }
+
+    function isWrappedDetailUrl() {
+        var address = new URLSearchParams(location.search).get('address');
+        return !!(address && /\/changemgmt\/outboundChangeSetDetailPage\.apexp/i.test(decodeURIComponent(address)));
+    }
+
+    function isOutboundChangeSetWrapperUrl() {
+        return /\/lightning\/setup\/OutboundChangeSet\/page/i.test(location.pathname || '');
     }
 
     // Walks the classic /<033id>?tab=PackageComponents view across every
@@ -210,7 +248,7 @@
     // whole change set in a single page; the next-page loop is here as
     // safety for very large sets.
     async function fetchAllChangeSetComponents(csId, resolvedPackageId) {
-        var urlId = new URLSearchParams(location.search).get('id');
+        var urlId = urlChangeSetId();
         if (!urlId) throw new Error('No change-set id in URL');
         var packageId = resolvedPackageId || await resolvePackageId(urlId);
         if (!packageId) {
@@ -256,12 +294,10 @@
                 // remove affordance — fall back to SF-id-shaped anchor hrefs,
                 // preferring the Name column cell so we don't pick up any
                 // Parent Object / Included By cross-reference.
-                var cid = null;
+                // Prefer componentId below; href is kept for removeHref only.
                 var href = findDelLinkInRow(row);
-                if (href) {
-                    cid = extractCidFromDelHref(href);
-                }
-                if (!cid) cid = findCidInRowAnchors(row, packageId, idx.name);
+                var componentId = findCidInRowAnchors(row, packageId, idx.name);
+                var cid = componentId || extractCidFromDelHref(href);
                 if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
@@ -308,9 +344,9 @@
         var csId = urlChangeSetId();
         if (!csId) return;
         var setSync = window.cshCart.setSyncState || function () {};
-        var visible = extractSyncItems(table);
+        var visible = table ? extractSyncItems(table) : [];
         var syncClaim = null;
-        setSync('syncing', '(' + visible.length + ')');
+        setSync('syncing');
         try {
             // Phase 1: fast sync of visible rows. Skipped when the
             // rendered table is empty (e.g. the user is on a filter view
@@ -328,6 +364,9 @@
             var packageId = await resolvePackageId(csId);
             var keys = [csId];
             if (packageId && packageId !== csId) keys.push(packageId);
+            if (window.cshCart.mergeRelatedCarts) {
+                await window.cshCart.mergeRelatedCarts(keys);
+            }
             if (window.cshDb && window.cshDb.markChangeSetsUsed) {
                 window.cshDb.markChangeSetsUsed(keys, { source: 'detail-page-change-set-use' }).catch(function (e) {
                     console.warn('cshDb change-set usage update failed:', e && e.message);
@@ -355,7 +394,11 @@
             // aligned so the Add page's cart card matches reality once the
             // user navigates over.
             for (var i = 0; i < syncClaim.keys.length; i++) {
-                var p2 = await window.cshCart.syncItemsFromServer(syncClaim.keys[i], all, { authoritative: true });
+                var p2 = await window.cshCart.syncItemsFromServer(
+                    syncClaim.keys[i],
+                    all,
+                    { authoritative: true, allowEmptyAuthoritative: true }
+                );
                 console.log('[CSH] background sync (authoritative) key=' + syncClaim.keys[i] +
                     ': inserted=' + p2.inserted + ' promoted=' + p2.promoted +
                     ' kept=' + p2.kept + ' pruned=' + (p2.pruned || 0) +
@@ -1196,7 +1239,7 @@
 
     async function buildDelHrefMap() {
         if (delHrefCache) return delHrefCache;
-        var urlId = new URLSearchParams(location.search).get('id');
+        var urlId = urlChangeSetId();
         if (!urlId) throw new Error('No change-set id in URL');
         var csId = await resolvePackageId(urlId);
         if (!csId) {

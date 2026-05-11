@@ -241,9 +241,9 @@ window.cshAuth = (function () {
             modal.querySelector('.csh-oauth-default').addEventListener('click', function () { close('default'); });
             modal.querySelector('.csh-oauth-options').addEventListener('click', function () {
                 try {
-                    window.open(chrome.runtime.getURL('options.html'), '_blank');
+                    window.open(chrome.runtime.getURL('pages/options.html'), '_blank');
                 } catch (_) {
-                    window.open('/options.html', '_blank');
+                    window.open('/pages/options.html', '_blank');
                 }
                 close('options');
             });

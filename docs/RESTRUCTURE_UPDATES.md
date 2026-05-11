@@ -1,5 +1,7 @@
 # Project Restructure Updates
 
+> Historical note: this document describes an older flat-root restructure. The current extension layout keeps `manifest.json` in the root and groups implementation files under `js/`, `css/`, `pages/`, and `assets/`.
+
 ## Summary
 
 The project documentation has been updated to reflect the **flat directory structure** where all source files are in the root directory (no `code/` subdirectory).

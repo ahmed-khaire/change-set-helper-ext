@@ -264,6 +264,26 @@ function cshRowIdFromElement(rowEl) {
     return null;
 }
 
+function cshIsRealComponentRow(rowEl) {
+    if (!rowEl) return false;
+    if (cshRowIdFromElement(rowEl)) return true;
+    var cells = rowEl.children || [];
+    if (cells.length === 1 && cells[0].hasAttribute('colspan')) return false;
+    return false;
+}
+
+function cshRealDataRows(rows) {
+    return $(rows).filter(function () {
+        return cshIsRealComponentRow(this);
+    });
+}
+
+function cshRemovePlaceholderDataRows(rows) {
+    $(rows).each(function () {
+        if (!cshIsRealComponentRow(this)) $(this).remove();
+    });
+}
+
 function cshUpsertComponentRowFromElement(rowEl) {
     if (!rowEl) return null;
     if (!cshBaseColumns.length) cshReadBaseColumnsFromTable();
@@ -346,6 +366,8 @@ function cshSetComponentRowChecked(id, checked) {
 // without the Type column (happens for heterogeneous folder-based types).
 function addColumnsToRows(rows) {
     if (!rows || rows.length === 0) return;
+    rows = cshRealDataRows(rows);
+    if (!rows.length) return;
 
     var extra = cshExtraColumnsPerRow();
     var widest = 0;
@@ -434,12 +456,16 @@ function setupTable() {
     // including types that add a parent-object column (CustomField, Workflow*,
     // RecordType, ListView, CompactLayout) and ones that drop the Type column.
     cshOriginalHeaderCount = $("table.list tr.headerRow").children('th,td').length;
+    var allDataRows = $("table.list tr.dataRow");
+    var existingRows = cshRealDataRows(allDataRows);
+    cshRemovePlaceholderDataRows(allDataRows);
+
     var widestDataRow = 0;
-    $("table.list tr.dataRow").each(function () {
+    existingRows.each(function () {
         var c = $(this).children('td').length;
         if (c > widestDataRow) widestDataRow = c;
     });
-    cshOriginalRowCellCount = widestDataRow;
+    cshOriginalRowCellCount = widestDataRow || cshOriginalHeaderCount;
     console.log('setupTable: original header cells =', cshOriginalHeaderCount,
                 ', widest data row =', widestDataRow);
     cshNormalizeNameHeader();
@@ -489,7 +515,6 @@ function setupTable() {
     console.log('After adding headers:', newHeaders.join(' | '));
 
     // Add columns only to existing rows (not ALL rows to avoid freeze)
-    var existingRows = $("table.list tr.dataRow");
     console.log('setupTable: Found', existingRows.length, 'data rows to update');
     console.log('setupTable: Captured', cshAddComponentRowsFromDom(existingRows), 'row model entries');
 
@@ -3275,7 +3300,7 @@ dynamicColumns = null; // Reset so next entity type can determine its own column
 
 var selectedEntityType = $('#entityType').val();
 var changeSetId = $("#id").val();
-var listTableLength = $("table.list tr.dataRow").length;
+var listTableLength = cshRealDataRows($("table.list tr.dataRow")).length;
 var nextPageHref = $('a:contains("Next Page")').first().attr('href');
 if (nextPageHref) {
     //nextPageHref = nextPageHref.replace("&lsr=1000", "");
@@ -3611,7 +3636,7 @@ function startPaginationWithMetadata() {
             });
 
             var parsedResponse = $(data);
-            var nextTable = parsedResponse.find("table.list tr.dataRow");
+            var nextTable = cshRealDataRows(parsedResponse.find("table.list tr.dataRow"));
             cshAddComponentRowsFromDom(nextTable);
 
             // Add columns to new rows
@@ -3771,6 +3796,7 @@ function startMetadataLoading() {
     nameColumn = $("table.list>tbody>tr.headerRow>th>a:contains('Name')");
 
 
+    cshRemovePlaceholderDataRows($("table.list tr.dataRow"));
     var changeSetHead2 = $('<thead></thead>').prependTo('table.list').append($('table.list tr:first'));
 
     // Build tfoot with one <td> per actual header <th>. Hard-coding 2 or 3

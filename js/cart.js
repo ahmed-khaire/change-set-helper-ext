@@ -35,8 +35,6 @@
     var JOBS_KEY = 'cshJobs';
     var SYNC_STATE_KEY = 'cshCartAuthoritativeSync';
 
-    // Salesforce caps POST form size; keep each batch conservative.
-    var BATCH_SIZE = 100;
     var MAX_ATTEMPTS = 3;
     var RETRY_BASE_MS = 2000;
     var AUTHORITATIVE_SYNC_FRESH_MS = 10 * 60 * 1000;
@@ -316,6 +314,72 @@
         return c;
     }
 
+    function itemIdentity(it) {
+        if (!it) return '';
+        if (it.salesforceId || it.id) return 'id:' + String(it.salesforceId || it.id).slice(0, 15);
+        if (it.type && it.fullName) return 'fullName:' + it.type + '::' + it.fullName;
+        if (it.type && it.name) return 'name:' + it.type + '::' + it.name;
+        return '';
+    }
+
+    function statusPriority(status) {
+        if (status === 'done') return 4;
+        if (status === 'submitting') return 3;
+        if (status === 'staged') return 2;
+        if (status === 'failed') return 1;
+        return 0;
+    }
+
+    function mergeCartRows(a, b) {
+        var winner = statusPriority(b.status) > statusPriority(a.status) ? b : a;
+        var other = winner === b ? a : b;
+        var merged = Object.assign({}, other, winner);
+        merged.uid = winner.uid || other.uid || uid();
+        merged.type = winner.type || other.type;
+        merged.salesforceId = winner.salesforceId || other.salesforceId;
+        if (merged.salesforceId) merged.salesforceId = String(merged.salesforceId).slice(0, 15);
+        merged.name = winner.name || other.name || merged.salesforceId;
+        merged.fullName = winner.fullName || other.fullName;
+        merged.removeHref = winner.removeHref || other.removeHref;
+        merged.error = winner.error || other.error || '';
+        if (merged.status === 'done' || merged.status === 'staged') merged.error = '';
+        return merged;
+    }
+
+    async function mergeRelatedCarts(changeSetIds) {
+        var keys = uniqueSyncKeys(Array.isArray(changeSetIds) ? changeSetIds : [changeSetIds]);
+        if (keys.length < 2) return { merged: false, keys: keys, count: 0 };
+        var s = pendingAll ? null : await storageGet([CART_KEY]);
+        var all = pendingAll || (s && s[CART_KEY]) || {};
+        var byIdentity = {};
+        var forms = {};
+        keys.forEach(function (k) {
+            var cart = all[k];
+            if (!cart) return;
+            if (cart.form) Object.assign(forms, cart.form);
+            (cart.items || []).forEach(function (it) {
+                var ident = itemIdentity(it);
+                if (!ident) return;
+                byIdentity[ident] = byIdentity[ident] ? mergeCartRows(byIdentity[ident], it) : Object.assign({}, it);
+            });
+        });
+        var items = Object.keys(byIdentity).map(function (k) { return byIdentity[k]; });
+        if (!items.length && !Object.keys(forms).length) return { merged: false, keys: keys, count: 0 };
+        var now = Date.now();
+        keys.forEach(function (k) {
+            var existing = all[k] || {};
+            all[k] = {
+                host: existing.host || serverUrl,
+                createdAt: existing.createdAt || now,
+                updatedAt: now,
+                items: items.map(function (it) { return Object.assign({}, it); }),
+                form: Object.assign({}, forms, existing.form || {})
+            };
+        });
+        await saveCart(all, { flush: true });
+        return { merged: true, keys: keys, count: items.length };
+    }
+
     // Carts saved before the counts cache was introduced won't have .counts
     // in storage — fall through to a one-shot recount so doRender can stay
     // O(1) from then on. Fresh carts post-introduction carry .counts in
@@ -327,16 +391,18 @@
 
     async function addItems(changeSetId, type, items /* [{id, name}] */) {
         var { all, cart } = await getCart(changeSetId);
-        // Dedup against existing staged/submitting items of the same type+id.
-        var key = function (type, id) { return type + '::' + id; };
+        // Salesforce component ids are globally unique. Use the id as cart
+        // identity so display/API type label differences do not create a
+        // duplicate staged row for the same component.
+        var key = function (id) { return id ? String(id).slice(0, 15) : ''; };
         var seen = {};
         cart.items.forEach(function (it) {
-            if (it.status !== 'done') seen[key(it.type, it.salesforceId)] = true;
+            if (it.status !== 'done') seen[key(it.salesforceId)] = true;
         });
         var added = 0;
         items.forEach(function (it) {
             if (!it.id) return;
-            if (seen[key(type, it.id)]) return;
+            if (seen[key(it.id)]) return;
             cart.items.push({
                 uid: uid(),
                 type: type,
@@ -346,6 +412,7 @@
                 source: 'ui',
                 addedAt: Date.now()
             });
+            seen[key(it.id)] = true;
             added++;
         });
         await saveCart(all);
@@ -366,15 +433,15 @@
     async function addItemsBatch(changeSetId, items /* [{type, id, name, status?, extra?}] */) {
         if (!items || !items.length) return 0;
         var { all, cart } = await getCart(changeSetId);
-        var key = function (t, id) { return t + '::' + id; };
+        var key = function (id) { return id ? String(id).slice(0, 15) : ''; };
         var seen = {};
         cart.items.forEach(function (it) {
-            if (it.status !== 'done') seen[key(it.type, it.salesforceId)] = true;
+            if (it.status !== 'done') seen[key(it.salesforceId)] = true;
         });
         var added = 0;
         items.forEach(function (it) {
             if (!it.id || !it.type) return;
-            if (seen[key(it.type, it.id)]) return;
+            if (seen[key(it.id)]) return;
             var row = {
                 uid: uid(),
                 type: it.type,
@@ -386,6 +453,7 @@
             };
             if (it.extra) Object.assign(row, it.extra);
             cart.items.push(row);
+            seen[key(it.id)] = true;
             added++;
         });
         await saveCart(all);
@@ -404,7 +472,7 @@
 
         var { all, cart } = await getCart(changeSetId);
         var rowKey = function (it) {
-            return it && it.type === type && String(it.salesforceId || '').slice(0, 15) === sfId;
+            return it && String(it.salesforceId || '').slice(0, 15) === sfId;
         };
         var existing = null;
         for (var i = 0; i < cart.items.length; i++) {
@@ -416,6 +484,7 @@
 
         if (checked) {
             if (existing) {
+                existing.type = type;
                 if (existing.status === 'failed') {
                     existing.status = 'staged';
                     existing.error = '';
@@ -464,7 +533,7 @@
     // Per-row dedup/promote semantics:
     //   - existing 'done' (any source) → keep as-is; server-sync is
     //     authoritative that the row is in the change set, which matches.
-    //   - existing 'staged' or 'failed' with same type+cid → promote to
+    //   - existing 'staged' or 'failed' with same cid -> promote to
     //     'done' + source='server-sync'. The component landed (via another
     //     tab, a manual add, or a previously-failed-then-retried worker
     //     run) and we shouldn't double-post it.
@@ -475,7 +544,7 @@
     //
     // options.authoritative — when true, the caller guarantees `items` is
     // the complete server-side membership of the change set. Any existing
-    // 'done' row whose (type, salesforceId) is NOT in the input list is
+    // 'done' row whose salesforceId is NOT in the input list is
     // pruned (it was removed from the change set elsewhere). 'staged',
     // 'submitting', and 'failed' rows are never pruned — those represent
     // user-side state, not claims about server state.
@@ -492,12 +561,6 @@
         // cart based on a bad scrape destroys user state, so we refuse and
         // let the caller retry. Callers that really want to wipe should
         // use clearDone instead.
-        if (!items.length) {
-            if (options.authoritative) {
-                console.warn('cshCart.syncItemsFromServer: refusing to authoritative-prune with empty input');
-            }
-            return { inserted: 0, promoted: 0, kept: 0, pruned: 0 };
-        }
         var { all, cart } = await getCart(changeSetId);
         // Salesforce exposes the same component as either a 15-char
         // case-sensitive id or an 18-char case-insensitive id depending on
@@ -510,7 +573,7 @@
         // between the Add and Detail pages produced visible duplicates —
         // each page's sync inserted its own form of the id as a "new" row.
         function sfId15(id) { return id ? String(id).slice(0, 15) : ''; }
-        var key = function (t, id) { return t + '::' + sfId15(id); };
+        var key = function (id) { return sfId15(id); };
         // Pre-pass: collapse any pre-existing 15/18-char duplicate rows in
         // the stored cart. Prior sync rounds (before this canonicalization)
         // may have left the cart with two entries for the same component.
@@ -523,7 +586,7 @@
         cart.items = cart.items.filter(function (it) {
             if (it.salesforceId) it.salesforceId = sfId15(it.salesforceId);
             if (!it.type || !it.salesforceId) return true;
-            var k = key(it.type, it.salesforceId);
+            var k = key(it.salesforceId);
             var prev = seenKeys[k];
             if (!prev) { seenKeys[k] = it; return true; }
             dupesMerged++;
@@ -542,15 +605,31 @@
         if (dupesMerged > 0) {
             console.log('cshCart.syncItemsFromServer: merged', dupesMerged, 'pre-existing duplicate row(s)');
         }
+        if (!items.length) {
+            if (options.authoritative && options.allowEmptyAuthoritative) {
+                var beforeEmptyPrune = cart.items.length;
+                cart.items = cart.items.filter(function (it) {
+                    return it.status !== 'done';
+                });
+                var emptyPruned = beforeEmptyPrune - cart.items.length;
+                await saveCart(all);
+                return { inserted: 0, promoted: 0, kept: 0, pruned: emptyPruned };
+            }
+            if (options.authoritative) {
+                console.warn('cshCart.syncItemsFromServer: refusing to authoritative-prune with empty input');
+            }
+            return { inserted: 0, promoted: 0, kept: 0, pruned: 0 };
+        }
         var byKey = seenKeys;
         var inputKeys = {};
         var inserted = 0, promoted = 0, kept = 0, pruned = 0;
         items.forEach(function (it) {
             if (!it.id || !it.type) return;
             var canonicalId = sfId15(it.id);
-            inputKeys[key(it.type, canonicalId)] = true;
-            var existing = byKey[key(it.type, canonicalId)];
+            inputKeys[key(canonicalId)] = true;
+            var existing = byKey[key(canonicalId)];
             if (existing) {
+                existing.type = it.type;
                 if (existing.status === 'done') {
                     if (it.name && (!existing.name || existing.name === existing.salesforceId)) {
                         existing.name = it.name;
@@ -589,7 +668,7 @@
             };
             if (it.extra) Object.assign(row, it.extra);
             cart.items.push(row);
-            byKey[key(row.type, row.salesforceId)] = row;
+            byKey[key(row.salesforceId)] = row;
             inserted++;
         });
         if (options.authoritative) {
@@ -597,7 +676,7 @@
             cart.items = cart.items.filter(function (it) {
                 if (it.status !== 'done') return true;
                 if (!it.type || !it.salesforceId) return true;
-                return inputKeys[key(it.type, it.salesforceId)] === true;
+                return inputKeys[key(it.salesforceId)] === true;
             });
             pruned = beforeLen - cart.items.length;
         }
@@ -727,7 +806,6 @@
                 if (row.status !== 'done' || !row.salesforceId) return true;
                 var match = byId[sfId15(row.salesforceId)];
                 if (!match) return true;
-                if (match.type && row.type && match.type !== row.type) return true;
                 removed++;
                 return false;
             });
@@ -1129,6 +1207,49 @@
         await storageSet({ [LOCK_KEY]: null });
     }
 
+    function submitCartBatch(formShape, ids) {
+        return new Promise(function (resolve, reject) {
+            if (!cshExtAlive()) {
+                markExtDead();
+                reject(new Error('Extension was reloaded — refresh this page to continue.'));
+                return;
+            }
+
+            var port;
+            var settled = false;
+            function finish(err, response) {
+                if (settled) return;
+                settled = true;
+                try { if (port) port.disconnect(); } catch (_) {}
+                if (err) reject(err);
+                else resolve(response);
+            }
+
+            try {
+                port = chrome.runtime.connect({ name: 'cartSubmitHandler' });
+                port.onMessage.addListener(function (message) {
+                    if (!message || message.type !== 'cshCartSubmitResult') return;
+                    finish(null, message.response || { ok: false, error: 'Empty cart submit response' });
+                });
+                port.onDisconnect.addListener(function () {
+                    if (settled) return;
+                    var err = chrome.runtime.lastError && chrome.runtime.lastError.message;
+                    finish(new Error(err || 'Cart submit channel closed before a response was received.'));
+                });
+                port.postMessage({
+                    type: 'cshCartSubmit',
+                    formShape: formShape,
+                    ids: ids
+                });
+            } catch (e) {
+                if (/Extension context invalidated/i.test(e && e.message || '')) {
+                    markExtDead();
+                }
+                finish(e);
+            }
+        });
+    }
+
     var workerRunning = false;
     async function runWorker(changeSetId) {
         if (workerRunning) return;
@@ -1157,13 +1278,14 @@
                 });
                 if (staged.length === 0) break;
 
-                // Group by type, pick the first type, take up to BATCH_SIZE ids.
+                // Group by type and submit one component type per request.
+                // runWorker awaits each request before moving to the next type.
                 var byType = {};
                 staged.forEach(function (it) {
                     (byType[it.type] = byType[it.type] || []).push(it);
                 });
                 var type = Object.keys(byType)[0];
-                var batchItems = byType[type].slice(0, BATCH_SIZE);
+                var batchItems = byType[type];
                 var batchId = uid();
 
                 await updateItemStatuses(
@@ -1201,11 +1323,10 @@
                         break;
                     }
                     try {
-                        var resp = await chrome.runtime.sendMessage({
-                            type: 'cshCartSubmit',
-                            formShape: formShape,
-                            ids: batchItems.map(function (it) { return it.salesforceId; })
-                        });
+                        var resp = await submitCartBatch(
+                            formShape,
+                            batchItems.map(function (it) { return it.salesforceId; })
+                        );
                         if (resp && resp.ok) {
                             success = true;
                         } else {
@@ -1224,33 +1345,66 @@
                 }
 
                 if (success) {
-                    await updateItemStatuses(
-                        changeSetId,
-                        function (it) { return it.batchId === batchId; },
-                        { status: 'done' },
-                        { flush: true }
-                    );
-                    if (window.cshDb) {
-                        try {
-                            await window.cshDb.markMembers(changeSetId, batchItems, 'present', { source: 'cart-submit' });
-                        } catch (e) {
-                            console.warn('cshDb submit cache failed:', e && e.message);
+                    var verified = null;
+                    try {
+                        verified = await reconcileSubmittedBatch(
+                            changeSetId,
+                            await _resolvePackageIdForServerRemove(changeSetId),
+                            batchItems,
+                            'Component was not added. It may have been deleted or is no longer selectable in Salesforce.'
+                        );
+                    } catch (e) {
+                        console.warn('[CSH] post-submit verification failed; marking requested batch done:', e && e.message);
+                        await updateItemStatuses(
+                            changeSetId,
+                            function (it) { return it.batchId === batchId; },
+                            { status: 'done' },
+                            { flush: true }
+                        );
+                        if (window.cshDb) {
+                            try {
+                                await window.cshDb.markMembers(changeSetId, batchItems, 'present', { source: 'cart-submit' });
+                            } catch (dbErr) {
+                                console.warn('cshDb submit cache failed:', dbErr && dbErr.message);
+                            }
                         }
                     }
-                    window.cshToast && window.cshToast.show(
-                        'Cart: added ' + batchItems.length + ' ' + type + ' item(s) to change set.',
-                        { type: 'success', duration: 4000 }
-                    );
+                    if (verified && verified.missing) {
+                        window.cshToast && window.cshToast.show(
+                            'Cart: added ' + verified.present + ' ' + type + ' item(s); ' +
+                            verified.missing + ' stale item(s) were not found in the change set.',
+                            { type: verified.present ? 'warning' : 'error', duration: 7000 }
+                        );
+                    } else {
+                        window.cshToast && window.cshToast.show(
+                            'Cart: added ' + batchItems.length + ' ' + type + ' item(s) to change set.',
+                            { type: 'success', duration: 4000 }
+                        );
+                    }
                 } else {
-                    await updateItemStatuses(
-                        changeSetId,
-                        function (it) { return it.batchId === batchId; },
-                        { status: 'failed', error: lastError },
-                        { flush: true }
-                    );
+                    var reconciledFailure = null;
+                    try {
+                        reconciledFailure = await reconcileSubmittedBatch(
+                            changeSetId,
+                            await _resolvePackageIdForServerRemove(changeSetId),
+                            batchItems,
+                            lastError
+                        );
+                    } catch (e) {
+                        console.warn('[CSH] post-failure verification failed:', e && e.message);
+                        await updateItemStatuses(
+                            changeSetId,
+                            function (it) { return it.batchId === batchId; },
+                            { status: 'failed', error: lastError },
+                            { flush: true }
+                        );
+                    }
                     window.cshToast && window.cshToast.show(
-                        'Cart: batch for ' + type + ' failed after ' + MAX_ATTEMPTS + ' attempts. ' + lastError,
-                        { type: 'error' }
+                        reconciledFailure && reconciledFailure.present
+                            ? ('Cart: added ' + reconciledFailure.present + ' ' + type +
+                               ' item(s); ' + reconciledFailure.missing + ' item(s) failed. ' + lastError)
+                            : ('Cart: batch for ' + type + ' failed after ' + attempt + ' attempt(s). ' + lastError),
+                        { type: reconciledFailure && reconciledFailure.present ? 'warning' : 'error' }
                     );
                 }
                 renderPanel();
@@ -1664,7 +1818,7 @@
         return null;
     }
     // Salesforce's 2024 domain split serves Setup pages (including
-    // AddToPackageFromChangeMgmtUi) from *.my.salesforce-setup.com and the
+    // AddToPackageFromChangeMgmtUi) from *.salesforce-setup.com and the
     // rest of the app — including outbound change-set detail pages and their
     // ?tab=PackageComponents view — from *.my.salesforce.com. Cookies don't
     // cross those eTLDs, so a `credentials:'include'` fetch built against
@@ -1674,8 +1828,8 @@
     // the URL (path, query) intact and ships the right cookies.
     function _appOriginForChangeSetView() {
         var host = location.host || '';
-        if (/\.my\.salesforce-setup\.com$/i.test(host)) {
-            return location.protocol + '//' + host.replace(/\.my\.salesforce-setup\.com$/i, '.my.salesforce.com');
+        if (/\.salesforce-setup\.com$/i.test(host)) {
+            return location.protocol + '//' + host.replace(/\.salesforce-setup\.com$/i, '.salesforce.com');
         }
         return location.origin;
     }
@@ -1716,10 +1870,127 @@
             });
         });
     }
+
+    async function fetchChangeSetViewItems(packageId) {
+        var items = [];
+        var appOrigin = _appOriginForChangeSetView();
+        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
+        var safety = 200;
+        var pageNum = 0;
+        while (nextUrl && safety-- > 0) {
+            pageNum++;
+            var r = await _fetchClassicPage(nextUrl);
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
+            var doc = new DOMParser().parseFromString(r.text, 'text/html');
+            var table = doc.querySelector('table.list');
+            if (!table) {
+                if (pageNum === 1) throw new Error('No table.list on classic components view (' + r.url + ')');
+                break;
+            }
+            var header = table.querySelector('tr.headerRow');
+            var idx = { name: -1, type: -1, fullName: -1 };
+            if (header) {
+                Array.prototype.forEach.call(header.children, function (cell, i) {
+                    var text = (cell.textContent || '').trim().toLowerCase();
+                    if ((text === 'name' || text === 'component name') && idx.name === -1) idx.name = i;
+                    else if (text === 'type' && idx.type === -1) idx.type = i;
+                    else if ((text === 'api name' || text === 'full name') && idx.fullName === -1) idx.fullName = i;
+                });
+            }
+            var rows = table.querySelectorAll('tr.dataRow');
+            rows.forEach(function (row) {
+                // Prefer componentId below; href is kept for removeHref only.
+                var href = _findDelHrefInRow(row);
+                var componentId = _findCidInRowAnchors(row, packageId, idx.name);
+                var cid = componentId || _extractCidFromDelHref(href);
+                if (!cid) return;
+                var cells = row.children;
+                var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
+                if (!type) return;
+                var name = idx.name >= 0 && cells[idx.name] ? (cells[idx.name].textContent || '').trim() : '';
+                var fullName = idx.fullName >= 0 && cells[idx.fullName] ? (cells[idx.fullName].textContent || '').trim() : '';
+                var it = { id: cid, type: type, name: name || cid };
+                if (fullName || href) {
+                    it.extra = {};
+                    if (fullName) it.extra.fullName = fullName;
+                    if (href) it.extra.removeHref = new URL(href, nextUrl).href;
+                }
+                items.push(it);
+            });
+            var nextHref = _findNextPageHrefInDoc(doc);
+            nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
+        }
+        return items;
+    }
+
+    async function reconcileSubmittedBatch(changeSetId, packageId, batchItems, fallbackError) {
+        var liveItems = await fetchChangeSetViewItems(packageId);
+        // Verify by Salesforce component id first. If Salesforce only exposes
+        // a package-member/remove id on the Package Components row, fall back
+        // to component name/fullName so a successful add is not marked failed.
+        var present = {};
+        var presentNames = {};
+        function nameKey(value) {
+            return value ? String(value).trim().toLowerCase() : '';
+        }
+        liveItems.forEach(function (it) {
+            var id = _id15(it.id);
+            if (id) present[id] = true;
+            var n = nameKey(it.fullName || (it.extra && it.extra.fullName) || it.name);
+            if (n) presentNames[n] = true;
+        });
+        var presentUids = {};
+        var missingUids = {};
+        batchItems.forEach(function (it) {
+            var idPresent = present[_id15(it.salesforceId)];
+            var submittedName = nameKey(it.fullName || it.name);
+            if (idPresent || (submittedName && presentNames[submittedName])) {
+                presentUids[it.uid] = true;
+            } else {
+                missingUids[it.uid] = true;
+            }
+        });
+        var presentCount = Object.keys(presentUids).length;
+        var missingCount = Object.keys(missingUids).length;
+        if (presentCount) {
+            await updateItemStatuses(
+                changeSetId,
+                function (it) { return presentUids[it.uid]; },
+                { status: 'done', error: '' },
+                { flush: true }
+            );
+            if (window.cshDb) {
+                try {
+                    await window.cshDb.markMembers(
+                        changeSetId,
+                        batchItems.filter(function (it) { return presentUids[it.uid]; }),
+                        'present',
+                        { source: 'cart-submit-verified' }
+                    );
+                } catch (e) {
+                    console.warn('cshDb verified submit cache failed:', e && e.message);
+                }
+            }
+        }
+        if (missingCount) {
+            await updateItemStatuses(
+                changeSetId,
+                function (it) { return missingUids[it.uid]; },
+                {
+                    status: 'failed',
+                    error: fallbackError || 'Component was not added. It may have been deleted or is no longer selectable in Salesforce.'
+                },
+                { flush: true }
+            );
+        }
+        return { present: presentCount, missing: missingCount, total: batchItems.length };
+    }
+
     async function syncFromChangeSetView(changeSetId, packageId, opts) {
         opts = opts || {};
         if (!packageId) throw new Error('syncFromChangeSetView: packageId required');
         var keys = uniqueSyncKeys([changeSetId, packageId]);
+        await mergeRelatedCarts(keys);
         if (window.cshDb && !opts.force) {
             try {
                 if (window.cshDb.markChangeSetsUsed) {
@@ -1731,16 +2002,9 @@
                     var cachedMembers = await window.cshDb.getChangeSetMembers(keys[ck], { status: 'present' });
                     if (cachedMembers && cachedMembers.length) {
                         var hydrated = await hydrateFromIndexedDb(keys);
-                        console.log('[CSH] Add-page authoritative sync skipped: IndexedDB has',
-                            cachedMembers.length, 'cached member(s)');
-                        return {
-                            count: hydrated.count || cachedMembers.length,
-                            inserted: hydrated.inserted || 0,
-                            promoted: hydrated.promoted || 0,
-                            kept: hydrated.kept || 0,
-                            pruned: hydrated.pruned || 0,
-                            skipped: 'cached-members'
-                        };
+                        console.log('[CSH] Add-page cart hydrated from IndexedDB before authoritative sync:',
+                            cachedMembers.length, 'cached member(s)', hydrated);
+                        break;
                     }
                 }
             } catch (e) {
@@ -1797,12 +2061,10 @@
                 // back to the first SF-id-shaped anchor href, preferring the
                 // Name column so we pick the component link over any
                 // Parent Object / Included By / Owned By cross-reference.
-                var cid = null;
+                // Prefer componentId below; href is kept for removeHref only.
                 var href = _findDelHrefInRow(row);
-                if (href) {
-                    cid = _extractCidFromDelHref(href);
-                }
-                if (!cid) cid = _findCidInRowAnchors(row, packageId, idx.name);
+                var componentId = _findCidInRowAnchors(row, packageId, idx.name);
+                var cid = componentId || _extractCidFromDelHref(href);
                 if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
@@ -2379,7 +2641,6 @@
             if (syncState === 'syncing') {
                 titleEl.innerHTML = escapeHtml(base) +
                     ' <span class="csh-cart-sync-badge">· Syncing' +
-                    (syncStateDetail ? ' ' + escapeHtml(syncStateDetail) : '') +
                     '<span class="csh-cart-sync-dot"></span></span>';
             } else if (syncState === 'error') {
                 titleEl.innerHTML = escapeHtml(base) +
@@ -2984,6 +3245,7 @@
         restoreFromCart: restoreFromCart,
         getCart: getCart,
         flushNow: flushNow,
+        mergeRelatedCarts: mergeRelatedCarts,
         hydrateFromIndexedDb: hydrateFromIndexedDb,
         beginAuthoritativeSync: beginAuthoritativeSync,
         finishAuthoritativeSync: finishAuthoritativeSync,

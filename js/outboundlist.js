@@ -247,8 +247,8 @@
 
     function appOriginForChangeSetView() {
         var host = location.host || '';
-        if (/\.my\.salesforce-setup\.com$/i.test(host)) {
-            return location.protocol + '//' + host.replace(/\.my\.salesforce-setup\.com$/i, '.my.salesforce.com');
+        if (/\.salesforce-setup\.com$/i.test(host)) {
+            return location.protocol + '//' + host.replace(/\.salesforce-setup\.com$/i, '.salesforce.com');
         }
         return location.origin;
     }

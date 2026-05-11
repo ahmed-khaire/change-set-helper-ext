@@ -1,5 +1,5 @@
 // Manifest V3 service worker
-// JSforce operations are handled in offscreen.html/offscreen.js due to XMLHttpRequest requirement
+// JSforce operations are handled in pages/offscreen.html and js/offscreen.js due to XMLHttpRequest requirement
 importScripts('cshlogger.js');
 
 var CSH_APIVERSION = "66.0";
@@ -624,8 +624,10 @@ async function cshGetFreshDeployToken(orgId) {
 
 // Keep service worker alive during long-running operations
 let keepAliveInterval = null;
+let keepAliveRefCount = 0;
 
 function startKeepAlive() {
+    keepAliveRefCount++;
     if (!keepAliveInterval) {
         keepAliveInterval = setInterval(() => {
             chrome.runtime.getPlatformInfo(() => {
@@ -636,10 +638,65 @@ function startKeepAlive() {
 }
 
 function stopKeepAlive() {
+    keepAliveRefCount = Math.max(0, keepAliveRefCount - 1);
+    if (keepAliveRefCount > 0) return;
     if (keepAliveInterval) {
         clearInterval(keepAliveInterval);
         keepAliveInterval = null;
     }
+}
+
+async function cshSubmitCartBatch(request, sender) {
+    var shape = request.formShape;
+    var ids = request.ids || [];
+    if (!shape || !shape.action) {
+        return { ok: false, error: 'No form shape available' };
+    }
+    var submitValidationError = cshValidateCartSubmitAction(shape.action, sender);
+    if (submitValidationError) {
+        return { ok: false, error: 'cshCartSubmit: ' + submitValidationError };
+    }
+    var body = new URLSearchParams();
+    Object.keys(shape.hidden || {}).forEach(function (k) {
+        body.append(k, shape.hidden[k]);
+    });
+    // The Salesforce form names its row checkboxes `ids`; appending one entry
+    // per selected id produces the same POST shape as a real user tick.
+    ids.forEach(function (id) { body.append('ids', id); });
+    // Include the submit button's own name/value so the server-side handler
+    // treats it as a Save (not a filter / search submission).
+    if (shape.submitName) body.append(shape.submitName, shape.submitValue || 'Save');
+
+    var startedAt = Date.now();
+    var resp = await fetch(shape.action, {
+        method: shape.method || 'POST',
+        credentials: 'include',
+        body: body.toString(),
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            // Hint the server this is an async submission; Salesforce tolerates
+            // it and it avoids full HTML shells in some cases.
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+    });
+    console.log('[CSH cart submit]', {
+        actionPath: new URL(shape.action).pathname,
+        idsCount: ids.length,
+        status: resp.status,
+        elapsedMs: Date.now() - startedAt,
+        finalUrl: resp.url
+    });
+    // Successful add-to-change-set usually returns a 302 redirect to the
+    // Outbound Change Set detail page. fetch follows redirects by default; a
+    // 200 on the detail URL is our success signal.
+    if (resp.ok || (resp.status >= 300 && resp.status < 400)) {
+        return { ok: true, finalUrl: resp.url };
+    }
+    var text = await resp.text().catch(function () { return ''; });
+    return {
+        ok: false,
+        error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
+    };
 }
 
 // Offscreen document management
@@ -699,7 +756,7 @@ function resetOffscreenInactivityTimer() {
     }, OFFSCREEN_INACTIVITY_TIMEOUT);
 }
 
-//offscreen.html
+// pages/offscreen.html
 async function setupOffscreenDocument(path) {
     try {
         // Check if offscreen API is available
@@ -781,7 +838,7 @@ async function sendToOffscreen(message) {
     // own message listener torn down mid-response.
     offscreenPendingCount++;
     try {
-        await setupOffscreenDocument('offscreen.html');
+        await setupOffscreenDocument('pages/offscreen.html');
         resetOffscreenInactivityTimer();
 
         if (!offscreenReady) {
@@ -835,6 +892,26 @@ chrome.runtime.onConnect.addListener(function (port) {
         port.onMessage.addListener(async function (request) {
             if (request.proxyFunction == "quickDeploy") {
                 await quickDeploy(port, request.currentId);
+            }
+        });
+        port.onDisconnect.addListener(() => {
+            stopKeepAlive();
+        });
+    }
+
+    if (port.name == "cartSubmitHandler") {
+        startKeepAlive();
+        port.onMessage.addListener(async function (request) {
+            if (request.type !== "cshCartSubmit") return;
+            try {
+                var response = await cshSubmitCartBatch(request, port.sender);
+                port.postMessage({ type: 'cshCartSubmitResult', response: response });
+            } catch (err) {
+                console.error('cshCartSubmit failed:', err);
+                port.postMessage({
+                    type: 'cshCartSubmitResult',
+                    response: { ok: false, error: err.message || String(err) }
+                });
             }
         });
         port.onDisconnect.addListener(() => {
@@ -1128,56 +1205,14 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         // the user's checkbox selections. fetch() from the service worker
         // includes cookies for any origin we have host_permissions for.
         (async function () {
+            startKeepAlive();
             try {
-                var shape = request.formShape;
-                var ids = request.ids || [];
-                if (!shape || !shape.action) {
-                    sendResponse({ ok: false, error: 'No form shape available' });
-                    return;
-                }
-                var submitValidationError = cshValidateCartSubmitAction(shape.action, sender);
-                if (submitValidationError) {
-                    sendResponse({ ok: false, error: 'cshCartSubmit: ' + submitValidationError });
-                    return;
-                }
-                var body = new URLSearchParams();
-                Object.keys(shape.hidden || {}).forEach(function (k) {
-                    body.append(k, shape.hidden[k]);
-                });
-                // The Salesforce form names its row checkboxes `ids`; appending
-                // one entry per selected id produces the same POST shape as a
-                // real user tick.
-                ids.forEach(function (id) { body.append('ids', id); });
-                // Include the submit button's own name/value so the server-side
-                // handler treats it as a Save (not a filter / search submission).
-                if (shape.submitName) body.append(shape.submitName, shape.submitValue || 'Save');
-
-                var resp = await fetch(shape.action, {
-                    method: shape.method || 'POST',
-                    credentials: 'include',
-                    body: body.toString(),
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        // Hint the server this is an async submission; Salesforce
-                        // tolerates it and it avoids full HTML shells in some cases.
-                        'X-Requested-With': 'XMLHttpRequest'
-                    }
-                });
-                // Successful add-to-change-set usually returns a 302 redirect
-                // to the Outbound Change Set detail page. fetch follows redirects
-                // by default; a 200 on the detail URL is our success signal.
-                if (resp.ok || (resp.status >= 300 && resp.status < 400)) {
-                    sendResponse({ ok: true, finalUrl: resp.url });
-                    return;
-                }
-                var text = await resp.text().catch(function () { return ''; });
-                sendResponse({
-                    ok: false,
-                    error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
-                });
+                sendResponse(await cshSubmitCartBatch(request, sender));
             } catch (err) {
                 console.error('cshCartSubmit failed:', err);
                 sendResponse({ ok: false, error: err.message || String(err) });
+            } finally {
+                stopKeepAlive();
             }
         })();
         return true;
@@ -1677,7 +1712,7 @@ function compareContents(type, item, localOrg, targetOrg) {
         item: item,
         createdAt: Date.now()
     };
-    var url = "compare.html?item=" + encodeURIComponent(item) +
+    var url = "pages/compare.html?item=" + encodeURIComponent(item) +
         "&requestId=" + encodeURIComponent(requestId);
     if (localOrg) url += "&localOrg=" + encodeURIComponent(localOrg);
     if (targetOrg) url += "&targetOrg=" + encodeURIComponent(targetOrg);
@@ -1741,4 +1776,4 @@ async function getContents(type, item, connType, side, requestId) {
 }
 
 console.log('Service worker ready');
-setupOffscreenDocument('offscreen.html');
+setupOffscreenDocument('pages/offscreen.html');

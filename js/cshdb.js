@@ -21,12 +21,12 @@
         try {
             var url = /^https?:\/\//i.test(raw) ? new URL(raw) : new URL(location.protocol + '//' + raw);
             var host = url.host.toLowerCase();
-            host = host.replace(/\.my\.salesforce-setup\.com$/i, '.my.salesforce.com');
+            host = host.replace(/\.salesforce-setup\.com$/i, '.salesforce.com');
             host = host.replace(/\.lightning\.force\.com$/i, '.my.salesforce.com');
             return url.protocol + '//' + host;
         } catch (_) {
             return String(raw)
-                .replace(/\.my\.salesforce-setup\.com/i, '.my.salesforce.com')
+                .replace(/\.salesforce-setup\.com/i, '.salesforce.com')
                 .replace(/\.lightning\.force\.com/i, '.my.salesforce.com');
         }
     }
