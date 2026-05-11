@@ -930,17 +930,36 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 
     if (request.type === 'cshComparePopupReady') {
-        startCompareRetrieves(request.requestId).catch(function (err) {
+        startCompareRetrieves(request.requestId, ['lhs', 'rhs'], request.runId).catch(function (err) {
             console.error('Compare retrieve startup failed:', err);
             chrome.runtime.sendMessage({
                 'requestId': request.requestId,
+                'runId': request.runId,
                 'setSide': 'lhs',
                 'err': err && err.message ? err.message : String(err)
             });
             chrome.runtime.sendMessage({
                 'requestId': request.requestId,
+                'runId': request.runId,
                 'setSide': 'rhs',
                 'err': err && err.message ? err.message : String(err)
+            });
+        });
+        sendResponse({ ok: true });
+        return false;
+    }
+
+    if (request.type === 'cshCompareRefresh') {
+        var refreshSides = Array.isArray(request.sides) && request.sides.length ? request.sides : ['lhs', 'rhs'];
+        startCompareRetrieves(request.requestId, refreshSides, request.runId).catch(function (err) {
+            console.error('Compare refresh failed:', err);
+            refreshSides.forEach(function (side) {
+                chrome.runtime.sendMessage({
+                    'requestId': request.requestId,
+                    'runId': request.runId,
+                    'setSide': side,
+                    'err': err && err.message ? err.message : String(err)
+                });
             });
         });
         sendResponse({ ok: true });
@@ -1718,33 +1737,35 @@ function compareContents(type, item, localOrg, targetOrg) {
     if (targetOrg) url += "&targetOrg=" + encodeURIComponent(targetOrg);
     chrome.windows.create({ 'url': url, 'type': "popup", "focused": false });
     setTimeout(function () {
-        if (cshPendingCompareRequests[requestId]) delete cshPendingCompareRequests[requestId];
-    }, 10 * 60 * 1000);
+        var req = cshPendingCompareRequests[requestId];
+        if (req && Date.now() - (req.lastUsedAt || req.createdAt || 0) > 60 * 60 * 1000) {
+            delete cshPendingCompareRequests[requestId];
+        }
+    }, 60 * 60 * 1000);
 }
 
-async function startCompareRetrieves(requestId) {
+async function startCompareRetrieves(requestId, sides, runId) {
     var req = cshPendingCompareRequests[requestId];
     if (!req) {
-        chrome.runtime.sendMessage({
-            'requestId': requestId,
-            'setSide': 'lhs',
-            'err': 'Compare request expired or was not found. Re-open the compare popup.'
-        });
-        chrome.runtime.sendMessage({
-            'requestId': requestId,
-            'setSide': 'rhs',
-            'err': 'Compare request expired or was not found. Re-open the compare popup.'
+        (Array.isArray(sides) && sides.length ? sides : ['lhs', 'rhs']).forEach(function (side) {
+            chrome.runtime.sendMessage({
+                'requestId': requestId,
+                'runId': runId,
+                'setSide': side,
+                'err': 'Compare request expired or was not found. Re-open the compare popup.'
+            });
         });
         return;
     }
-    delete cshPendingCompareRequests[requestId];
-    await Promise.all([
-        getContents(req.type, req.item, 'local', "lhs", requestId),
-        getContents(req.type, req.item, 'deploy', "rhs", requestId)
-    ]);
+    req.lastUsedAt = Date.now();
+    sides = Array.isArray(sides) && sides.length ? sides : ['lhs', 'rhs'];
+    var jobs = [];
+    if (sides.indexOf('lhs') !== -1) jobs.push(getContents(req.type, req.item, 'local', "lhs", requestId, runId));
+    if (sides.indexOf('rhs') !== -1) jobs.push(getContents(req.type, req.item, 'deploy', "rhs", requestId, runId));
+    await Promise.all(jobs);
 }
 
-async function getContents(type, item, connType, side, requestId) {
+async function getContents(type, item, connType, side, requestId, runId) {
     try {
         const response = await sendToOffscreen({
             action: 'retrieveMetadata',
@@ -1759,10 +1780,11 @@ async function getContents(type, item, connType, side, requestId) {
         });
 
         if (response.error) {
-            chrome.runtime.sendMessage({ 'requestId': requestId, 'setSide': side, 'err': response.error });
+            chrome.runtime.sendMessage({ 'requestId': requestId, 'runId': runId, 'setSide': side, 'err': response.error });
         } else {
             chrome.runtime.sendMessage({
                 'requestId': requestId,
+                'runId': runId,
                 'setSide': side,
                 'type': type,
                 'content': {zipFile: response.zipData},
@@ -1771,7 +1793,7 @@ async function getContents(type, item, connType, side, requestId) {
         }
     } catch (err) {
         console.error(err);
-        chrome.runtime.sendMessage({ 'requestId': requestId, 'setSide': side, 'err': err.toString() });
+        chrome.runtime.sendMessage({ 'requestId': requestId, 'runId': runId, 'setSide': side, 'err': err.toString() });
     }
 }
 

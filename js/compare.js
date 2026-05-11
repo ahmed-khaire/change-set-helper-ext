@@ -9,6 +9,7 @@ $(document).ready(function () {
 	var requestId = params.get('requestId') || '';
 	var localOrg = params.get('localOrg') || 'This org';
 	var targetOrg = params.get('targetOrg') || 'Other org';
+	var currentRunId = 'cmp-run-' + Date.now() + '-' + Math.random().toString(36).slice(2);
 	window.document.title = "COMPARING " + compareItem + " — " + localOrg + " < — > " + targetOrg;
 
 	// Drop a header bar with the org names so the user can tell the two
@@ -25,14 +26,25 @@ $(document).ready(function () {
 	function isCurrentCompareMessage(request) {
 		if (!request || !request.setSide) return false;
 		if (request.setSide !== 'lhs' && request.setSide !== 'rhs') return false;
-		if (requestId) return request.requestId === requestId;
-		if (request.requestId) return false;
+		if (requestId) {
+			if (request.requestId !== requestId) return false;
+		} else if (request.requestId) {
+			return false;
+		}
+		if (currentRunId && request.runId !== currentRunId) return false;
 		return !compareItem || compareItem === request.compareItem;
 	}
 	$('body').prepend(
 		'<div id="csh-compare-header" style="display:flex;align-items:center;padding:6px 10px;background:#f4f6f9;border-bottom:1px solid #d8dde6;font:12px/1.4 Arial,sans-serif;color:#2b2826;">' +
 			'<div style="flex:1;"><strong>This org:</strong> ' + escapeHtml(localOrg) + '</div>' +
-			'<div style="padding:0 12px;color:#706e6b;">' + escapeHtml(compareItem) + '</div>' +
+			'<div style="padding:0 12px;color:#706e6b;text-align:center;">' +
+				'<div>' + escapeHtml(compareItem) + '</div>' +
+				'<div style="margin-top:4px;display:flex;gap:4px;justify-content:center;white-space:nowrap;">' +
+					'<button type="button" class="csh-compare-refresh" data-sides="lhs,rhs" style="padding:3px 8px;border:1px solid #c9c9c9;border-radius:3px;background:#fff;cursor:pointer;font:11px Arial,sans-serif;">Refresh both</button>' +
+					'<button type="button" class="csh-compare-refresh" data-sides="lhs" style="padding:3px 8px;border:1px solid #c9c9c9;border-radius:3px;background:#fff;cursor:pointer;font:11px Arial,sans-serif;">This org</button>' +
+					'<button type="button" class="csh-compare-refresh" data-sides="rhs" style="padding:3px 8px;border:1px solid #c9c9c9;border-radius:3px;background:#fff;cursor:pointer;font:11px Arial,sans-serif;">Other org</button>' +
+				'</div>' +
+			'</div>' +
 			'<div style="flex:1;text-align:right;"><strong>Other org:</strong> ' + escapeHtml(targetOrg) + '</div>' +
 		'</div>'
 	);
@@ -61,6 +73,26 @@ $(document).ready(function () {
 		tipShownAt: 30000, // surface the "setup → retrieve status" tip after 30s
 		timer: null
 	};
+	function setRefreshBusy(isBusy) {
+		$('.csh-compare-refresh').prop('disabled', !!isBusy).css({
+			opacity: isBusy ? '0.65' : '1',
+			cursor: isBusy ? 'default' : 'pointer'
+		});
+	}
+	function resetProgressForRetrieve(sides) {
+		if (progress.timer) clearInterval(progress.timer);
+		progress.start = Date.now();
+		$('.csh-compare-progress-error').remove();
+		$('.csh-compare-progress-tip').hide();
+		$('#csh-compare-progress').stop(true, true).show();
+		sides.forEach(function (side) {
+			progress[side] = 'working';
+			$('#compare').mergely(side, 'Loading latest...');
+		});
+		setRefreshBusy(true);
+		progress.timer = setInterval(updateProgressPanel, 500);
+		updateProgressPanel();
+	}
 	function updateProgressPanel() {
 		var phases = 'This org: ' + progress.lhs + ' · Other org: ' + progress.rhs;
 		$('.csh-compare-progress-phase').text(phases);
@@ -72,6 +104,8 @@ $(document).ready(function () {
 		}
 		if (progress.lhs !== 'working' && progress.rhs !== 'working') {
 			clearInterval(progress.timer);
+			progress.timer = null;
+			setRefreshBusy(false);
 			// Auto-hide the panel after both sides have finished (success or
 			// error) so the diff takes the whole window. Errors stay visible
 			// long enough for the user to read them.
@@ -81,10 +115,32 @@ $(document).ready(function () {
 			}, anyError ? 4000 : 600);
 		}
 	}
-	progress.timer = setInterval(updateProgressPanel, 500);
 	$('#csh-compare-cancel').on('click', function () {
 		window.close();
 	});
+	$('.csh-compare-refresh').on('click', function () {
+		if (!requestId) return;
+		var sides = String($(this).attr('data-sides') || 'lhs,rhs').split(',').filter(Boolean);
+		currentRunId = 'cmp-run-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+		resetProgressForRetrieve(sides);
+		chrome.runtime.sendMessage({
+			type: 'cshCompareRefresh',
+			requestId: requestId,
+			runId: currentRunId,
+			sides: sides
+		}, function (resp) {
+			if (chrome.runtime.lastError || !resp || !resp.ok) {
+				sides.forEach(function (side) { progress[side] = 'error'; });
+				$('#csh-compare-progress').append(
+					'<div class="csh-compare-progress-error" style="color:#c23934;margin-top:4px;">Refresh failed: ' +
+					escapeHtml((chrome.runtime.lastError && chrome.runtime.lastError.message) || 'background worker did not accept the request') +
+					'</div>'
+				);
+				updateProgressPanel();
+			}
+		});
+	});
+	resetProgressForRetrieve(['lhs', 'rhs']);
 
 	chrome.runtime.onMessage.addListener(
 		  function(request, sender, sendResponse) {
@@ -97,8 +153,8 @@ $(document).ready(function () {
 				 // collections) — the legacy code silently threw here.
 				 var sideKey = request.setSide || 'lhs';
 				 progress[sideKey] = 'error';
-				 $('.csh-compare-progress-phase').append(
-					 '<div style="color:#c23934;margin-top:4px;">' + sideKey.toUpperCase() + ' failed: ' +
+				 $('#csh-compare-progress').append(
+					 '<div class="csh-compare-progress-error" style="color:#c23934;margin-top:4px;">' + sideKey.toUpperCase() + ' failed: ' +
 					 escapeHtml(request.err) + '</div>'
 				 );
 				 updateProgressPanel();
@@ -185,8 +241,8 @@ $(document).ready(function () {
 					});
 				}).catch(function (e) {
 					progress[request.setSide] = 'error';
-					$('.csh-compare-progress-phase').append(
-						'<div style="color:#c23934;margin-top:4px;">' + request.setSide.toUpperCase() +
+					$('#csh-compare-progress').append(
+						'<div class="csh-compare-progress-error" style="color:#c23934;margin-top:4px;">' + request.setSide.toUpperCase() +
 						' unzip failed: ' + escapeHtml(e && e.message ? e.message : String(e)) + '</div>'
 					);
 					updateProgressPanel();
@@ -196,12 +252,12 @@ $(document).ready(function () {
 
 	});
 	if (requestId) {
-		chrome.runtime.sendMessage({ type: 'cshComparePopupReady', requestId: requestId }, function (resp) {
+		chrome.runtime.sendMessage({ type: 'cshComparePopupReady', requestId: requestId, runId: currentRunId }, function (resp) {
 			if (!resp || !resp.ok) {
 				progress.lhs = 'error';
 				progress.rhs = 'error';
-				$('.csh-compare-progress-phase').append(
-					'<div style="color:#c23934;margin-top:4px;">Compare startup failed. Re-open the popup.</div>'
+				$('#csh-compare-progress').append(
+					'<div class="csh-compare-progress-error" style="color:#c23934;margin-top:4px;">Compare startup failed. Re-open the popup.</div>'
 				);
 				updateProgressPanel();
 			}

@@ -83,6 +83,7 @@ var entityTypeMap = {
     'ActionFieldUpdate': 'WorkflowFieldUpdate',
     'ActionTask': 'WorkflowTask',
     'ActionEmail': 'WorkflowAlert',
+    'ActionOutboundMessage': 'WorkflowOutboundMessage',
     'Report': 'Report',
     'ExternalString': 'CustomLabel',
     // Salesforce's Add-to-Change-Set picker sometimes emits the display label
@@ -149,9 +150,22 @@ var CSH_POST_FILTERS = {
 };
 
 function cshApplyPostFilter(results) {
+    if (/__mdt$/i.test(selectedEntityType || '') && Array.isArray(results)) {
+        var typeWithSuffix = selectedEntityType;
+        var typeWithoutSuffix = selectedEntityType.replace(/__mdt$/i, '');
+        return results.filter(function (rec) {
+            var fn = rec && rec.fullName;
+            return typeof fn === 'string' &&
+                (fn.indexOf(typeWithSuffix + '.') === 0 || fn.indexOf(typeWithoutSuffix + '.') === 0);
+        });
+    }
     var f = CSH_POST_FILTERS[selectedEntityType];
     if (!f || !Array.isArray(results)) return results;
     return results.filter(f);
+}
+
+function cshIsInvalidMetadataTypeError(err) {
+    return /INVALID_TYPE:\s*Unknown type:/i.test(String(err || ''));
 }
 
 //as Dashboard, Document,
@@ -357,7 +371,7 @@ function cshSetComponentRowChecked(id, checked) {
     var row = cshGetComponentRowById(id);
     if (!row || !window.cshCart || !window.cshCart.setItemChecked) return Promise.resolve(false);
     var csId = cshAddPagePackageId || cshAddPageChangeSetId || changeSetId || $('#id').val();
-    return window.cshCart.setItemChecked(csId, selectedEntityType || row.type, row, checked);
+    return window.cshCart.setItemChecked(csId, row.displayType || selectedEntityType || row.type, row, checked);
 }
 
 // Helper function to add columns to specific rows (avoids freezing with large datasets).
@@ -775,7 +789,13 @@ function determineMetadataColumns(metadataRecordOrArray) {
 function processListResults(response) {
     response = response || {};
     if (response.err || response.error) {
-        console.warn('processListResults: metadata response error:', response.err || response.error);
+        var metadataError = response.err || response.error;
+        if (cshIsInvalidMetadataTypeError(metadataError)) {
+            console.info('processListResults: metadata type is not listable for this picker:', selectedEntityType, metadataError);
+            response.results = [];
+        } else {
+            console.warn('processListResults: metadata response error:', metadataError);
+        }
     }
     console.log('========================================');
     console.log('processListResults: Received response from JSforce');
@@ -2623,7 +2643,7 @@ function cshResolveEntityApiNames(connType, cb) {
     }
     var proxy = connType === 'deploy' ? 'queryToolingDeploy' : 'queryToolingLocal';
     chrome.runtime.sendMessage(
-        { proxyFunction: proxy, soql: 'SELECT Id, QualifiedApiName FROM EntityDefinition' },
+        { proxyFunction: proxy, soql: 'SELECT Id, QualifiedApiName FROM EntityDefinition LIMIT 2000' },
         function (response) {
             if (response && response.err) { cb(response.err, null); return; }
             var records = (response && response.records) || [];
@@ -3374,6 +3394,9 @@ window.cshMetadata.getDescribe().then(function (describeCache) {
     resolvedMetadataType = window.cshMetadata.resolveEntityType(
         selectedEntityType, describeCache, entityTypeMap
     );
+    if (!resolvedMetadataType && /__mdt$/i.test(selectedEntityType || '')) {
+        resolvedMetadataType = 'CustomMetadata';
+    }
     console.log('Entity type resolution:', selectedEntityType, '->', resolvedMetadataType,
                 describeCache ? '(describe cache warm)' : '(describe cache cold)');
 

@@ -2,12 +2,12 @@
 
 #csh-cart-panel {
     position: fixed;
-    right: 16px;
-    bottom: 16px;
+    right: 6px;
+    bottom: 6px;
     width: 420px;
-    min-height: 260px;
-    height: min(680px, calc(100vh - 96px));
-    max-height: calc(100vh - 48px);
+    min-height: 300px;
+    height: min(780px, calc(100vh - 20px));
+    max-height: calc(100vh - 10px);
     background: #fff;
     border: 1px solid #c9c9c9;
     border-radius: 6px;
@@ -51,6 +51,7 @@
     color: #fff;
     border-radius: 5px 5px 0 0;
     font-weight: 600;
+    flex: 0 0 auto;
 }
 
 #csh-cart-panel .csh-cart-title { flex: 1 1 auto; }
@@ -118,14 +119,15 @@
 }
 
 #csh-cart-panel .csh-cart-body {
-    padding: 8px 10px;
+    padding: 5px 7px;
     overflow-y: auto;
-    min-height: 180px;
-    flex: 1 1 auto;
+    min-height: 0;
+    flex: 1 1 0;
 }
 
 #csh-cart-panel .csh-cart-search-row {
     padding: 8px 10px 0;
+    flex: 0 0 auto;
 }
 
 #csh-cart-panel .csh-cart-search-row .csh-cart-search {
@@ -156,8 +158,8 @@
 #csh-cart-panel .csh-cart-counts {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
-    margin-bottom: 8px;
+    gap: 4px;
+    margin-bottom: 5px;
 }
 
 #csh-cart-panel .chip {
@@ -190,15 +192,15 @@
 }
 
 #csh-cart-panel .csh-cart-group {
-    margin-bottom: 6px;
+    margin-bottom: 4px;
     border: 1px solid #e5e5e5;
     border-radius: 4px;
-    padding: 4px 6px;
+    padding: 3px 5px;
 }
 
 #csh-cart-panel .csh-cart-group > summary {
     cursor: pointer;
-    padding: 2px 0;
+    padding: 1px 0;
     user-select: none;
 }
 
@@ -208,6 +210,30 @@
 }
 
 #csh-cart-panel .csh-cart-type-count { color: #706e6b; font-weight: 400; }
+
+#csh-cart-panel .csh-cart-remove-type {
+    float: right;
+    border: 1px solid #c9c9c9;
+    background: #fff;
+    color: #8e0916;
+    border-radius: 3px;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    font: 700 14px/16px Arial, sans-serif;
+    cursor: pointer;
+    text-align: center;
+}
+
+#csh-cart-panel .csh-cart-remove-type:hover {
+    border-color: #ba0517;
+    background: #fff5f5;
+}
+
+#csh-cart-panel .csh-cart-remove-type:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
 
 #csh-cart-panel .csh-cart-group-preview {
     display: block;
@@ -229,15 +255,15 @@
 
 #csh-cart-panel .csh-cart-group ul {
     list-style: none;
-    padding: 4px 0 0 0;
+    padding: 2px 0 0 0;
     margin: 0;
 }
 
 #csh-cart-panel .csh-cart-item {
     display: flex;
     align-items: flex-start;
-    gap: 6px;
-    padding: 4px 0;
+    gap: 4px;
+    padding: 2px 0;
     border-bottom: 1px solid #f4f4f4;
 }
 
@@ -252,22 +278,22 @@
     font-weight: 500;
     word-break: break-word;
     color: #2b2826;
-    line-height: 1.3;
+    line-height: 1.18;
 }
 
 #csh-cart-panel .csh-cart-item-subname {
     color: #706e6b;
     font-size: 11px;
     word-break: break-word;
-    line-height: 1.25;
-    margin-top: 1px;
+    line-height: 1.15;
+    margin-top: 0;
 }
 
 #csh-cart-panel .csh-cart-item-status {
     flex: 0 0 auto;
     font-size: 10px;
     color: #706e6b;
-    padding-top: 2px;
+    padding-top: 0;
     white-space: nowrap;
 }
 
@@ -286,7 +312,7 @@
     font-size: 14px;
     line-height: 1;
     cursor: pointer;
-    padding: 0 4px;
+    padding: 0 2px;
 }
 
 #csh-cart-panel .csh-cart-more {
@@ -299,13 +325,13 @@
    rows on top of a spacer div. Rows are single-line with ellipsis; full
    name/subname are preserved in the row's title attribute. */
 #csh-cart-panel .csh-cart-virt {
-    padding: 4px 0 0 0;
+    padding: 2px 0 0 0;
     margin: 0;
 }
 
 #csh-cart-panel .csh-cart-item-virt {
     box-sizing: border-box;
-    padding: 6px 0;
+    padding: 3px 0;
     border-bottom: 1px solid #f4f4f4;
     overflow: hidden;
 }
@@ -317,8 +343,9 @@
 }
 
 #csh-cart-panel .csh-cart-section {
-    padding: 8px 12px 6px;
+    padding: 5px 8px 4px;
     border-top: 1px solid #e5e5e5;
+    flex: 0 0 auto;
 }
 
 #csh-cart-panel .csh-cart-section-label {
@@ -385,17 +412,18 @@
 
 #csh-cart-panel .csh-cart-footer {
     display: flex;
-    gap: 6px;
-    padding: 10px 12px;
+    gap: 4px;
+    padding: 6px 8px;
     border-top: 1px solid #e5e5e5;
     flex-wrap: wrap;
     background: #fafbfc;
     border-radius: 0 0 5px 5px;
+    flex: 0 0 auto;
 }
 
 #csh-cart-panel .csh-cart-footer button {
     flex: 1 1 auto;
-    padding: 7px 12px;
+    padding: 5px 8px;
     border-radius: 3px;
     border: 1px solid #c9c9c9;
     background: #fff;

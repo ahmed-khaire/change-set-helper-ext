@@ -279,6 +279,7 @@
                 form: {}
             };
         }
+        normalizeCartItems(all[changeSetId]);
         return { all: all, cart: all[changeSetId] };
     }
 
@@ -322,6 +323,34 @@
         return '';
     }
 
+    function normalizeCartType(type) {
+        var t = String(type || '').trim();
+        if (t === 'CustomFieldDefinition' || t === 'CustomField') return 'Custom Field';
+        return t;
+    }
+
+    function normalizeCartItems(cart) {
+        if (!cart || !Array.isArray(cart.items)) return false;
+        var changed = false;
+        cart.items.forEach(function (it) {
+            var next = normalizeCartType(it.type);
+            if (next && next !== it.type) {
+                it.type = next;
+                changed = true;
+            }
+        });
+        if (cart.form && typeof cart.form === 'object') {
+            Object.keys(cart.form).forEach(function (key) {
+                var next = normalizeCartType(key);
+                if (!next || next === key) return;
+                cart.form[next] = Object.assign({}, cart.form[key], cart.form[next] || {});
+                delete cart.form[key];
+                changed = true;
+            });
+        }
+        return changed;
+    }
+
     function statusPriority(status) {
         if (status === 'done') return 4;
         if (status === 'submitting') return 3;
@@ -335,7 +364,7 @@
         var other = winner === b ? a : b;
         var merged = Object.assign({}, other, winner);
         merged.uid = winner.uid || other.uid || uid();
-        merged.type = winner.type || other.type;
+        merged.type = normalizeCartType(winner.type || other.type);
         merged.salesforceId = winner.salesforceId || other.salesforceId;
         if (merged.salesforceId) merged.salesforceId = String(merged.salesforceId).slice(0, 15);
         merged.name = winner.name || other.name || merged.salesforceId;
@@ -358,6 +387,7 @@
             if (!cart) return;
             if (cart.form) Object.assign(forms, cart.form);
             (cart.items || []).forEach(function (it) {
+                it.type = normalizeCartType(it.type);
                 var ident = itemIdentity(it);
                 if (!ident) return;
                 byIdentity[ident] = byIdentity[ident] ? mergeCartRows(byIdentity[ident], it) : Object.assign({}, it);
@@ -390,6 +420,7 @@
     }
 
     async function addItems(changeSetId, type, items /* [{id, name}] */) {
+        type = normalizeCartType(type);
         var { all, cart } = await getCart(changeSetId);
         // Salesforce component ids are globally unique. Use the id as cart
         // identity so display/API type label differences do not create a
@@ -441,10 +472,11 @@
         var added = 0;
         items.forEach(function (it) {
             if (!it.id || !it.type) return;
+            var type = normalizeCartType(it.type);
             if (seen[key(it.id)]) return;
             var row = {
                 uid: uid(),
-                type: it.type,
+                type: type,
                 salesforceId: it.id,
                 name: it.name || it.id,
                 status: it.status || 'staged',
@@ -458,13 +490,16 @@
         });
         await saveCart(all);
         if (window.cshDb && added > 0) {
-            window.cshDb.markMembers(changeSetId, items, 'pending_add', { source: 'cart-batch-add' })
+            window.cshDb.markMembers(changeSetId, items.map(function (it) {
+                return Object.assign({}, it, { type: normalizeCartType(it.type) });
+            }), 'pending_add', { source: 'cart-batch-add' })
                 .catch(function (e) { console.warn('cshDb batch add cache failed:', e && e.message); });
         }
         return added;
     }
 
     async function setItemChecked(changeSetId, type, item, checked) {
+        type = normalizeCartType(type);
         if (!changeSetId || !type || !item) return false;
         var sfId = item.id || item.salesforceId;
         if (!sfId) return false;
@@ -554,6 +589,10 @@
     async function syncItemsFromServer(changeSetId, items /* [{type, id, name?, extra?}] */, options) {
         options = options || {};
         if (!items) items = [];
+        items = items.map(function (it) {
+            if (!it) return it;
+            return Object.assign({}, it, { type: normalizeCartType(it.type) });
+        });
         // Empty input → no-op. For authoritative callers this is defensive:
         // "empty authoritative" is almost always a scrape failure (fetch
         // returned a parseable but rowless page, or the 033 id was wrong),
@@ -687,7 +726,7 @@
                 items.map(function (it) {
                     var out = {
                         id: it.id,
-                        type: it.type,
+                        type: normalizeCartType(it.type),
                         name: it.name,
                         source: 'server-sync'
                     };
@@ -717,12 +756,12 @@
         for (var i = 0; i < keys.length; i++) {
             var rows = await window.cshDb.getChangeSetMembers(keys[i], { status: 'present' });
             rows.forEach(function (row) {
-                var itemKey = [row.type, row.componentId || row.fullName || row.name].join('::');
+                var itemKey = [normalizeCartType(row.type), row.componentId || row.fullName || row.name].join('::');
                 if (seen[itemKey]) return;
                 seen[itemKey] = true;
                 cached.push({
                     id: row.componentId || row.id,
-                    type: row.type,
+                    type: normalizeCartType(row.type),
                     name: row.name || row.fullName || row.componentId,
                     extra: {
                         fullName: row.fullName || undefined,
@@ -789,6 +828,9 @@
         if (!Array.isArray(changeSetIds)) changeSetIds = [changeSetIds];
         changeSetIds = changeSetIds.filter(Boolean);
         items = Array.isArray(items) ? items.filter(function (it) { return it && it.id; }) : [];
+        items = items.map(function (it) {
+            return Object.assign({}, it, { type: normalizeCartType(it.type) });
+        });
         if (!changeSetIds.length || !items.length) return { removed: 0 };
 
         function sfId15(id) { return id ? String(id).slice(0, 15) : ''; }
@@ -797,7 +839,8 @@
             byId[sfId15(it.id)] = it;
         });
 
-        var all = await storageGet(CART_KEY) || {};
+        var s = await storageGet([CART_KEY]);
+        var all = s[CART_KEY] || {};
         var removed = 0;
         changeSetIds.forEach(function (changeSetId) {
             var cart = all[changeSetId];
@@ -821,6 +864,15 @@
         }
 
         return { removed: removed };
+    }
+
+    async function relatedChangeSetKeys(changeSetId) {
+        var keys = uniqueSyncKeys([changeSetId]);
+        try {
+            var packageId = await _resolvePackageIdForServerRemove(changeSetId);
+            if (packageId) keys = uniqueSyncKeys(keys.concat([packageId]));
+        } catch (_) {}
+        return keys;
     }
 
     async function getItemByUid(changeSetId, uid) {
@@ -849,10 +901,62 @@
         } else {
             await removeDoneItemViaClassicView(changeSetId, item);
         }
-        await removeItem(changeSetId, uid);
+        await removeServerItems(await relatedChangeSetKeys(changeSetId), [{
+            id: item.salesforceId,
+            type: item.type,
+            name: label,
+            fullName: item.fullName
+        }]);
         window.cshToast && window.cshToast.show(
             'Removed "' + label + '" from the change set.',
             { type: 'success', duration: 3000 }
+        );
+    }
+
+    async function removeDoneTypeFromServerAndCart(changeSetId, type) {
+        type = normalizeCartType(type);
+        var { cart } = await getCart(changeSetId);
+        var items = (cart.items || []).filter(function (it) {
+            return normalizeCartType(it.type) === type && it.status === 'done' && it.salesforceId;
+        });
+        if (!items.length) return;
+        if (!confirm('Remove all ' + items.length + ' "' + type + '" component(s) from this change set? This cannot be undone.')) return;
+
+        var ids = items.map(function (it) { return it.salesforceId; });
+        var removedItems = [];
+        if (window.cshChangeSetOps && window.cshChangeSetOps.removeManyByIds) {
+            var result = await window.cshChangeSetOps.removeManyByIds(ids);
+            var failed = {};
+            (result.errors || []).forEach(function (e) {
+                if (e && e.cid) failed[String(e.cid).slice(0, 15)] = true;
+            });
+            removedItems = items.filter(function (it) {
+                return !failed[String(it.salesforceId).slice(0, 15)];
+            }).map(function (it) {
+                return { id: it.salesforceId, type: it.type, name: bestDisplayName(it), fullName: it.fullName };
+            });
+            if (result.failed && window.cshToast) {
+                window.cshToast.show(
+                    'Removed ' + result.done + ' ' + type + ' component(s); ' + result.failed + ' failed.',
+                    { type: 'warning', duration: 7000 }
+                );
+            }
+        } else {
+            for (var i = 0; i < items.length; i++) {
+                await removeDoneItemViaClassicView(changeSetId, items[i]);
+                removedItems.push({
+                    id: items[i].salesforceId,
+                    type: items[i].type,
+                    name: bestDisplayName(items[i]),
+                    fullName: items[i].fullName
+                });
+            }
+        }
+        if (!removedItems.length) return;
+        await removeServerItems(await relatedChangeSetKeys(changeSetId), removedItems);
+        window.cshToast && window.cshToast.show(
+            'Removed ' + removedItems.length + ' ' + type + ' component(s) from the change set.',
+            { type: 'success', duration: 4000 }
         );
     }
 
@@ -870,9 +974,10 @@
     }
 
     async function clearType(changeSetId, type) {
+        type = normalizeCartType(type);
         var { all, cart } = await getCart(changeSetId);
         cart.items = cart.items.filter(function (it) {
-            return !(it.type === type && it.status === 'staged');
+            return !(normalizeCartType(it.type) === type && it.status === 'staged');
         });
         await saveCart(all);
     }
@@ -907,6 +1012,7 @@
     }
 
     async function cacheFormShape(changeSetId, type, formShape) {
+        type = normalizeCartType(type);
         var { all, cart } = await getCart(changeSetId);
         cart.form[type] = Object.assign({ capturedAt: Date.now() }, formShape);
         await saveCart(all);
@@ -1031,6 +1137,7 @@
     var autoSaveTimer = null;
     var _cartType = null;
     function installCheckboxAutoSave(changeSetId, type) {
+        type = normalizeCartType(type);
         _cartType = type;
         // Selector intentionally scoped to `table.list input[type="checkbox"]`
         // rather than `tr.dataRow input[...]` so the header "Select All"
@@ -1065,6 +1172,7 @@
     }
 
     async function syncCartFromCheckboxes(changeSetId, type) {
+        type = normalizeCartType(type);
         if (!changeSetId || !type) return;
 
         // Partition every checkbox currently in the DOM into visible-checked
@@ -1089,7 +1197,7 @@
         var seen = {};
         cart.items.forEach(function (it) {
             // Items for other types untouched.
-            if (it.type !== type) { kept.push(it); return; }
+            if (normalizeCartType(it.type) !== type) { kept.push(it); return; }
             // In-flight / terminal items protected.
             if (it.status !== 'staged') { kept.push(it); seen[it.salesforceId] = true; return; }
 
@@ -1139,11 +1247,12 @@
     // ticks rows that should be ticked per the cart. Doesn't trigger the
     // change event (would cause recursive auto-save), just sets .checked.
     async function restoreVisibleTicksFromCart(changeSetId, type) {
+        type = normalizeCartType(type);
         if (!changeSetId || !type) return;
         var { cart } = await getCart(changeSetId);
         var wanted = {};
         cart.items.forEach(function (it) {
-            if (it.type !== type) return;
+            if (normalizeCartType(it.type) !== type) return;
             if (it.status === 'done') return;
             wanted[it.salesforceId] = true;
         });
@@ -1154,10 +1263,11 @@
     }
 
     async function restoreFromCart(changeSetId, type) {
+        type = normalizeCartType(type);
         var { cart } = await getCart(changeSetId);
         var wanted = {};
         cart.items.forEach(function (it) {
-            if (it.type !== type) return;
+            if (normalizeCartType(it.type) !== type) return;
             if (it.status === 'done') return;
             wanted[it.salesforceId] = it;
         });
@@ -1656,6 +1766,7 @@
     // Specialised addItems for imports: stores fullName so rescanForFullNames
     // can resolve salesforceId on page visit.
     async function addUnresolvedItems(changeSetId, type, items) {
+        type = normalizeCartType(type);
         var { all, cart } = await getCart(changeSetId);
         // Dedup by (type + fullName) among unresolved items to avoid double-import.
         var seen = {};
@@ -1693,12 +1804,13 @@
     // panel show "Account.MyField" instead of just "MyField" for custom
     // fields, etc.
     async function rescanForFullNames(changeSetId, type) {
+        type = normalizeCartType(type);
         var { all, cart } = await getCart(changeSetId);
         var unresolved = cart.items.filter(function (it) {
-            return it.type === type && !it.salesforceId && it.fullName;
+            return normalizeCartType(it.type) === type && !it.salesforceId && it.fullName;
         });
         var needsFullName = cart.items.filter(function (it) {
-            return it.type === type && it.salesforceId && !it.fullName;
+            return normalizeCartType(it.type) === type && it.salesforceId && !it.fullName;
         });
         if (unresolved.length === 0 && needsFullName.length === 0) return 0;
 
@@ -1806,6 +1918,23 @@
         }
         return extract(rowEl.querySelectorAll('a[href]'));
     }
+
+    function _findCidInRowFields(rowEl, packageId) {
+        var SF_ID_RE = /^[0-9a-zA-Z]{15}(?:[0-9a-zA-Z]{3})?$/;
+        var pkgPrefix = packageId ? packageId.slice(0, 15) : null;
+        var attrs = ['value', 'data-cid', 'data-id', 'data-component-id', 'data-recordid'];
+        var nodes = rowEl.querySelectorAll('input, button, a, span, div');
+        for (var i = 0; i < nodes.length; i++) {
+            for (var j = 0; j < attrs.length; j++) {
+                var val = nodes[i].getAttribute(attrs[j]) || '';
+                if (!SF_ID_RE.test(val)) continue;
+                if (pkgPrefix && val.slice(0, 15) === pkgPrefix) continue;
+                return val;
+            }
+        }
+        return null;
+    }
+
     function _findNextPageHrefInDoc(doc) {
         var anchors = doc.querySelectorAll('a');
         for (var i = 0; i < anchors.length; i++) {
@@ -1902,7 +2031,8 @@
                 // Prefer componentId below; href is kept for removeHref only.
                 var href = _findDelHrefInRow(row);
                 var componentId = _findCidInRowAnchors(row, packageId, idx.name);
-                var cid = componentId || _extractCidFromDelHref(href);
+                var fieldId = _findCidInRowFields(row, packageId);
+                var cid = componentId || fieldId || _extractCidFromDelHref(href);
                 if (!cid) return;
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
@@ -2064,7 +2194,8 @@
                 // Prefer componentId below; href is kept for removeHref only.
                 var href = _findDelHrefInRow(row);
                 var componentId = _findCidInRowAnchors(row, packageId, idx.name);
-                var cid = componentId || _extractCidFromDelHref(href);
+                var fieldId = _findCidInRowFields(row, packageId);
+                var cid = componentId || fieldId || _extractCidFromDelHref(href);
                 if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
@@ -2354,6 +2485,26 @@
         // re-rendered on every paint, so wire the listener on the stable
         // panel element. Click toggles: same filter → clear; other → switch.
         panel.addEventListener('click', function (ev) {
+            var removeType = ev.target.closest && ev.target.closest('.csh-cart-remove-type');
+            if (removeType && panel.contains(removeType)) {
+                ev.preventDefault();
+                ev.stopPropagation();
+                var changeSetId = currentChangeSetId();
+                var type = removeType.getAttribute('data-type');
+                if (!changeSetId || !type) return;
+                removeType.disabled = true;
+                removeDoneTypeFromServerAndCart(changeSetId, type)
+                    .then(function () {
+                        if (document.documentElement.contains(removeType)) removeType.disabled = false;
+                    })
+                    .catch(function (err) {
+                        removeType.disabled = false;
+                        var msg = (err && err.message) || String(err);
+                        console.error('[CSH] cart type remove failed:', err);
+                        window.cshToast && window.cshToast.show('Remove type failed: ' + msg, { type: 'error', duration: 8000 });
+                    });
+                return;
+            }
             var chip = ev.target.closest && ev.target.closest('[data-status-filter]');
             if (!chip || !panel.contains(chip)) return;
             var f = chip.getAttribute('data-status-filter');
@@ -2602,7 +2753,7 @@
     // rows are swapped mid-scroll.
     // -----------------------------------------------------------------------
     var VIRT_THRESHOLD = 80;
-    var VIRT_ITEM_H = 32;
+    var VIRT_ITEM_H = 25;
     var VIRT_VIEWPORT_H = 320;
     var VIRT_BUFFER = 4;
 
@@ -2830,7 +2981,13 @@
             var q = searchQuery;
             var sf = statusFilter;
             var byType = {};
+            var doneCountByType = {};
             var visibleTotal = 0;
+            items.forEach(function (it) {
+                if (it.status === 'done' && it.salesforceId) {
+                    doneCountByType[it.type] = (doneCountByType[it.type] || 0) + 1;
+                }
+            });
             items.forEach(function (it) {
                 if (!itemMatchesSearch(it, q)) return;
                 if (sf && (it.status || 'staged') !== sf) return;
@@ -2892,11 +3049,18 @@
                     .map(function (it) { return bestDisplayName(it); })
                     .join(', ');
                 if (list.length > 3) previewNames += ', +' + (list.length - 3) + ' more';
+                var doneInType = doneCountByType[type] || 0;
+                var removeTypeButton = doneInType
+                    ? '<button type="button" class="csh-cart-remove-type" data-type="' + escapeAttr(type) +
+                        '" title="Remove all added ' + escapeAttr(type) + ' components from this change set" ' +
+                        'aria-label="Remove all added ' + escapeAttr(type) + ' components from this change set">×</button>'
+                    : '';
 
                 html += '<details class="csh-cart-group"' + (isOpen ? ' open' : '') + ' data-group-key="' + escapeAttr(key) + '">' +
                         '<summary>' +
                           '<span class="csh-cart-group-type">' + escapeHtml(type) + '</span> ' +
                           '<span class="csh-cart-type-count">(' + list.length + ')</span>' +
+                          removeTypeButton +
                           '<div class="csh-cart-group-preview" title="' + escapeAttr(previewNames) + '">' +
                             escapeHtml(previewNames) +
                           '</div>' +
@@ -3170,17 +3334,18 @@
         opts = opts || {};
         _currentChangeSetId = opts.changeSetId || ($('#id').val() || null);
         if (!_currentChangeSetId) return;
+        var currentType = normalizeCartType(opts.currentType);
 
         // Cache the form shape for this type so the worker can replay later
         // even if the user has navigated away.
         var shape = scrapeFormShape();
-        if (shape && opts.currentType) {
-            await cacheFormShape(_currentChangeSetId, opts.currentType, shape);
+        if (shape && currentType) {
+            await cacheFormShape(_currentChangeSetId, currentType, shape);
         }
 
         // Restore staged-but-not-submitted items for this type.
-        if (opts.currentType) {
-            var restored = await restoreFromCart(_currentChangeSetId, opts.currentType);
+        if (currentType) {
+            var restored = await restoreFromCart(_currentChangeSetId, currentType);
             if (restored > 0) {
                 console.log('cshCart: restored', restored, 'checkbox(es) from cart');
             }
@@ -3200,8 +3365,8 @@
         // mechanism for user selections — every checkbox click flushes to
         // chrome.storage.local before any Salesforce-initiated navigation can
         // run, so the cart survives refresh without relying on modal timing.
-        if (opts.currentType) {
-            installCheckboxAutoSave(_currentChangeSetId, opts.currentType);
+        if (currentType) {
+            installCheckboxAutoSave(_currentChangeSetId, currentType);
         }
         // Type-switch guard kept as NO-OP: dropdown change now lets Salesforce
         // navigate freely because state is already persisted on every click.
@@ -3212,8 +3377,8 @@
             console.warn('refreshPresetSelect failed:', e && e.message);
         });
         // Lazily resolve any imported-but-unresolved items for this type.
-        if (opts.currentType) {
-            rescanForFullNames(_currentChangeSetId, opts.currentType).catch(function () {});
+        if (currentType) {
+            rescanForFullNames(_currentChangeSetId, currentType).catch(function () {});
         }
 
         // Resume anything left in "submitting" from a prior session that was
