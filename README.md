@@ -1,6 +1,6 @@
 # Salesforce Change Set Helper Reloaded
 
-![Version](https://img.shields.io/badge/version-3.1.4-blue.svg)
+![Version](https://img.shields.io/badge/version-3.1.5-blue.svg)
 ![Manifest](https://img.shields.io/badge/manifest-v3-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 

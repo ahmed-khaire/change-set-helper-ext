@@ -4,7 +4,7 @@
   "manifest_version": 3,
   "name": "Salesforce Change Set Helper",
   "description": "Enhances the Salesforce change set. Adds last changed date and allows sorting, searching, validation and comparison with other orgs.",
-  "version": "3.1.4",
+  "version": "3.1.5",
   "options_page": "pages/options.html",
   "action": {
     "default_icon": "assets/icons/braincloudsmall.png",
