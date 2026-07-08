@@ -483,16 +483,24 @@ window.cshAuth = (function () {
             chrome.storage.local.set({ [KEY]: map }, function () { resolve(); });
         });
     }
+    // The same 0A2 id reaches us as 15 or 18 chars depending on which page
+    // scraped it (URL param vs retURL vs anchor href), so canonicalize keys
+    // to the 15-char prefix — otherwise the Add page can write a mapping the
+    // Detail page then misses.
+    function keyFor(changeSetId) {
+        return String(changeSetId).slice(0, 15);
+    }
     async function getPackageId(changeSetId) {
         if (!changeSetId) return null;
         var map = await readMap();
-        return map[changeSetId] || null;
+        // Legacy entries may sit under the un-normalized (18-char) key.
+        return map[keyFor(changeSetId)] || map[changeSetId] || null;
     }
     async function putMapping(changeSetId, packageId) {
         if (!changeSetId || !packageId) return;
         var map = await readMap();
-        if (map[changeSetId] === packageId) return;
-        map[changeSetId] = packageId;
+        if (map[keyFor(changeSetId)] === packageId) return;
+        map[keyFor(changeSetId)] = packageId;
         await writeMap(map);
     }
     window.cshIdMap = { getPackageId: getPackageId, putMapping: putMapping };

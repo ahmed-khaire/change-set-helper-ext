@@ -445,6 +445,18 @@
     function normalizeCartType(type) {
         var t = String(type || '').trim();
         if (t === 'CustomFieldDefinition' || t === 'CustomField') return 'Custom Field';
+        // Rows synced from the change-set view carry the UI label ("Flow
+        // Definition", "List View") while rows added on the Add page carry
+        // the API type name ("FlowDefinition", "ListView"). Canonicalize the
+        // API form to the spaced label so grouping and identity keys line up
+        // — otherwise the panel shows two sections for the same type and the
+        // server sync can't match rows it should merge. (Types whose UI label
+        // isn't a plain camel-case split — e.g. AuraDefinitionBundle vs
+        // "Lightning Component Bundle" — still diverge; the id-based dedup
+        // covers those once a salesforceId is known.)
+        if (/^[A-Za-z][A-Za-z0-9]*$/.test(t) && /[a-z][A-Z]/.test(t)) {
+            return t.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+        }
         return t;
     }
 
@@ -771,6 +783,15 @@
                     return it.status === 'done';
                 }).length;
                 await saveCart(all);
+                // Also wipe the IndexedDB membership cache — it re-hydrates
+                // the cart on every Add-page load (syncFromChangeSetView), so
+                // leaving 'present' rows there would resurrect the pruned
+                // items until the next successful non-empty sync.
+                if (window.cshDb && window.cshDb.deleteChangeSetMembers) {
+                    window.cshDb.deleteChangeSetMembers([changeSetId]).catch(function (e) {
+                        console.warn('cshDb.deleteChangeSetMembers failed:', e && e.message);
+                    });
+                }
                 return { inserted: 0, promoted: 0, kept: 0, pruned: emptyPruned };
             }
             if (options.authoritative) {
@@ -779,6 +800,26 @@
             return { inserted: 0, promoted: 0, kept: 0, pruned: 0 };
         }
         var byKey = seenKeys;
+        // Fallback index for rows that never learned their salesforceId —
+        // cart submissions post a classic form and get no record id back, so
+        // those rows sit as 'done' with only a type + name/fullName. Without
+        // this, the id-keyed loop below inserts the server's copy of the same
+        // component as a duplicate row (and the panel shows it twice), and
+        // the authoritative prune can never retire the id-less original.
+        var byNameKey = {};
+        function nameKeys(type, names) {
+            var t = normalizeCartType(type);
+            return names
+                .map(function (n) { return String(n || '').trim().toLowerCase(); })
+                .filter(Boolean)
+                .map(function (n) { return t + '::' + n; });
+        }
+        cart.items.forEach(function (it) {
+            if (!it || it.salesforceId || !it.type) return;
+            nameKeys(it.type, [it.fullName, it.name]).forEach(function (k) {
+                if (!byNameKey[k]) byNameKey[k] = it;
+            });
+        });
         var inputKeys = {};
         var inserted = 0, promoted = 0, kept = 0, pruned = 0;
         items.forEach(function (it) {
@@ -786,6 +827,24 @@
             var canonicalId = sfId15(it.id);
             inputKeys[key(canonicalId)] = true;
             var existing = byKey[key(canonicalId)];
+            if (!existing) {
+                // No id match — try to claim an id-less row by name and
+                // backfill its salesforceId so every later id-keyed path
+                // (prune, removeServerItems, dedup) can see it.
+                var candidates = nameKeys(it.type, [it.extra && it.extra.fullName, it.name]);
+                for (var c = 0; c < candidates.length; c++) {
+                    var ghost = byNameKey[candidates[c]];
+                    if (ghost) {
+                        ghost.salesforceId = canonicalId;
+                        byKey[key(canonicalId)] = ghost;
+                        nameKeys(ghost.type, [ghost.fullName, ghost.name]).forEach(function (k) {
+                            if (byNameKey[k] === ghost) delete byNameKey[k];
+                        });
+                        existing = ghost;
+                        break;
+                    }
+                }
+            }
             if (existing) {
                 existing.type = it.type;
                 if (existing.status === 'done') {
@@ -832,7 +891,12 @@
         if (options.authoritative) {
             pruned = dropCartItems(cart, function (it) {
                 if (it.status !== 'done') return false;
-                if (!it.type || !it.salesforceId) return false;
+                // Id-less 'done' rows that no server component claimed via
+                // the name backfill above are stale — the component was
+                // removed from the change set elsewhere. Before the backfill
+                // existed these were unprunable ghosts that lingered forever.
+                if (!it.salesforceId) return true;
+                if (!it.type) return false;
                 return inputKeys[key(it.salesforceId)] !== true;
             }).length;
         }
@@ -2271,6 +2335,7 @@
         }
         try {
         var items = [];
+        var sawEmptyListMarker = false;
         var appOrigin = _appOriginForChangeSetView();
         var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
         var safety = 200;
@@ -2300,6 +2365,19 @@
                 });
             }
             var rows = table.querySelectorAll('tr.dataRow');
+            // A genuinely empty change set still renders table.list, with a
+            // "No records to display" placeholder instead of data rows. That
+            // marker lets us distinguish "user removed everything" (prune is
+            // correct) from "scrape landed on the wrong page" (prune would
+            // destroy state) in the zero-rows branch below.
+            if (pageNum === 1 && rows.length === 0) {
+                // Empty Package Components view (verified against a live
+                // org): <th class="noRowsHeader">No package components
+                // defined</th> inside table.list. Other classic lists use
+                // td.noRowsHeader / "No records to display" — accept both.
+                sawEmptyListMarker = !!table.querySelector('.noRowsHeader') ||
+                    /no (records to display|package components defined)/i.test(table.textContent || '');
+            }
             var dropped = { noCid: 0, noType: 0 };
             rows.forEach(function (row, rowIdx) {
                 // Prefer Del link (its ?cid= query is the canonical component
@@ -2342,6 +2420,22 @@
         // makes the cause (row dropped counts / headerIdx / shell response)
         // easy to diagnose when it matters.
         if (items.length === 0) {
+            if (sawEmptyListMarker) {
+                // The classic view rendered its "No records to display"
+                // placeholder — the change set is genuinely empty, so the
+                // right move is the opposite of the defensive skip below:
+                // prune every stale 'done' row so the panel matches reality.
+                var emptySummary = { count: 0, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
+                for (var ek = 0; ek < syncClaim.keys.length; ek++) {
+                    var er = await syncItemsFromServer(syncClaim.keys[ek], [],
+                        { authoritative: true, allowEmptyAuthoritative: true });
+                    emptySummary.pruned += er.pruned || 0;
+                }
+                console.log('[CSH] Add-page authoritative sync: change set is empty — pruned',
+                    emptySummary.pruned, 'stale done row(s)');
+                await finishAuthoritativeSync(syncClaim.keys, 0);
+                return emptySummary;
+            }
             console.warn('[CSH] Add-page authoritative sync: zero rows scraped from ' +
                          new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href +
                          ' — skipping authoritative prune to preserve cart state. ' +

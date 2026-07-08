@@ -255,14 +255,15 @@
             throw new Error('Could not resolve 033 MetadataPackage id for authoritative sync');
         }
         var items = [];
-        var nextUrl = absoluteUrl('/' + packageId + '?tab=PackageComponents&rowsperpage=5000');
+        // App origin, not the current page's — see buildDelHrefMap.
+        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOriginForChangeSetView()).href;
         var safety = 200;
         var pageNum = 0;
         while (nextUrl && safety-- > 0) {
             pageNum++;
-            var r = await fetch(nextUrl, { credentials: 'include' });
+            var r = await fetchClassicPage(nextUrl);
             if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
-            var html = await r.text();
+            var html = r.text;
             var doc = new DOMParser().parseFromString(html, 'text/html');
             var table = doc.querySelector('table.list');
             if (!table) {
@@ -1018,6 +1019,74 @@
         try { return new URL(href, location.href).href; } catch (_) { return href; }
     }
 
+    // On enhanced-domain orgs the Setup UI (including this detail page) is
+    // served from *.salesforce-setup.com, but the classic app pages this
+    // module scrapes (/<033id>?tab=PackageComponents, /p/mfpkg/AddToPackage*)
+    // only render on *.salesforce.com. Same technique as outboundlist.js /
+    // cart.js — map the origin before building classic URLs.
+    function appOriginForChangeSetView() {
+        var host = location.host || '';
+        if (/\.salesforce-setup\.com$/i.test(host)) {
+            return location.protocol + '//' + host.replace(/\.salesforce-setup\.com$/i, '.salesforce.com');
+        }
+        return location.origin;
+    }
+
+    // Credentialed cross-origin fetches are blocked for content scripts even
+    // with host_permissions, so cross-origin classic-page requests proxy
+    // through the service worker (cshClassicFetch / cshClassicFormSubmit).
+    // Same-origin requests still go direct to skip the SW round trip.
+    function fetchClassicPage(url) {
+        var sameOrigin = (function () {
+            try { return new URL(url).origin === location.origin; }
+            catch (_) { return false; }
+        })();
+        if (sameOrigin) {
+            return fetch(url, { credentials: 'include' }).then(function (r) {
+                return r.text().then(function (text) {
+                    return { ok: r.ok, status: r.status, url: r.url, text: text };
+                });
+            });
+        }
+        return new Promise(function (resolve, reject) {
+            chrome.runtime.sendMessage({ type: 'cshClassicFetch', url: url }, function (resp) {
+                if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                if (!resp) return reject(new Error('cshClassicFetch: no response from service worker'));
+                if (resp.error) return reject(new Error(resp.error));
+                resolve({ ok: resp.ok, status: resp.status, url: resp.finalUrl || url, text: resp.text || '' });
+            });
+        });
+    }
+
+    function postClassicForm(url, body, method) {
+        var sameOrigin = (function () {
+            try { return new URL(url).origin === location.origin; }
+            catch (_) { return false; }
+        })();
+        if (sameOrigin) {
+            return fetch(url, {
+                method: method || 'POST',
+                credentials: 'include',
+                redirect: 'follow',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body
+            }).then(function (r) {
+                return { ok: r.ok, status: r.status, url: r.url };
+            });
+        }
+        return new Promise(function (resolve, reject) {
+            chrome.runtime.sendMessage(
+                { type: 'cshClassicFormSubmit', url: url, body: body, method: method || 'POST' },
+                function (resp) {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    if (!resp) return reject(new Error('cshClassicFormSubmit: no response from service worker'));
+                    if (resp.error) return reject(new Error(resp.error));
+                    resolve({ ok: resp.ok, status: resp.status, url: resp.finalUrl || url });
+                }
+            );
+        });
+    }
+
     // Match the row's Remove/Del action. On an outbound change set viewed
     // via /<033id>?tab=PackageComponents the action column anchor is labeled
     // "Remove" (not "Del", which is only used on generic list views). The
@@ -1221,19 +1290,52 @@
             }
         }
         var addPageUrls = [
-            '/p/mfpkg/AddToPackageFromChangeMgmtUi?id=' + encodeURIComponent(csId),
-            '/p/mfpkg/AddToPackageUi?id=' + encodeURIComponent(csId)
+            new URL('/p/mfpkg/AddToPackageFromChangeMgmtUi?id=' + encodeURIComponent(csId), appOriginForChangeSetView()).href,
+            new URL('/p/mfpkg/AddToPackageUi?id=' + encodeURIComponent(csId), appOriginForChangeSetView()).href
         ];
+        // Preferred: plain fetch of the Add page HTML (SW-proxied when this
+        // detail page is on *.salesforce-setup.com) and scan it for the 033 —
+        // same technique as outboundlist.js. The hidden-iframe fallback below
+        // is unreliable: Salesforce often refuses to render the Add page in
+        // an iframe, and on Setup-domain orgs a relative iframe URL targeted
+        // the wrong host entirely (issue: "no <input id=\"id\"> was present").
+        for (var f = 0; f < addPageUrls.length; f++) {
+            try {
+                var page = await fetchClassicPage(addPageUrls[f]);
+                if (!page.ok) continue;
+                var addDoc = new DOMParser().parseFromString(page.text, 'text/html');
+                var found = null;
+                var inputs = addDoc.querySelectorAll('input');
+                for (var j = 0; j < inputs.length; j++) {
+                    var v = inputs[j].value || '';
+                    if (PACKAGE_ID_RE.test(v)) { found = v; break; }
+                }
+                if (!found) {
+                    var bodyMatch = (addDoc.body && addDoc.body.innerHTML || '').match(/033[A-Za-z0-9]{12,15}/);
+                    if (bodyMatch) found = bodyMatch[0];
+                }
+                if (found) {
+                    packageIdCache = found;
+                    console.log('[CSH] packageId from Add page fetch (' + addPageUrls[f] + '):', packageIdCache);
+                    if (window.cshIdMap) window.cshIdMap.putMapping(csId, found).catch(function () {});
+                    return packageIdCache;
+                }
+                console.warn('[CSH] Add page fetch had no 033:', page.url);
+            } catch (err) {
+                console.warn('[CSH] Add page fetch failed:', addPageUrls[f], err && err.message);
+            }
+        }
         for (var i = 0; i < addPageUrls.length; i++) {
             try {
                 var val = await loadAddPageInIframe(addPageUrls[i], 15000);
                 if (val) {
                     packageIdCache = val;
                     console.log('[CSH] packageId from Add page iframe (' + addPageUrls[i] + '):', packageIdCache);
+                    if (window.cshIdMap) window.cshIdMap.putMapping(csId, val).catch(function () {});
                     return packageIdCache;
                 }
             } catch (err) {
-                console.warn('[CSH] Add page fetch failed:', addPageUrls[i], err);
+                console.warn('[CSH] Add page iframe failed:', addPageUrls[i], err);
             }
         }
         return null;
@@ -1250,14 +1352,17 @@
         }
         console.log('[CSH] buildDelHrefMap using id:', csId);
         var map = new Map();
-        var nextUrl = absoluteUrl('/' + csId + '?tab=PackageComponents&rowsperpage=5000');
+        // App origin, not the current page's: the classic components view
+        // doesn't render on *.salesforce-setup.com (issue: "Del URL not
+        // found ... in classic components view" on enhanced-domain orgs).
+        var nextUrl = new URL('/' + csId + '?tab=PackageComponents&rowsperpage=5000', appOriginForChangeSetView()).href;
         var safety = 200;
         var pageNum = 0;
         while (nextUrl && safety-- > 0) {
             pageNum++;
-            var r = await fetch(nextUrl, { credentials: 'include' });
+            var r = await fetchClassicPage(nextUrl);
             if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
-            var html = await r.text();
+            var html = r.text;
             var doc = new DOMParser().parseFromString(html, 'text/html');
             var rows = doc.querySelectorAll('table.list tr.dataRow');
             console.log('[CSH] components page', pageNum, ': finalUrl=', r.url, 'rows=', rows.length);
@@ -1371,10 +1476,13 @@
     // no confirm form to parse, so we stop after the GET succeeds.
     async function deleteViaDelHref(delHref) {
         var isOneShotRedirect = /\/setup\/own\/deleteredirect\.jsp/i.test(delHref);
-        var r = await fetch(delHref, { credentials: 'include', redirect: 'follow' });
+        // Del hrefs come from the classic components view on the app origin,
+        // which is cross-origin when this page is on *.salesforce-setup.com —
+        // proxy through the SW like the fetches that built the map.
+        var r = await fetchClassicPage(delHref);
         if (!r.ok) throw new Error('HTTP ' + r.status + ' on confirm page');
         if (isOneShotRedirect) return;
-        var html = await r.text();
+        var html = r.text;
         var doc = new DOMParser().parseFromString(html, 'text/html');
         var forms = doc.querySelectorAll('form');
         if (forms.length === 0) return; // already done
@@ -1389,7 +1497,10 @@
             }
         }
         if (!form) form = forms[0];
-        var action = new URL(form.getAttribute('action') || delHref, delHref).href;
+        // Resolve the form action against the URL the confirm page actually
+        // came back from (r.url), not the request URL — the fetch may have
+        // followed redirects.
+        var action = new URL(form.getAttribute('action') || delHref, r.url || delHref).href;
         var method = (form.getAttribute('method') || 'POST').toUpperCase();
         var body = new URLSearchParams();
         form.querySelectorAll('input[type="hidden"], input[type="text"]').forEach(function (inp) {
@@ -1397,13 +1508,7 @@
         });
         var submit = form.querySelector('input[type="submit"][name]');
         if (submit) body.append(submit.name, submit.value);
-        var r2 = await fetch(action, {
-            method: method,
-            credentials: 'include',
-            redirect: 'follow',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: body.toString()
-        });
+        var r2 = await postClassicForm(action, body.toString(), method);
         if (!r2.ok && !(r2.status >= 300 && r2.status < 400)) {
             throw new Error('HTTP ' + r2.status + ' on confirm POST');
         }
