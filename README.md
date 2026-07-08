@@ -1,6 +1,6 @@
 # Salesforce Change Set Helper Reloaded
 
-![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)
+![Version](https://img.shields.io/badge/version-3.1.4-blue.svg)
 ![Manifest](https://img.shields.io/badge/manifest-v3-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 
@@ -357,6 +357,7 @@ The extension requires these Chrome permissions:
 - **`identity`**: OAuth authentication for cross-org comparison
 - **`storage`**: Save user preferences and API version settings
 - **`offscreen`**: Create offscreen document for JSforce operations
+- **`cookies`**: Read the Salesforce session cookie (`sid`) on Salesforce domains so the extension can call the Metadata API as you (see Salesforce Configuration above)
 - **`host_permissions`**: Access Salesforce domains for metadata operations
 
 ---

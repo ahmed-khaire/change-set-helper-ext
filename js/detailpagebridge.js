@@ -20,13 +20,17 @@
     var OK_BUTTON_ID = 'simpleDialog0button0';
 
     window.addEventListener('message', function (ev) {
+        // Only same-window, same-origin messages: the content script posts to
+        // this very window, so anything from another window/origin (e.g. a
+        // hostile iframe) is not ours.
+        if (ev.source !== window || ev.origin !== window.location.origin) return;
         var data = ev.data;
         if (!data || data.__cshBulk !== true || data.source === 'page') return;
 
         function reply(payload) {
             window.postMessage(
                 Object.assign({ __cshBulk: true, source: 'page', mid: data.mid }, payload),
-                '*'
+                window.location.origin
             );
         }
 

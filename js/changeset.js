@@ -1294,6 +1294,21 @@ function processCompareResults(results, env, opts) {
         if (typeof idx === 'number') fullNameToRowIdx[componentRow.fullName] = idx;
     });
 
+    // Pre-index fullName → raw local lastModifiedDate. The visible "Last
+    // Modified Date" cell is day-formatted ("DD MMM YYYY"), so parsing it
+    // back yields midnight — comparing that against the target org's
+    // full-precision timestamp misclassified any same-calendar-day target
+    // edit as "newer in target". cshComponentRows keeps the raw value in
+    // .metadata (populated by cshApplyMetadataToComponentRows), so prefer
+    // it for the recency comparison below.
+    var fullNameToLocalDateMod = {};
+    cshComponentRows.forEach(function (componentRow) {
+        if (!componentRow || !componentRow.fullName) return;
+        if (componentRow.metadata && componentRow.metadata.lastModifiedDate) {
+            fullNameToLocalDateMod[componentRow.fullName] = componentRow.metadata.lastModifiedDate;
+        }
+    });
+
     // Track rows we actually mutated so a single invalidate+draw at the end
     // can re-sync DataTables' internal cache with what we wrote to the DOM.
     // Writing via cell().data() per-cell triggers an internal invalidation
@@ -1372,8 +1387,18 @@ function processCompareResults(results, env, opts) {
             //   csh-diff-newer-target → target is newer (deploying would REGRESS)
             //   csh-diff-same         → timestamps match (no-op deploy)
             if (compareColumnIndices.lastModifiedDate >= 0) {
-                var thisOrgDateMod = changeSetTable.cell(rowIdx, compareColumnIndices.lastModifiedDate).data();
-                var localMoment = convertToMoment(thisOrgDateMod);
+                // Prefer the raw full-precision local timestamp so both sides
+                // of the diff carry time-of-day. Fall back to parsing the
+                // day-formatted cell text (which floors to midnight) only for
+                // rows hydrated from a path that never captured metadata.
+                var localRawDateMod = fullNameToLocalDateMod[fullName];
+                var localMoment;
+                if (localRawDateMod) {
+                    localMoment = moment(new Date(localRawDateMod));
+                } else {
+                    var thisOrgDateMod = changeSetTable.cell(rowIdx, compareColumnIndices.lastModifiedDate).data();
+                    localMoment = convertToMoment(thisOrgDateMod);
+                }
                 var targetMoment = moment(dateMod);
                 var rowNode = changeSetTable.row(rowIdx).node();
                 if (rowNode) {
@@ -1425,7 +1450,9 @@ function processCompareResults(results, env, opts) {
         .append('<option value=""></option>');
 
     column.data().unique().sort().each(function (d) {
-        select.append('<option value="' + d + '">' + d + '</option>')
+        // .val()/.text() instead of HTML concat: values are org-controlled
+        // (e.g. user Names) and must not be parsed as HTML.
+        select.append($('<option>').val(d).text(d))
     });
 
     $("#editPage").removeClass("lowOpacity");
@@ -2168,7 +2195,9 @@ function basicTableInitComplete() {
                 })
 
             column.data().unique().sort().each(function (d, j) {
-                select.append('<option value="' + d + '">' + d + '</option>')
+                // .val()/.text() instead of HTML concat: values are org-controlled
+                // (e.g. user Names) and must not be parsed as HTML.
+                select.append($('<option>').val(d).text(d))
             });
         }
         ;
@@ -2268,7 +2297,9 @@ function tableInitComplete() {
                 });
 
             column.data().unique().sort().each(function (d, j) {
-                select.append('<option value="' + d + '">' + d + '</option>')
+                // .val()/.text() instead of HTML concat: values are org-controlled
+                // (e.g. user Names) and must not be parsed as HTML.
+                select.append($('<option>').val(d).text(d))
             });
         }
 
@@ -2281,6 +2312,42 @@ function tableInitComplete() {
                         .search($(this).val())
                         .draw();
                 });
+        }
+    });
+}
+
+// Rebuild every footer dropdown filter from the table's CURRENT data.
+// initComplete populates the dropdowns from the first ~1000 rows only, so
+// values that arrive via background pagination were silently unfilterable.
+// Only the <option> children are replaced — the <select> elements and their
+// change handlers stay untouched, so no handlers get duplicated. The user's
+// current selection is preserved when its value still exists. This includes
+// the Compare Modified By dropdown, which processCompareResults also
+// refreshes on its own after a compare run.
+function cshRebuildFilterDropdowns(tableApi) {
+    if (!tableApi) return;
+    tableApi.columns().every(function () {
+        var column = this;
+        var select = $(column.footer()).find('select.dtsearch');
+        if (!select.length) return;
+
+        var currentVal = select.val();
+        select.empty().append($('<option>').val(''));
+
+        column.data().unique().sort().each(function (d) {
+            // .val()/.text() instead of HTML concat: values are org-controlled
+            // (e.g. user Names) and must not be parsed as HTML.
+            select.append($('<option>').val(d).text(d))
+        });
+
+        // Restore the previous selection if that value still exists; the
+        // active column.search() is untouched either way, so an in-force
+        // filter keeps filtering even if its value vanished from the options.
+        if (currentVal) {
+            var stillExists = select.find('option').filter(function () {
+                return $(this).val() === currentVal;
+            }).length > 0;
+            if (stillExists) select.val(currentVal);
         }
     });
 }
@@ -3639,6 +3706,11 @@ function startPaginationWithMetadata() {
             // Redraw table to show final count
             if (changeSetTable) {
                 changeSetTable.draw();
+                // Every completion path (all pages loaded, user cancel, fetch
+                // error) funnels through here, so this is the one spot the
+                // dropdown filters need refreshing with values from the
+                // late-arriving pages.
+                cshRebuildFilterDropdowns(changeSetTable);
             }
 
             return;
@@ -4071,7 +4143,9 @@ $(document).ready(function () {
 });
 
 //Find out if they are logged in already
-chrome.runtime.sendMessage({'proxyFunction': 'getDeployUsername'}, function(username) {
+chrome.runtime.sendMessage({'proxyFunction': 'getDeployUsername'}, function(response) {
+	// Response is {username, orgId} (older shape was a bare string).
+	var username = response && (typeof response === 'string' ? response : response.username);
 	console.log(username);
 	if (username) {
 		//Then there is a logged in deploy user — hide both login paths

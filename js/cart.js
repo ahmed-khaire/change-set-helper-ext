@@ -84,13 +84,29 @@
     }
     function storageSet(obj) {
         return new Promise(function (resolve) {
-            if (!cshExtAlive()) { markExtDead(); resolve(); return; }
+            if (!cshExtAlive()) { markExtDead(); resolve(false); return; }
             try {
                 chrome.storage.local.set(obj, function () {
-                    if (chrome.runtime.lastError) markExtDead();
-                    resolve();
+                    var err = chrome.runtime.lastError;
+                    if (err) {
+                        // A quota failure is not extension death — flipping
+                        // the "Extension was reloaded" banner would be wrong
+                        // and non-actionable. Surface what the user can
+                        // actually do about it instead.
+                        if (/quota/i.test(err.message || '')) {
+                            window.cshToast && window.cshToast.show(
+                                'Cart storage is full — remove completed items or clear the cart, then try again.',
+                                { type: 'error', duration: 8000 }
+                            );
+                        } else {
+                            markExtDead();
+                        }
+                        resolve(false);
+                        return;
+                    }
+                    resolve(true);
                 });
-            } catch (_) { markExtDead(); resolve(); }
+            } catch (_) { markExtDead(); resolve(false); }
         });
     }
 
@@ -229,6 +245,43 @@
     var FLUSH_DEBOUNCE_MS = 150;
     var pendingAll = null;
     var flushTimer = null;
+    // Cross-tab merge bookkeeping. Content scripts run in every Setup tab
+    // (all_frames), so two tabs can hold the same change set at once. A
+    // blind full-blob write from one tab would clobber whatever the other
+    // tab flushed between our read and our write, so flushNow() re-reads
+    // storage and merges before writing. Deletions need explicit tracking
+    // or the merge would resurrect them from the other tab's copy:
+    //   removedUids     — item uids this tab deleted since its last flush.
+    //   replacedCartIds — change sets this tab rewrote wholesale (clear-all,
+    //                     mergeRelatedCarts); our version wins outright.
+    var removedUids = {};
+    var replacedCartIds = {};
+    // Bumped by saveCart so an in-flight flush can tell whether a newer
+    // mutation landed while its read/write was awaiting — if so it must not
+    // clear pendingAll/tombstones out from under that mutation's own flush.
+    var flushGen = 0;
+    var flushInFlight = null;
+
+    // Every item deletion routes through here so the flush-time merge knows
+    // the row is gone on purpose. Filters cart.items with `shouldRemove`,
+    // tombstones each dropped uid, and returns the dropped rows.
+    function dropCartItems(cart, shouldRemove) {
+        var dropped = [];
+        cart.items = cart.items.filter(function (it) {
+            if (shouldRemove(it)) { dropped.push(it); return false; }
+            return true;
+        });
+        dropped.forEach(function (it) {
+            if (it && it.uid) removedUids[it.uid] = true;
+        });
+        return dropped;
+    }
+
+    // Wholesale replacement — this tab's items array for the change set is
+    // authoritative; the merge must not pull rows back in from disk.
+    function markCartReplaced(changeSetId) {
+        if (changeSetId) replacedCartIds[changeSetId] = true;
+    }
 
     function scheduleFlush() {
         if (flushTimer) return;
@@ -238,18 +291,83 @@
         }, FLUSH_DEBOUNCE_MS);
     }
 
+    // Reconcile our snapshot with whatever is on disk at write time. Change
+    // sets only on disk are kept as-is (another tab owns them); change sets
+    // we replaced wholesale take our version; everything else merges per
+    // item uid — our row wins on a shared uid, disk-only rows survive
+    // unless we tombstoned them (deliberate removal) or they duplicate a
+    // component we already hold (same 15-char salesforceId staged
+    // independently in both tabs).
+    function mergeAllForFlush(disk, snap) {
+        var out = {};
+        var id;
+        for (id in disk) {
+            if (disk.hasOwnProperty(id)) out[id] = disk[id];
+        }
+        for (id in snap) {
+            if (!snap.hasOwnProperty(id)) continue;
+            var mine = snap[id];
+            var theirs = out[id];
+            if (!theirs || replacedCartIds[id] || !Array.isArray(theirs.items)) {
+                out[id] = mine;
+                continue;
+            }
+            var haveUid = {};
+            var haveSfId = {};
+            (mine.items || []).forEach(function (it) {
+                if (!it) return;
+                if (it.uid) haveUid[it.uid] = true;
+                if (it.salesforceId) haveSfId[String(it.salesforceId).slice(0, 15)] = true;
+            });
+            var items = (mine.items || []).slice();
+            theirs.items.forEach(function (it) {
+                if (!it || !it.uid) return;
+                if (haveUid[it.uid] || removedUids[it.uid]) return;
+                if (it.salesforceId && haveSfId[String(it.salesforceId).slice(0, 15)]) return;
+                items.push(it);
+            });
+            var merged = Object.assign({}, theirs, mine);
+            merged.items = items;
+            merged.form = Object.assign({}, theirs.form || {}, mine.form || {});
+            recountCart(merged);
+            out[id] = merged;
+        }
+        return out;
+    }
+
     async function flushNow() {
+        // Serialize flushes: the debounce timer and a {flush:true} caller
+        // can overlap, and interleaved read-merge-write cycles would clobber
+        // each other just like two tabs would.
+        while (flushInFlight) await flushInFlight;
         if (!pendingAll) return;
-        var snap = pendingAll;
-        pendingAll = null;
-        if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-        await storageSet({ [CART_KEY]: snap });
+        flushInFlight = (async function () {
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            var snap = pendingAll;
+            var gen = flushGen;
+            var s = await storageGet([CART_KEY]);
+            var merged = mergeAllForFlush(s[CART_KEY] || {}, snap);
+            var ok = await storageSet({ [CART_KEY]: merged });
+            // Only reset the cache/tombstones after a clean write with no
+            // saveCart() during the awaits above — a mid-flight mutation has
+            // its own flush queued and still needs them, and a failed write
+            // (quota) keeps state around so a later flush can retry once the
+            // user frees space. Re-applying tombstones is idempotent.
+            if (ok && flushGen === gen) {
+                pendingAll = null;
+                removedUids = {};
+                replacedCartIds = {};
+            }
+        })();
+        try { await flushInFlight; } finally { flushInFlight = null; }
     }
 
     // beforeunload can't await a Promise, but chrome.storage.local.set is
     // fire-and-forget from our side — the runtime will still persist the
     // write even after the tab is gone. Good enough for typical navigation;
-    // we accept losing the last 150ms of changes on a hard crash.
+    // we accept losing the last 150ms of changes on a hard crash. This is a
+    // blind (unmerged) write — the read half of the merge can't run
+    // synchronously here — so it carries the same small cross-tab exposure.
     window.addEventListener('beforeunload', function () {
         if (pendingAll && cshExtAlive()) {
             try { chrome.storage.local.set({ [CART_KEY]: pendingAll }); } catch (_) {}
@@ -286,6 +404,7 @@
     async function saveCart(all, opts) {
         opts = opts || {};
         pendingAll = all;
+        flushGen++; // an in-flight flush must not clear this newer state
         // Cached status counts on each cart so renders avoid re-iterating
         // the whole item list on every frame. Every mutation flows through
         // saveCart so this is the single authoritative recount site.
@@ -406,6 +525,9 @@
                 form: Object.assign({}, forms, existing.form || {})
             };
         });
+        // Every key was rebuilt wholesale; the flush merge must take our
+        // version rather than re-merging per uid with whatever is on disk.
+        keys.forEach(markCartReplaced);
         await saveCart(all, { flush: true });
         return { merged: true, keys: keys, count: items.length };
     }
@@ -540,9 +662,8 @@
                 cart.items.push(existing);
             }
         } else {
-            cart.items = cart.items.filter(function (it) {
-                if (!rowKey(it)) return true;
-                return it.status !== 'staged' && it.status !== 'failed';
+            dropCartItems(cart, function (it) {
+                return rowKey(it) && (it.status === 'staged' || it.status === 'failed');
             });
         }
 
@@ -622,12 +743,12 @@
         // duplicates.
         var seenKeys = {};
         var dupesMerged = 0;
-        cart.items = cart.items.filter(function (it) {
+        dropCartItems(cart, function (it) {
             if (it.salesforceId) it.salesforceId = sfId15(it.salesforceId);
-            if (!it.type || !it.salesforceId) return true;
+            if (!it.type || !it.salesforceId) return false;
             var k = key(it.salesforceId);
             var prev = seenKeys[k];
-            if (!prev) { seenKeys[k] = it; return true; }
+            if (!prev) { seenKeys[k] = it; return false; }
             dupesMerged++;
             var preferThis = (prev.status === 'done' && it.status !== 'done');
             if (preferThis) {
@@ -639,18 +760,16 @@
             }
             if (!prev.name && it.name) prev.name = it.name;
             if (!prev.fullName && it.fullName) prev.fullName = it.fullName;
-            return false;
+            return true;
         });
         if (dupesMerged > 0) {
             console.log('cshCart.syncItemsFromServer: merged', dupesMerged, 'pre-existing duplicate row(s)');
         }
         if (!items.length) {
             if (options.authoritative && options.allowEmptyAuthoritative) {
-                var beforeEmptyPrune = cart.items.length;
-                cart.items = cart.items.filter(function (it) {
-                    return it.status !== 'done';
-                });
-                var emptyPruned = beforeEmptyPrune - cart.items.length;
+                var emptyPruned = dropCartItems(cart, function (it) {
+                    return it.status === 'done';
+                }).length;
                 await saveCart(all);
                 return { inserted: 0, promoted: 0, kept: 0, pruned: emptyPruned };
             }
@@ -711,13 +830,11 @@
             inserted++;
         });
         if (options.authoritative) {
-            var beforeLen = cart.items.length;
-            cart.items = cart.items.filter(function (it) {
-                if (it.status !== 'done') return true;
-                if (!it.type || !it.salesforceId) return true;
-                return inputKeys[key(it.salesforceId)] === true;
-            });
-            pruned = beforeLen - cart.items.length;
+            pruned = dropCartItems(cart, function (it) {
+                if (it.status !== 'done') return false;
+                if (!it.type || !it.salesforceId) return false;
+                return inputKeys[key(it.salesforceId)] !== true;
+            }).length;
         }
         await saveCart(all);
         if (window.cshDb) {
@@ -787,11 +904,9 @@
 
     async function removeItem(changeSetId, uid) {
         var { all, cart } = await getCart(changeSetId);
-        var removed = null;
-        cart.items = cart.items.filter(function (it) {
-            if (it.uid === uid) { removed = it; return false; }
-            return true;
-        });
+        var removed = dropCartItems(cart, function (it) {
+            return it.uid === uid;
+        })[0] || null;
         await saveCart(all);
         // On the Add page, mirror the cart removal to the row's checkbox so
         // the table UI stops showing a ticked row for something the user
@@ -839,19 +954,18 @@
             byId[sfId15(it.id)] = it;
         });
 
-        var s = await storageGet([CART_KEY]);
-        var all = s[CART_KEY] || {};
+        // Prefer the unflushed snapshot when we have one — reading disk here
+        // would silently drop mutations still waiting on the debounce.
+        var s = pendingAll ? null : await storageGet([CART_KEY]);
+        var all = pendingAll || (s && s[CART_KEY]) || {};
         var removed = 0;
         changeSetIds.forEach(function (changeSetId) {
             var cart = all[changeSetId];
             if (!cart || !Array.isArray(cart.items)) return;
-            cart.items = cart.items.filter(function (row) {
-                if (row.status !== 'done' || !row.salesforceId) return true;
-                var match = byId[sfId15(row.salesforceId)];
-                if (!match) return true;
-                removed++;
-                return false;
-            });
+            removed += dropCartItems(cart, function (row) {
+                if (row.status !== 'done' || !row.salesforceId) return false;
+                return !!byId[sfId15(row.salesforceId)];
+            }).length;
         });
 
         if (removed > 0) await saveCart(all, { flush: true });
@@ -976,8 +1090,8 @@
     async function clearType(changeSetId, type) {
         type = normalizeCartType(type);
         var { all, cart } = await getCart(changeSetId);
-        cart.items = cart.items.filter(function (it) {
-            return !(normalizeCartType(it.type) === type && it.status === 'staged');
+        dropCartItems(cart, function (it) {
+            return normalizeCartType(it.type) === type && it.status === 'staged';
         });
         await saveCart(all);
     }
@@ -990,10 +1104,10 @@
     async function clearDone(changeSetId, opts) {
         opts = opts || {};
         var { all, cart } = await getCart(changeSetId);
-        cart.items = cart.items.filter(function (it) {
-            if (it.status !== 'done') return true;
-            if (opts.keepServerSynced && it.source === 'server-sync') return true;
-            return false;
+        dropCartItems(cart, function (it) {
+            if (it.status !== 'done') return false;
+            if (opts.keepServerSynced && it.source === 'server-sync') return false;
+            return true;
         });
         await saveCart(all);
     }
@@ -1004,8 +1118,8 @@
     // the user's in-flight selections.
     async function clearStaged(changeSetId) {
         var { all, cart } = await getCart(changeSetId);
-        cart.items = cart.items.filter(function (it) {
-            return it.status !== 'staged' && it.status !== 'failed';
+        dropCartItems(cart, function (it) {
+            return it.status === 'staged' || it.status === 'failed';
         });
         await saveCart(all);
         uncheckAllRowCheckboxes();
@@ -1207,7 +1321,9 @@
                 seen[it.salesforceId] = true;
             } else if (visibleUnchecked[it.salesforceId]) {
                 // Row is visible and explicitly unticked — drop from cart.
-                // (Do nothing — item is intentionally omitted from `kept`.)
+                // Tombstone the uid so the flush merge doesn't restore it
+                // from another tab's copy.
+                if (it.uid) removedUids[it.uid] = true;
             } else {
                 // Row isn't in the DOM at all (filtered / paged away). Preserve
                 // cart state; user hasn't interacted with this item in this view.
@@ -2549,12 +2665,13 @@
                 await clearDone(changeSetId);
             } else if (action === 'all') {
                 if (!confirm('Clear every cart item — staged, completed, and failed? This cannot be undone.')) return;
-                var s = await storageGet([CART_KEY]);
-                var all = s[CART_KEY] || {};
-                if (all[changeSetId]) {
-                    all[changeSetId].items = [];
-                    await saveCart(all);
-                }
+                // Re-read via getCart so an unflushed snapshot isn't lost,
+                // and mark the wipe wholesale so the flush merge doesn't
+                // restore rows from another tab's copy.
+                var fresh = await getCart(changeSetId);
+                fresh.cart.items = [];
+                markCartReplaced(changeSetId);
+                await saveCart(fresh.all);
                 uncheckAllRowCheckboxes();
             }
         });
@@ -2861,7 +2978,9 @@
                     '<div class="csh-cart-item-name">' + escapeHtml(primary) + '</div>' +
                     (secondary && !virtualized ? '<div class="csh-cart-item-subname">' + escapeHtml(secondary) + '</div>' : '') +
                   '</div>' +
-                  '<span class="csh-cart-item-status">' + statusLabel(it) + '</span>' +
+                  // escapeHtml: statusLabel embeds it.error, which can contain a raw
+                  // slice of an HTTP response body (see cshSubmitCartBatch).
+                  '<span class="csh-cart-item-status">' + escapeHtml(statusLabel(it)) + '</span>' +
                   (it.status === 'done'
                     ? '<button class="csh-cart-remove" data-server-remove="1" title="' + escapeAttr(removeTitle(it)) + '">x</button>'
                     : '') +
@@ -3356,7 +3475,14 @@
             try {
                 chrome.storage.onChanged.addListener(function (changes, area) {
                     if (area !== 'local') return;
-                    if (changes[CART_KEY]) renderPanel();
+                    if (changes[CART_KEY]) {
+                        // Another tab (or the worker) wrote the cart. If this
+                        // tab has no unflushed mutations, drop the write-back
+                        // cache so the next getCart() reads the fresh blob
+                        // instead of serving a stale snapshot.
+                        if (pendingAll && !flushTimer && !flushInFlight) pendingAll = null;
+                        renderPanel();
+                    }
                 });
             } catch (_) { markExtDead(); }
         }

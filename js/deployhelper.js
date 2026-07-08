@@ -27,6 +27,13 @@ var cshDpPollTimer = null;
 var cshDpPollState = null;              // {deployId, orgId, instanceUrl, accessToken, apiVersion}
 var cshDpPollInFlight = false;          // one poll at a time
 
+// The saved-org id THIS tab connected as the deploy target. The actual
+// connection lives in the shared offscreen document, where another tab can
+// silently repoint it at a different org. Every deploy/quickDeploy sends
+// this id as expectedOrgId so background.js can refuse to deploy through a
+// connection that no longer matches what this tab's UI shows.
+var cshConnectedDeployOrgId = null;
+
 // Button label tracks the current deploy-mode selector so "Please wait..." →
 // reset always returns to a label that matches what will happen on the next
 // click. Falls back to "Validate" if the selector isn't rendered yet (before
@@ -698,7 +705,8 @@ function testDeploy() {
 	console.log(opts);
 	$('#deployTest').val ("Please wait...");
 	$('#deployTest').prop('disabled',true);
-	$('#deployContent').html('Getting ' + changename +  ' metadata...');
+	// .text(), not .html(): changename is the org-controlled change set label.
+	$('#deployContent').text('Getting ' + changename +  ' metadata...');
 	$('#quickDeploy').hide();
 	$('#cancelDeploy').hide();
 	$('#json-renderer').jsonViewer();
@@ -711,10 +719,12 @@ function testDeploy() {
 	var sid = (window.cshSession && window.cshSession.current && window.cshSession.current()) || sessionId;
 	var port = chrome.runtime.connect({name: "deployHandler"});
 
-	port.postMessage({'proxyFunction': "deploy", 'opts': opts, "changename": changename, "sessionId":sid, "serverUrl":serverUrl});
+	port.postMessage({'proxyFunction': "deploy", 'opts': opts, "changename": changename, "sessionId":sid, "serverUrl":serverUrl, "expectedOrgId": cshConnectedDeployOrgId});
 	port.onMessage.addListener(function(msg) {
 		console.log('Listining!');
-		console.log(msg);
+		// Never log msg wholesale: the handoff message carries the target-org
+		// access token.
+		console.log(msg.response || (msg.handoff ? '(handoff)' : msg));
 		var response = msg.response;
 		var err = msg.err;
 		if (err) {
@@ -723,7 +733,12 @@ function testDeploy() {
 			cshUpdateJsonBadge(typeof err === 'string' ? err : (err && err.message) || 'error');
 			cshBindJsonCopy();
 			$('#cancelDeploy').hide();
-			$('#deployContent').html('<pre><code>' + JSON.stringify(err, null, 2) + '</code></pre>');
+			// Build via .text(): err can embed org-controlled strings
+			// (validation rule messages, Apex errors) that must not be
+			// parsed as HTML.
+			$('#deployContent').empty().append(
+				$('<pre>').append($('<code>').text(JSON.stringify(err, null, 2)))
+			);
 			cshStopPageDeployPoll();
 			cshFinishDeployProgress('Failed');
 			$('#deployTest').prop('disabled', false).val(cshDeployButtonLabel());
@@ -892,6 +907,7 @@ function cshOnConnectSavedOrg() {
 		$("#loginSection").hide();
 		$("#loggedInUsername").html(response.username || '');
 		$("#validateSection").show();
+		cshConnectedDeployOrgId = response.orgId || null;
 	});
 }
 
@@ -954,6 +970,7 @@ async function cshStartNewOrgLogin(env, customHost) {
 		$("#loginSection").hide();
 		$("#loggedInUsername").html(response.username || '');
 		$("#validateSection").show();
+		cshConnectedDeployOrgId = response.orgId || null;
 		// Keep the saved-orgs list fresh for the next page visit; don't
 		// block UI on this.
 		cshRefreshSavedOrgsUI().catch(function () {});
@@ -982,11 +999,15 @@ function oauthLogin() {
 // last login), we skip the login UI; otherwise we render the saved-orgs
 // dropdown.
 function cshDeployHelperInitLoginState() {
-	chrome.runtime.sendMessage({'proxyFunction': 'getDeployUsername'}, function(username) {
+	chrome.runtime.sendMessage({'proxyFunction': 'getDeployUsername'}, function(response) {
+		// Older shape was a bare username string; current shape is
+		// {username, orgId} so this tab can pin the org it will deploy to.
+		var username = response && (typeof response === 'string' ? response : response.username);
 		if (username) {
 			$("#loginSection").hide();
 			$("#loggedInUsername").html(username);
 			$("#validateSection").show();
+			cshConnectedDeployOrgId = (response && response.orgId) || null;
 			return;
 		}
 		cshRefreshSavedOrgsUI().catch(function (e) {
@@ -1003,6 +1024,7 @@ function deployLogin() {
 }
 
 function deployLogout() {
+	cshConnectedDeployOrgId = null;
 	chrome.runtime.sendMessage({'oauth': 'deployLogout'}, function(response) {
 		console.log(response);
 			//do nothing else
@@ -1092,10 +1114,12 @@ function quickDeploy() {
 		cshSetDpPhase('Queued in target org');
 
 		var port = chrome.runtime.connect({name: "quickDeployHandler"});
-		port.postMessage({'proxyFunction': "quickDeploy", "currentId": currentId});
+		port.postMessage({'proxyFunction': "quickDeploy", "currentId": currentId, "expectedOrgId": cshConnectedDeployOrgId});
 		port.onMessage.addListener(function (msg) {
 			console.log('Listining!');
-			console.log(msg);
+			// Never log msg wholesale: the handoff message carries the
+			// target-org access token.
+			console.log(msg.response || (msg.handoff ? '(handoff)' : msg));
 			var err = msg.err;
 			if (err) {
 				console.debug(err);

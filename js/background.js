@@ -67,6 +67,35 @@ try {
     });
 } catch (_) { /* session storage may not be available in older Chrome */ }
 
+// The deploy connection is a single shared slot in the one offscreen
+// document, so a second tab clicking "Connect" repoints it for every tab.
+// Before any deploy, compare the org id the calling tab believes it
+// connected (expectedOrgId) against the org the shared connection actually
+// points at; return an error string on mismatch so the caller refuses to
+// deploy into the wrong org. Returns null when the check passes or when the
+// caller predates the check (no expectedOrgId).
+async function cshGetActiveDeployOrgId() {
+    if (cshActiveDeployOrgId) return cshActiveDeployOrgId;
+    // SW may have restarted and the async restore above not run yet.
+    try {
+        var items = await chrome.storage.session.get(['cshActiveDeployOrgId']);
+        return (items && items.cshActiveDeployOrgId) || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function cshCheckExpectedDeployOrg(expectedOrgId) {
+    if (!expectedOrgId) return null;
+    var active = await cshGetActiveDeployOrgId();
+    if (active && active !== expectedOrgId) {
+        return 'Deploy blocked: the target-org connection was switched to a different org ' +
+            '(usually by another tab of this extension) after this page connected. ' +
+            'Re-connect the target org here, verify it, and try again.';
+    }
+    return null;
+}
+
 // Connected App Consumer Key. Default is the self-hosted Connected App
 // deployed to the Change Set Helper dev org (Metadata API; see
 // sfdx-connected-app/). Users can override via Options → Connected App
@@ -107,27 +136,6 @@ function cshNormalizeHost(raw) {
         var u = new URL(host);
         return u.protocol + '//' + u.host;
     } catch (_) { return null; }
-}
-
-// Auth URLs are built lazily per request so the latest cshClientId is used.
-// environment ∈ {'sandbox', 'prod', 'mydomain'}; customHost applies only to
-// 'mydomain' and must be an https origin.
-function buildAuthUrl(environment, customHost) {
-    var host;
-    if (environment === 'mydomain') {
-        host = cshNormalizeHost(customHost);
-        if (!host) host = 'https://login.salesforce.com'; // safe fallback
-    } else if (environment === 'prod') {
-        host = 'https://login.salesforce.com';
-    } else {
-        host = 'https://test.salesforce.com';
-    }
-    return host + '/services/oauth2/authorize' +
-        '?display=page' +
-        '&prompt=select_account' +
-        '&response_type=token' +
-        '&client_id=' + encodeURIComponent(cshClientId) +
-        '&redirect_uri=' + encodeURIComponent(redirectUri);
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +887,11 @@ chrome.runtime.onConnect.addListener(function (port) {
         startKeepAlive();
         port.onMessage.addListener(async function (request) {
             if (request.proxyFunction == "deploy") {
+                var orgMismatch = await cshCheckExpectedDeployOrg(request.expectedOrgId);
+                if (orgMismatch) {
+                    port.postMessage({response: 'Error', err: orgMismatch});
+                    return;
+                }
                 await deploy(port, request.opts, request.changename, request.sessionId, request.serverUrl);
             }
         });
@@ -891,6 +904,11 @@ chrome.runtime.onConnect.addListener(function (port) {
         startKeepAlive();
         port.onMessage.addListener(async function (request) {
             if (request.proxyFunction == "quickDeploy") {
+                var orgMismatch = await cshCheckExpectedDeployOrg(request.expectedOrgId);
+                if (orgMismatch) {
+                    port.postMessage({result: null, response: null, err: orgMismatch});
+                    return;
+                }
                 await quickDeploy(port, request.currentId);
             }
         });
@@ -964,12 +982,6 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         });
         sendResponse({ ok: true });
         return false;
-    }
-
-    // Handle OAuth requests (these stay in service worker as chrome.identity works here)
-    if (request.oauth == "request") {
-        getSfdcOauth2(sendResponse, request.environment);
-        return true;
     }
 
     if (request.type == "cshAuthLogin") {
@@ -1335,11 +1347,6 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
-    if (request.oauth == "connectToLocalOauth") {
-        connectToLocalOauth(sendResponse);
-        return true;
-    }
-
     if (request.oauth == "deployLogout") {
         sendToOffscreen({action: 'deployLogout'}).then(() => {
             sendResponse({success: true});
@@ -1467,8 +1474,12 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
     }
 
     if (request.proxyFunction == "getDeployUsername") {
-        sendToOffscreen({action: 'getDeployUsername'}).then(response => {
-            sendResponse(response.username);
+        sendToOffscreen({action: 'getDeployUsername'}).then(async response => {
+            // Include the active org id so the page can pin which org this
+            // connection points at (see cshCheckExpectedDeployOrg).
+            sendResponse(response.username
+                ? { username: response.username, orgId: await cshGetActiveDeployOrgId() }
+                : null);
         }).catch(err => {
             console.error('Error in getDeployUsername:', err);
             sendResponse(null);
@@ -1510,63 +1521,6 @@ async function setLocalConn(sendResponse, authValue, serverUrl, authMode, instan
         console.error('Error in setLocalConn:', err);
         sendResponse({error: err.message});
     }
-}
-
-function connectToLocalOauth(sendResponse) {
-    connectToOrg(sendResponse, 'sandbox', 'local');
-}
-
-function connectToOrg(sendResponse, environment, connType, customHost) {
-    var auth_url = buildAuthUrl(environment, customHost);
-
-    // Keep the service worker alive while the user interacts with the OAuth
-    // popup. 30-second idle timers in MV3 can otherwise drop the pending
-    // callback if the user pauses for 2FA / password managers / SSO flows.
-    startKeepAlive();
-    chrome.identity.launchWebAuthFlow({'url': auth_url, 'interactive': true}, async function (redirect_url) {
-        try {
-            if (chrome.runtime.lastError) {
-                console.log(chrome.runtime.lastError.message);
-                sendResponse({'oauth': 'response', 'error': chrome.runtime.lastError.message});
-                return;
-            }
-
-            try {
-                var oauthtoken = getAccessToken(redirect_url);
-                var instanceUrl = getInstanceUrl(redirect_url);
-
-                // Send credentials to offscreen document to create connection
-                const response = await sendToOffscreen({
-                    action: 'connectToOrg',
-                    environment: environment,
-                    connType: connType,
-                    instanceUrl: instanceUrl,
-                    accessToken: oauthtoken
-                });
-
-                if (response.error) {
-                    sendResponse({'oauth': 'response', 'error': response.error});
-                } else {
-                    sendResponse({'oauth': 'response', 'username': response.username});
-                }
-            } catch (err) {
-                console.error('Error in connectToOrg:', err);
-                sendResponse({'oauth': 'response', 'error': err.message});
-            }
-        } finally {
-            stopKeepAlive();
-        }
-    });
-}
-
-function getAccessToken(url) {
-    var subStr = url.match("#access_token=(.*?)&");
-    return (decodeURIComponent(subStr[1]));
-}
-
-function getInstanceUrl(url) {
-    var subStr = url.match("instance_url=(.*?)&");
-    return (decodeURIComponent(subStr[1]));
 }
 
 async function deploy(port, opts, changename, sessionId, serverUrl) {

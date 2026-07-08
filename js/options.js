@@ -81,6 +81,13 @@ function renderResult(html) {
     byId('diagResults').innerHTML = html;
 }
 
+// The authorization URL built by the most recent diagnostic run. The "Open
+// this URL in a new tab" button lives inside #diagResults, whose innerHTML
+// is replaced on every renderResult() — so the button's click handling is
+// delegated (see wireDiagnostic) and reads the URL from here instead of a
+// listener bound to a node that gets destroyed.
+var cshDiagAuthUrl = null;
+
 function resultLine(ok, message, extra) {
     var cls = ok === true ? 'check-pass'
             : ok === false ? 'check-fail'
@@ -157,8 +164,7 @@ async function runDiagnostic() {
         '</details>'
     );
     renderResult(lines.join(''));
-    var openBtn = byId('openAuthUrlBtn');
-    if (openBtn) openBtn.addEventListener('click', function () { window.open(authUrl, '_blank'); });
+    cshDiagAuthUrl = authUrl;
 
     var redirectResult;
     try {
@@ -356,6 +362,13 @@ function wireDiagnostic() {
 
     byId('diagEnvKind').addEventListener('change', function () {
         byId('diagMyDomain').style.display = this.value === 'mydomain' ? '' : 'none';
+    });
+    // Delegated: the button is re-created by every renderResult() call
+    // (including the error path it exists to help with), so a listener on
+    // the button node itself would be lost with the innerHTML swap.
+    byId('diagResults').addEventListener('click', function (ev) {
+        var btn = ev.target && ev.target.closest && ev.target.closest('#openAuthUrlBtn');
+        if (btn && cshDiagAuthUrl) window.open(cshDiagAuthUrl, '_blank');
     });
     byId('resetClientId').addEventListener('click', function () {
         byId('diagClientId').value = DEFAULT_CLIENT_ID;

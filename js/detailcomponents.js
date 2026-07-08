@@ -497,6 +497,8 @@
         if (pageBridgeInjected) return;
         pageBridgeInjected = true;
         window.addEventListener('message', function (ev) {
+            // Bridge replies come from this same window/origin only.
+            if (ev.source !== window || ev.origin !== window.location.origin) return;
             var d = ev.data;
             if (!d || d.__cshBulk !== true || d.source !== 'page') return;
             var pending = pendingDeletes[d.mid];
@@ -1549,7 +1551,7 @@
                     reject(new Error('bridge ping timeout'));
                 }
             }, 3000);
-            window.postMessage({ __cshBulk: true, cmd: 'ping', mid: mid }, '*');
+            window.postMessage({ __cshBulk: true, cmd: 'ping', mid: mid }, window.location.origin);
         });
     }
 

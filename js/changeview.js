@@ -19,7 +19,12 @@
     var changeSetTable = null;
     var totalLoadedRows = 0;
     var totalExpectedRows = null; // populated once we scrape "N-M of X" footer
-    var fetchCancelled = false;
+    // Two independent cancel flags: the pagination progress pill's Cancel
+    // used to share one flag with the remove-modal worker, so cancelling the
+    // page fetch silently no-opped every later bulk remove (it reported
+    // "Removed 0" as success).
+    var paginationCancelled = false;
+    var removeCancelled = false;
     var selectionCount = 0;
     var CONCURRENCY = 4;
 
@@ -172,7 +177,7 @@
             '</div>';
         document.body.appendChild(progressEl);
         progressEl.querySelector('.csh-cv-progress-cancel').addEventListener('click', function () {
-            fetchCancelled = true;
+            paginationCancelled = true;
             hideProgress(400);
         });
         return progressEl;
@@ -209,7 +214,7 @@
         ensureProgressPill();
         updateProgress();
         var safetyMax = 200; // cap at 200 pages to avoid infinite loops on a broken scrape
-        while (nextHref && !fetchCancelled && safetyMax-- > 0) {
+        while (nextHref && !paginationCancelled && safetyMax-- > 0) {
             try {
                 var resp = await fetch(nextHref, { credentials: 'include' });
                 if (!resp.ok) { console.warn('changeview: page fetch failed', resp.status); break; }
@@ -381,6 +386,7 @@
         if (targets.length === 0) return;
         if (!confirm('Remove ' + targets.length + ' component(s) from this change set? This cannot be undone.')) return;
 
+        removeCancelled = false;
         showRemoveModal(targets.length);
 
         var queue = targets.slice();
@@ -388,7 +394,7 @@
         var failures = [];
 
         async function worker() {
-            while (queue.length && !fetchCancelled) {
+            while (queue.length && !removeCancelled) {
                 var cb = queue.shift();
                 var delHref = cb.getAttribute('data-del-href');
                 var cid = cb.getAttribute('data-cid') || '(unknown)';
@@ -489,11 +495,11 @@
             '</div>';
         document.body.appendChild(modal);
         modal.querySelector('.csh-cv-modal-cancel').addEventListener('click', function () {
-            fetchCancelled = true;
+            removeCancelled = true;
         });
         modal.querySelector('.csh-cv-modal-close').addEventListener('click', function () {
             modal.remove();
-            fetchCancelled = false;
+            removeCancelled = false;
         });
     }
 
