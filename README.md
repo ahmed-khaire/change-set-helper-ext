@@ -502,7 +502,15 @@ This project builds upon the original work by Susan Bohme. Please respect the or
 
 ## 📊 Version History
 
-### v3.1.0 (Current)
+### v3.1.5 (Current)
+- 🐛 Fixed component removal and cart sync on enhanced-domain (Setup-domain) orgs
+- 🐛 Fixed Lightning iframe + Setup-domain cart sync issues
+- 🔒 Restricted messaging to trusted HTTPS Salesforce domains
+- 🔒 Security and correctness fixes from full-repo review
+- ⚡ Large-org performance optimization
+- 🔧 Updated Options page API version placeholder to 66.0
+
+### v3.1.0
 - ✨ Select components from different types and add them in one go
 - ✨ See everything in your change set without leaving the add screen
 - ✨ Validate and deploy directly to other orgs
