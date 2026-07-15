@@ -1,8 +1,9 @@
 # Salesforce Change Set Helper Reloaded
 
-![Version](https://img.shields.io/badge/version-3.1.5-blue.svg)
+![Chrome Web Store Version](https://img.shields.io/chrome-web-store/v/gdjfanbphogooppaefebaaoohdcigpoi?logo=googlechrome)
 ![Manifest](https://img.shields.io/badge/manifest-v3-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
+![Chrome Web Store Rating](https://img.shields.io/chrome-web-store/rating/gdjfanbphogooppaefebaaoohdcigpoi?logo=googlechrome)
 
 A powerful Chrome Extension that enhances Salesforce change set functionality with advanced features like last modified dates, sorting, searching, validation, deployment, and cross-org comparison capabilities.
 
