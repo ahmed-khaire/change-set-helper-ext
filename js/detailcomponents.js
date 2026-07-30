@@ -255,6 +255,17 @@
             throw new Error('Could not resolve 033 MetadataPackage id for authoritative sync');
         }
         var items = [];
+        // Whether we walked the pagination chain to its natural end. A page
+        // that fails to parse half-way through leaves us holding a PARTIAL
+        // membership list, which must never be used as an authoritative claim
+        // — pruning against it deletes every component on the pages we never
+        // read. Callers gate their prune on this.
+        var complete = true;
+        // Set only when the classic view positively told us the change set has
+        // no components (its "No package components defined" placeholder).
+        // Distinguishes "user emptied the set" from "our scrape broke", which
+        // otherwise both look like a zero-length item list.
+        var emptyConfirmed = false;
         // App origin, not the current page's — see buildDelHrefMap.
         var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOriginForChangeSetView()).href;
         var safety = 200;
@@ -270,6 +281,7 @@
                 if (pageNum === 1) {
                     throw new Error('No table.list on classic components view (' + r.url + ')');
                 }
+                complete = false;
                 break;
             }
             // The classic view has different header names than the
@@ -288,6 +300,14 @@
                 });
             }
             var rows = table.querySelectorAll('tr.dataRow');
+            // Empty Package Components view renders table.list with a
+            // <th class="noRowsHeader">No package components defined</th>
+            // instead of data rows. Same marker cart.js:syncFromChangeSetView
+            // keys off — verified against a live org.
+            if (pageNum === 1 && rows.length === 0) {
+                emptyConfirmed = !!table.querySelector('.noRowsHeader') ||
+                    /no (records to display|package components defined)/i.test(table.textContent || '');
+            }
             var dropped = { noCid: 0, noType: 0 };
             rows.forEach(function (row) {
                 // Prefer Del link (its ?cid= query is the canonical component
@@ -298,7 +318,12 @@
                 // Prefer componentId below; href is kept for removeHref only.
                 var href = findDelLinkInRow(row);
                 var componentId = findCidInRowAnchors(row, packageId, idx.name);
-                var cid = componentId || extractCidFromDelHref(href);
+                // Same three-way fallback cart.js:fetchChangeSetViewItems uses.
+                // Without the hidden-field probe this scraper dropped rows the
+                // Add-page scraper could read, and a dropped row now costs us
+                // the authoritative prune (see the `complete` gate below).
+                var fieldId = findCidInRowFields(row, packageId);
+                var cid = componentId || fieldId || extractCidFromDelHref(href);
                 if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
@@ -313,14 +338,39 @@
                 }
                 items.push(it);
             });
+            var keptOnPage = rows.length - dropped.noCid - dropped.noType;
             console.log('[CSH] authoritative sync page', pageNum,
                 ': rows=', rows.length,
-                'kept=', rows.length - dropped.noCid - dropped.noType,
+                'kept=', keptOnPage,
                 'dropped=', dropped, 'headerIdx=', idx);
+            // Rows were rendered but we understood none of them. That is a
+            // parse failure, not an empty change set — most often the header
+            // row didn't yield a Type column index (localized org, renamed
+            // column, changed markup), so every row fell out as noType.
+            // Returning [] here would let the caller's authoritative prune
+            // wipe the user's entire cart inventory, so fail loudly instead.
+            if (rows.length > 0 && keptOnPage === 0) {
+                throw new Error('Parsed ' + rows.length + ' component row(s) on page ' + pageNum +
+                    ' but understood none (dropped noCid=' + dropped.noCid +
+                    ', noType=' + dropped.noType + ', headerIdx=' + JSON.stringify(idx) +
+                    '). Refusing to report an empty change set.');
+            }
+            // ANY dropped row means this list is not a provably complete
+            // membership claim. Pruning against it would delete the components
+            // we failed to parse — the same data loss as the all-dropped case,
+            // just partial, and it survives the throw above because one
+            // readable row is enough to look "successful". Forfeit the prune
+            // and sync additively instead; the log above names the cause.
+            if (dropped.noCid > 0 || dropped.noType > 0) {
+                complete = false;
+            }
             var nextHref = findNextPageHrefInDoc(doc);
             nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
         }
-        return items;
+        // Ran out of the pagination safety budget with pages still pending —
+        // the list we hold is partial, same hazard as a mid-chain parse break.
+        if (nextUrl && safety <= 0) complete = false;
+        return { items: items, complete: complete, emptyConfirmed: emptyConfirmed };
     }
 
     async function hasCachedMembership(keys) {
@@ -387,7 +437,35 @@
                 setSync('idle');
                 return true;
             }
-            var all = await fetchAllChangeSetComponents(csId, packageId);
+            var scrape = await fetchAllChangeSetComponents(csId, packageId);
+            var all = scrape.items;
+            // An authoritative claim is only safe when we read the WHOLE
+            // membership list. A partial scrape (pagination broke mid-chain)
+            // must sync additively — pruning against it would delete every
+            // component sitting on a page we never read.
+            var authoritative = scrape.complete;
+            // And an EMPTY authoritative claim is only safe when the classic
+            // view positively confirmed the change set has no components.
+            // Without that marker an empty list means our scrape failed, and
+            // pruning on it wipes the user's whole done-inventory plus the
+            // IndexedDB membership cache (cart.js:781). This is the guard the
+            // Add-page path has always had (cart.js:2422) and this caller
+            // previously lacked.
+            var allowEmpty = scrape.complete && scrape.emptyConfirmed;
+            if (!all.length && !allowEmpty) {
+                console.warn('[CSH] authoritative sync: zero components scraped but the classic view ' +
+                    'never confirmed the change set is empty (complete=' + scrape.complete +
+                    ') — skipping prune to preserve cart state.');
+                if (window.cshCart.failAuthoritativeSync) {
+                    await window.cshCart.failAuthoritativeSync(syncClaim.keys, 'zero rows scraped, empty not confirmed');
+                }
+                setSync('error', 'Could not read change set membership — cart left untouched.');
+                return false;
+            }
+            if (!authoritative) {
+                console.warn('[CSH] authoritative sync: partial scrape (' + all.length +
+                    ' component(s) read before pagination broke) — syncing additively, not pruning.');
+            }
             // Write to both cart keys: the 0A2 outbound change-set id used
             // by this Detail page and the 033 MetadataPackage id used by
             // the Add page. Historically these were two divergent storage
@@ -398,23 +476,40 @@
                 var p2 = await window.cshCart.syncItemsFromServer(
                     syncClaim.keys[i],
                     all,
-                    { authoritative: true, allowEmptyAuthoritative: true }
+                    { authoritative: authoritative, allowEmptyAuthoritative: allowEmpty }
                 );
                 console.log('[CSH] background sync (authoritative) key=' + syncClaim.keys[i] +
                     ': inserted=' + p2.inserted + ' promoted=' + p2.promoted +
                     ' kept=' + p2.kept + ' pruned=' + (p2.pruned || 0) +
                     ' (scanned=' + all.length + ')');
             }
-            if (window.cshCart.finishAuthoritativeSync) {
-                await window.cshCart.finishAuthoritativeSync(syncClaim.keys, all.length);
+            if (authoritative) {
+                if (window.cshCart.finishAuthoritativeSync) {
+                    await window.cshCart.finishAuthoritativeSync(syncClaim.keys, all.length);
+                }
+                setSync('idle');
+            } else {
+                // Do NOT mark a partial scrape as a completed authoritative
+                // sync — finishAuthoritativeSync stamps it fresh for
+                // AUTHORITATIVE_SYNC_FRESH_MS, which would suppress the real
+                // full sync for the next 10 minutes. Record the failure so the
+                // next page load retries instead.
+                if (window.cshCart.failAuthoritativeSync) {
+                    await window.cshCart.failAuthoritativeSync(syncClaim.keys, 'partial scrape — pagination incomplete');
+                }
+                setSync('error', 'Read only part of the change set — cart updated but not pruned.');
             }
-            setSync('idle');
             return true;
         } catch (e) {
             console.warn('[CSH] authoritative sync failed:', e && e.message);
             if (syncClaim && syncClaim.started && window.cshCart && window.cshCart.failAuthoritativeSync) {
-                window.cshCart.failAuthoritativeSync(syncClaim.keys, (e && e.message) || 'Sync failed')
-                    .catch(function () {});
+                // Awaited: a fire-and-forget release can be abandoned by page
+                // navigation or context teardown, leaving the claim marked
+                // running for AUTHORITATIVE_SYNC_RUNNING_TTL_MS (15 min) and
+                // blocking every later sync attempt on this change set.
+                try {
+                    await window.cshCart.failAuthoritativeSync(syncClaim.keys, (e && e.message) || 'Sync failed');
+                } catch (_) {}
             }
             setSync('error', (e && e.message) || 'Sync failed');
             return false;
@@ -1161,6 +1256,27 @@
             }
         }
         return extract(rowEl.querySelectorAll('a[href]'));
+    }
+
+    // Second fallback when neither a Del link nor an SF-id-shaped anchor href
+    // yields a component id: some releases carry it only in a hidden input or
+    // a data- attribute. Mirrors cart.js:_findCidInRowFields so both scrapers
+    // read the same set of rows — a row only this one drops would cost us the
+    // authoritative prune.
+    function findCidInRowFields(rowEl, packageId) {
+        var SF_ID_RE = /^[0-9a-zA-Z]{15}(?:[0-9a-zA-Z]{3})?$/;
+        var pkgPrefix = packageId ? packageId.slice(0, 15) : null;
+        var attrs = ['value', 'data-cid', 'data-id', 'data-component-id', 'data-recordid'];
+        var nodes = rowEl.querySelectorAll('input, button, a, span, div');
+        for (var i = 0; i < nodes.length; i++) {
+            for (var j = 0; j < attrs.length; j++) {
+                var val = nodes[i].getAttribute(attrs[j]) || '';
+                if (!SF_ID_RE.test(val)) continue;
+                if (pkgPrefix && val.slice(0, 15) === pkgPrefix) continue;
+                return val;
+            }
+        }
+        return null;
     }
 
     function findNextPageHrefInDoc(doc) {

@@ -2336,6 +2336,12 @@
         try {
         var items = [];
         var sawEmptyListMarker = false;
+        // Pagination broke mid-chain, so `items` is a PARTIAL membership list.
+        // The zero-rows guard below doesn't catch this case (the list is
+        // non-empty), so track it separately and downgrade the sync to
+        // additive — an authoritative prune against a partial list deletes
+        // every component on the pages we never read.
+        var sawPartialScrape = false;
         var appOrigin = _appOriginForChangeSetView();
         var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
         var safety = 200;
@@ -2349,6 +2355,7 @@
             var table = doc.querySelector('table.list');
             if (!table) {
                 if (pageNum === 1) throw new Error('No table.list on classic components view (' + r.url + ')');
+                sawPartialScrape = true;
                 break;
             }
             var header = table.querySelector('tr.headerRow');
@@ -2404,12 +2411,30 @@
                 }
                 items.push(it);
             });
+            var keptOnPage = rows.length - dropped.noCid - dropped.noType;
             console.log('[CSH] Add-page authoritative sync page', pageNum,
-                ': rows=', rows.length, 'kept=', rows.length - dropped.noCid - dropped.noType,
+                ': rows=', rows.length, 'kept=', keptOnPage,
                 'dropped=', dropped, 'headerIdx=', idx);
+            // Rows rendered but none understood — a parse failure (usually no
+            // Type column index on a localized/renamed header), not an empty
+            // change set. Fail loudly rather than letting the prune below
+            // treat "we understood nothing" as "there is nothing".
+            if (rows.length > 0 && keptOnPage === 0) {
+                throw new Error('Parsed ' + rows.length + ' component row(s) on page ' + pageNum +
+                    ' but understood none (dropped noCid=' + dropped.noCid +
+                    ', noType=' + dropped.noType + ', headerIdx=' + JSON.stringify(idx) +
+                    '). Refusing to report an empty change set.');
+            }
+            // ANY dropped row means the list isn't a provably complete
+            // membership claim, so it must not drive a prune — see the matching
+            // guard in detailcomponents.js:fetchAllChangeSetComponents.
+            if (dropped.noCid > 0 || dropped.noType > 0) {
+                sawPartialScrape = true;
+            }
             var nextHref = _findNextPageHrefInDoc(doc);
             nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
         }
+        if (nextUrl && safety <= 0) sawPartialScrape = true;
         // Zero scraped rows from a page that DID parse (table.list was found,
         // else page-1 would have thrown above) means Salesforce served us a
         // Lightning shell / unexpected layout, not a genuinely empty change
@@ -2420,7 +2445,11 @@
         // makes the cause (row dropped counts / headerIdx / shell response)
         // easy to diagnose when it matters.
         if (items.length === 0) {
-            if (sawEmptyListMarker) {
+            // `&& !sawPartialScrape` is belt-and-braces: an empty-list marker
+            // on page 1 plus a broken later page should be impossible (an empty
+            // set has no page 2), but the two flags are set independently and
+            // the cost of being wrong here is wiping the user's inventory.
+            if (sawEmptyListMarker && !sawPartialScrape) {
                 // The classic view rendered its "No records to display"
                 // placeholder — the change set is genuinely empty, so the
                 // right move is the opposite of the defensive skip below:
@@ -2448,8 +2477,12 @@
         // id) and the Detail page (0A2 outbound change-set id) see the same
         // authoritative state.
         var summary = { count: items.length, inserted: 0, promoted: 0, kept: 0, pruned: 0 };
+        if (sawPartialScrape) {
+            console.warn('[CSH] Add-page sync: partial scrape (' + items.length +
+                ' component(s) read before pagination broke) — syncing additively, not pruning.');
+        }
         for (var k = 0; k < syncClaim.keys.length; k++) {
-            var r2 = await syncItemsFromServer(syncClaim.keys[k], items, { authoritative: true });
+            var r2 = await syncItemsFromServer(syncClaim.keys[k], items, { authoritative: !sawPartialScrape });
             summary.inserted += r2.inserted;
             summary.promoted += r2.promoted;
             summary.kept += r2.kept;
@@ -2459,7 +2492,14 @@
                 ' kept=' + r2.kept + ' pruned=' + (r2.pruned || 0) +
                 ' (scanned=' + items.length + ')');
         }
-        await finishAuthoritativeSync(syncClaim.keys, items.length);
+        if (sawPartialScrape) {
+            // Never stamp a partial scrape as a completed authoritative sync —
+            // that marks it fresh for AUTHORITATIVE_SYNC_FRESH_MS and blocks
+            // the real full sync for the next 10 minutes.
+            await failAuthoritativeSync(syncClaim.keys, 'partial scrape — pagination incomplete');
+        } else {
+            await finishAuthoritativeSync(syncClaim.keys, items.length);
+        }
         return summary;
         } catch (e) {
             await failAuthoritativeSync(syncClaim.keys, (e && e.message) || String(e));
