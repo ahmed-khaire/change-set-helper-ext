@@ -503,6 +503,19 @@
         merged.removeHref = winner.removeHref || other.removeHref;
         merged.error = winner.error || other.error || '';
         if (merged.status === 'done' || merged.status === 'staged') merged.error = '';
+        // Verified beats unverified. Object.assign can only ever carry the flag
+        // forward (a confirmed row simply lacks the property, so it never
+        // overwrites a true), which would let a stale unverified duplicate
+        // re-flag a row the server has since confirmed.
+        //
+        // Only a *verified done* row is evidence the component is really in the
+        // change set. Merely lacking the flag is not — a 'staged' or 'failed'
+        // duplicate says nothing about server presence, so it must not clear a
+        // legitimate unverified marker.
+        if ((a.status === 'done' && !a.unverified) ||
+                (b.status === 'done' && !b.unverified)) {
+            delete merged.unverified;
+        }
         return merged;
     }
 
@@ -847,6 +860,10 @@
             }
             if (existing) {
                 existing.type = it.type;
+                // The server just told us this component IS in the change set,
+                // which retires any done-but-unverified marker from a submit
+                // whose post-check couldn't reach the classic view.
+                if (existing.unverified) delete existing.unverified;
                 if (existing.status === 'done') {
                     if (it.name && (!existing.name || existing.name === existing.salesforceId)) {
                         existing.name = it.name;
@@ -1636,6 +1653,10 @@
 
                 if (success) {
                     var verified = null;
+                    // Set when the unverified path has already told the user
+                    // what happened, so the trailing success toast below can't
+                    // contradict it with "added N item(s)".
+                    var reportedToUser = false;
                     try {
                         verified = await reconcileSubmittedBatch(
                             changeSetId,
@@ -1644,20 +1665,33 @@
                             'Component was not added. It may have been deleted or is no longer selectable in Salesforce.'
                         );
                     } catch (e) {
-                        console.warn('[CSH] post-submit verification failed; marking requested batch done:', e && e.message);
+                        // We could not confirm the add against the server. The
+                        // POST looked successful, so 'done' is still the most
+                        // likely truth and demoting to 'failed' would push the
+                        // user into needless re-submits — but we must not
+                        // present this as verified:
+                        //   * flag the rows unverified so the panel can say so
+                        //     and a later sync can tell them apart;
+                        //   * do NOT write them into the IndexedDB membership
+                        //     cache — that cache re-hydrates the cart, so
+                        //     seeding it with an unconfirmed row is how a
+                        //     phantom component survives a refresh and then
+                        //     vanishes on the next trustworthy sync.
+                        console.warn('[CSH] post-submit verification failed; marking batch done-but-unverified:',
+                            e && e.message);
                         await updateItemStatuses(
                             changeSetId,
                             function (it) { return it.batchId === batchId; },
-                            { status: 'done' },
+                            { status: 'done', unverified: true },
                             { flush: true }
                         );
-                        if (window.cshDb) {
-                            try {
-                                await window.cshDb.markMembers(changeSetId, batchItems, 'present', { source: 'cart-submit' });
-                            } catch (dbErr) {
-                                console.warn('cshDb submit cache failed:', dbErr && dbErr.message);
-                            }
-                        }
+                        window.cshToast && window.cshToast.show(
+                            'Cart: submitted ' + batchItems.length + ' ' + type + ' item(s), but could not verify ' +
+                            'them against the change set (' + ((e && e.message) || 'sync failed') + '). ' +
+                            'Use Full Sync to confirm what actually landed.',
+                            { type: 'warning', duration: 9000 }
+                        );
+                        reportedToUser = true;
                     }
                     if (verified && verified.missing) {
                         window.cshToast && window.cshToast.show(
@@ -1665,7 +1699,7 @@
                             verified.missing + ' stale item(s) were not found in the change set.',
                             { type: verified.present ? 'warning' : 'error', duration: 7000 }
                         );
-                    } else {
+                    } else if (!reportedToUser) {
                         window.cshToast && window.cshToast.show(
                             'Cart: added ' + batchItems.length + ' ' + type + ' item(s) to change set.',
                             { type: 'success', duration: 4000 }
@@ -3409,6 +3443,10 @@
     function statusLabel(it) {
         if (it.status === 'staged') return 'staged';
         if (it.status === 'submitting') return 'submitting…';
+        // A submit whose post-check couldn't reach the classic view. Saying
+        // plain "added" would assert a confirmation we never got — the whole
+        // point of the flag is that the user can see which rows are unproven.
+        if (it.status === 'done' && it.unverified) return 'added (unverified)';
         if (it.status === 'done') return 'added';
         if (it.status === 'failed') return 'failed — ' + (it.error || '');
         return it.status;
