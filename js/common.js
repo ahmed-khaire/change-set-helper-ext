@@ -366,6 +366,312 @@ window.cshAuth = (function () {
     window.cshToast = { show: show };
 })();
 
+// 3b) In-page confirm/alert dialogs.
+//
+//     Chrome 92+ ignores window.confirm/alert/prompt called from a cross-origin
+//     iframe: the call returns immediately (confirm -> false) and only logs a
+//     console warning. In Lightning, Setup renders the Visualforce change-set
+//     pages inside exactly such an iframe (shell on *.lightning.force.com, frame
+//     on *--c.vf.force.com / *.my.salesforce-setup.com), so every action written
+//     as `if (!confirm(...)) return;` became a silent no-op — the "button does
+//     nothing" reports. In Classic the same code sits in the top frame and works,
+//     which is why this never showed up in testing.
+//
+//     These replacements are real DOM, so they work in any frame. Styles are
+//     inline on purpose: css/cart.css (which carries .csh-modal-scrim) is not
+//     loaded in the changeview.js content-script context, and a dialog that
+//     silently renders unstyled would be its own failure mode.
+(function () {
+    // Max int32. Must sit above the extension's OWN overlays too, not just
+    // Salesforce's: the cart panel is 2147483644 (css/cart.css) and the existing
+    // modals are 2147483645/2147483646 (cart.css, changeset.css). At a lower
+    // value a cart-triggered dialog renders beneath the cart panel, leaving the
+    // panel clickable above the scrim.
+    var Z = 2147483647;
+
+    function buildButton(label, kind) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        var bg = kind === 'danger' ? '#ba0517' : kind === 'primary' ? '#0176d3' : '#ffffff';
+        var fg = kind === 'ghost' ? '#0176d3' : '#ffffff';
+        var border = kind === 'ghost' ? '#c9c9c9' : bg;
+        b.style.cssText = [
+            'background:' + bg,
+            'color:' + fg,
+            'border:1px solid ' + border,
+            'border-radius:4px',
+            'padding:7px 16px',
+            'font:13px/1.2 "Salesforce Sans", Arial, sans-serif',
+            'cursor:pointer',
+            'min-width:72px'
+        ].join(';');
+        return b;
+    }
+
+    // Only one dialog may be open at a time. Native confirm() blocked the JS
+    // thread, so double-clicking a destructive button was impossible; an async
+    // dialog removes that protection. Two open dialogs is not merely untidy —
+    // both register a document-level keydown listener, and stopPropagation()
+    // does not stop other listeners on the same node, so a single Escape or
+    // Enter resolves BOTH, which on the deploy path means two deploys.
+    var activeDialog = null;
+    var uidSeq = 0;
+
+    // Shared shell. `buttons` is [{label, kind, value}]; resolves with the
+    // clicked button's value. escValue is what Escape / scrim-click resolves to.
+    function open(opts) {
+        var message = String(opts.message == null ? '' : opts.message);
+        var title = opts.title || 'Change Set Helper';
+        var buttons = opts.buttons || [];
+        var escValue = opts.escValue;
+
+        // A second request is refused, not queued and not merged. Returning the
+        // active dialog's promise would make one confirmation approve both
+        // callers — exactly the double-action this guard exists to prevent — so
+        // the loser resolves as if it had been cancelled.
+        if (activeDialog) {
+            try {
+                if (activeDialog.focusFirst) activeDialog.focusFirst();
+            } catch (_) {}
+            return Promise.resolve(escValue);
+        }
+
+        return new Promise(function (resolve) {
+            var settled = false;
+            var previousFocus = document.activeElement;
+            var seq = ++uidSeq;
+
+            function finish(value) {
+                if (settled) return;
+                settled = true;
+                if (activeDialog && activeDialog.seq === seq) activeDialog = null;
+                document.removeEventListener('keydown', onKey, true);
+                if (scrim.parentNode) scrim.parentNode.removeChild(scrim);
+                // Return focus where the user left it so a keyboard user isn't
+                // dumped back at the top of the document.
+                try {
+                    if (previousFocus && previousFocus.focus) previousFocus.focus();
+                } catch (_) {}
+                resolve(value);
+            }
+
+            var scrim = document.createElement('div');
+            scrim.style.cssText = [
+                'position:fixed', 'inset:0', 'top:0', 'right:0', 'bottom:0', 'left:0',
+                'background:rgba(0,0,0,0.45)',
+                'z-index:' + Z,
+                'display:flex', 'align-items:center', 'justify-content:center',
+                // Scrollable so a dialog taller than a short iframe viewport can
+                // still be reached rather than being clipped with its buttons
+                // off-screen.
+                'overflow:auto',
+                'padding:20px'
+            ].join(';');
+
+            var titleId = 'csh-dlg-t' + seq;
+            var msgId = 'csh-dlg-m' + seq;
+            var box = document.createElement('div');
+            box.setAttribute('role', 'alertdialog');
+            box.setAttribute('aria-modal', 'true');
+            box.setAttribute('aria-labelledby', titleId);
+            box.setAttribute('aria-describedby', msgId);
+            box.style.cssText = [
+                'background:#ffffff', 'color:#080707',
+                'border-radius:6px',
+                'box-shadow:0 4px 20px rgba(0,0,0,0.4)',
+                // border-box or the 22px side padding is added OUTSIDE width:100%
+                // and the box overflows a narrow iframe.
+                'box-sizing:border-box',
+                'max-width:520px', 'width:100%',
+                'max-height:80vh', 'overflow:auto',
+                'padding:20px 22px',
+                'font:14px/1.45 "Salesforce Sans", Arial, sans-serif'
+            ].join(';');
+
+            var h = document.createElement('h3');
+            h.id = titleId;
+            h.textContent = title;
+            h.style.cssText = 'margin:0 0 10px;font-size:17px;font-weight:700;';
+
+            // textContent, never innerHTML — messages interpolate org-controlled
+            // values (component names, change set labels, org usernames).
+            var p = document.createElement('div');
+            p.id = msgId;
+            p.textContent = message;
+            p.style.cssText = 'margin:0 0 18px;white-space:pre-wrap;word-break:break-word;';
+
+            var actions = document.createElement('div');
+            actions.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;';
+
+            var firstDefault = null;
+            buttons.forEach(function (spec) {
+                var b = buildButton(spec.label, spec.kind);
+                b.addEventListener('click', function () { finish(spec.value); });
+                if (spec.isDefault && !firstDefault) firstDefault = b;
+                actions.appendChild(b);
+            });
+
+            box.appendChild(h);
+            box.appendChild(p);
+            // Optional text field (prompt replacement). Sits between the
+            // message and the actions so tab order reads naturally.
+            if (opts.field) box.appendChild(opts.field);
+            box.appendChild(actions);
+            scrim.appendChild(box);
+
+            scrim.addEventListener('click', function (ev) {
+                if (ev.target === scrim) finish(escValue);
+            });
+
+            // Tab-cycle targets, in visual order.
+            function focusables() {
+                var list = [];
+                if (opts.field) list.push(opts.field);
+                Array.prototype.forEach.call(actions.children, function (el) {
+                    if (!el.disabled) list.push(el);
+                });
+                return list;
+            }
+
+            function focusFirst() {
+                var f = focusables()[0];
+                if (f) { try { f.focus(); } catch (_) {} }
+            }
+
+            function onKey(ev) {
+                if (ev.key === 'Escape') {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    finish(escValue);
+                    return;
+                }
+                if (ev.key === 'Enter' && firstDefault) {
+                    // Let Enter inside a textarea behave normally if one is ever
+                    // added; a single-line input has no competing behaviour.
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    firstDefault.click();
+                    return;
+                }
+                if (ev.key !== 'Tab') return;
+                // Focus trap: aria-modal is a promise to assistive tech that the
+                // rest of the page is inert, so Tab must not reach the
+                // background controls sitting behind the scrim.
+                var list = focusables();
+                if (!list.length) return;
+                var first = list[0];
+                var last = list[list.length - 1];
+                var active = document.activeElement;
+                if (!box.contains(active)) {
+                    ev.preventDefault();
+                    try { (ev.shiftKey ? last : first).focus(); } catch (_) {}
+                    return;
+                }
+                if (!ev.shiftKey && active === last) {
+                    ev.preventDefault();
+                    try { first.focus(); } catch (_) {}
+                } else if (ev.shiftKey && active === first) {
+                    ev.preventDefault();
+                    try { last.focus(); } catch (_) {}
+                }
+            }
+            // Capture phase: Salesforce's own key handlers are aggressive and
+            // would otherwise swallow Escape/Tab before it reaches us.
+            document.addEventListener('keydown', onKey, true);
+
+            activeDialog = { seq: seq, focusFirst: focusFirst };
+
+            // If anything below throws, the singleton flag must not stay set —
+            // a stuck flag would refuse every future dialog and turn every
+            // destructive action into a permanent silent no-op, which is the
+            // exact failure this whole change set exists to remove.
+            try {
+                (document.body || document.documentElement).appendChild(scrim);
+                // Focus the field when there is one — the user's next action is
+                // typing, not clicking. Enter still activates the default button
+                // via the keydown handler above.
+                var toFocus = opts.field || firstDefault;
+                if (toFocus) {
+                    try { toFocus.focus(); } catch (_) {}
+                }
+            } catch (e) {
+                console.error('Change Set Helper: could not open dialog', e);
+                finish(escValue);
+            }
+        });
+    }
+
+    // Drop-in for window.confirm. Resolves true/false; NEVER throws, so callers
+    // can always `if (!await cshDialog.confirm(...)) return;`.
+    function confirmDialog(message, opts) {
+        opts = opts || {};
+        return open({
+            message: message,
+            title: opts.title || 'Confirm',
+            escValue: false,
+            buttons: [
+                {
+                    label: opts.confirmLabel || 'OK',
+                    kind: opts.destructive ? 'danger' : 'primary',
+                    value: true,
+                    isDefault: true
+                },
+                { label: opts.cancelLabel || 'Cancel', kind: 'ghost', value: false }
+            ]
+        });
+    }
+
+    // Drop-in for window.alert.
+    function alertDialog(message, opts) {
+        opts = opts || {};
+        return open({
+            message: message,
+            title: opts.title || 'Change Set Helper',
+            escValue: undefined,
+            buttons: [{ label: 'OK', kind: 'primary', value: undefined, isDefault: true }]
+        }).then(function () {});
+    }
+
+    // Drop-in for window.prompt. Resolves the trimmed string, or null if the
+    // user cancelled — same contract callers already branch on.
+    function promptDialog(message, opts) {
+        opts = opts || {};
+        return new Promise(function (resolve) {
+            var input = document.createElement('input');
+            input.type = 'text';
+            input.value = opts.defaultValue || '';
+            input.style.cssText = [
+                'width:100%', 'box-sizing:border-box',
+                'margin:0 0 18px', 'padding:7px 9px',
+                'border:1px solid #c9c9c9', 'border-radius:4px',
+                'font:14px/1.4 "Salesforce Sans", Arial, sans-serif'
+            ].join(';');
+            open({
+                message: message,
+                title: opts.title || 'Change Set Helper',
+                escValue: null,
+                field: input,
+                buttons: [
+                    { label: opts.confirmLabel || 'Save', kind: 'primary', value: 'submit', isDefault: true },
+                    { label: 'Cancel', kind: 'ghost', value: null }
+                ]
+            }).then(function (v) {
+                if (v !== 'submit') { resolve(null); return; }
+                var val = String(input.value || '').trim();
+                resolve(val || null);
+            });
+        });
+    }
+
+    window.cshDialog = {
+        confirm: confirmDialog,
+        alert: alertDialog,
+        prompt: promptDialog,
+        open: open
+    };
+})();
+
 // 4) Dynamic Salesforce API version discovery.
 //    Hits /services/data/ on the current host and picks the highest supported
 //    version. Cached per-host in chrome.storage.local for 24h so we don't
