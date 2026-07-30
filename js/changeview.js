@@ -384,7 +384,9 @@
     async function handleRemoveSelected() {
         var targets = collectSelectedCheckboxes();
         if (targets.length === 0) return;
-        if (!confirm('Remove ' + targets.length + ' component(s) from this change set? This cannot be undone.')) return;
+        if (!await window.cshDialog.confirm(
+                'Remove ' + targets.length + ' component(s) from this change set? This cannot be undone.',
+                { title: 'Remove components', confirmLabel: 'Remove', destructive: true })) return;
 
         removeCancelled = false;
         showRemoveModal(targets.length);

@@ -1130,7 +1130,9 @@
             );
             return;
         }
-        if (!confirm('Remove "' + label + '" from this change set? This cannot be undone.')) return;
+        if (!await window.cshDialog.confirm(
+                'Remove "' + label + '" from this change set? This cannot be undone.',
+                { title: 'Remove component', confirmLabel: 'Remove', destructive: true })) return;
         if (window.cshChangeSetOps && window.cshChangeSetOps.removeById) {
             await window.cshChangeSetOps.removeById(item.salesforceId);
         } else {
@@ -1155,7 +1157,9 @@
             return normalizeCartType(it.type) === type && it.status === 'done' && it.salesforceId;
         });
         if (!items.length) return;
-        if (!confirm('Remove all ' + items.length + ' "' + type + '" component(s) from this change set? This cannot be undone.')) return;
+        if (!await window.cshDialog.confirm(
+                'Remove all ' + items.length + ' "' + type + '" component(s) from this change set? This cannot be undone.',
+                { title: 'Remove components', confirmLabel: 'Remove', destructive: true })) return;
 
         var ids = items.map(function (it) { return it.salesforceId; });
         var removedItems = [];
@@ -2872,7 +2876,9 @@
                 if (!counts.done) return;
                 await clearDone(changeSetId);
             } else if (action === 'all') {
-                if (!confirm('Clear every cart item — staged, completed, and failed? This cannot be undone.')) return;
+                if (!await window.cshDialog.confirm(
+                        'Clear every cart item — staged, completed, and failed? This cannot be undone.',
+                        { title: 'Clear cart', confirmLabel: 'Clear everything', destructive: true })) return;
                 // Re-read via getCart so an unflushed snapshot isn't lost,
                 // and mark the wipe wholesale so the flush merge doesn't
                 // restore rows from another tab's copy.
@@ -2889,7 +2895,8 @@
         // addEventListener throws on page init.
         if (CART_PRESETS_ENABLED) {
             panel.querySelector('.csh-cart-save-preset').addEventListener('click', async function () {
-                var name = prompt('Save current cart as preset. Name?');
+                var name = await window.cshDialog.prompt('Name for this preset?',
+                        { title: 'Save cart as preset' });
                 if (!name) return;
                 try {
                     var p = await savePreset(name);
@@ -2920,10 +2927,11 @@
                 var select = panel.querySelector('.csh-cart-preset-select');
                 var name = select.value;
                 if (!name) {
-                    alert('Pick a preset from the dropdown first.');
+                    window.cshDialog.alert('Pick a preset from the dropdown first.');
                     return;
                 }
-                if (!confirm('Delete preset "' + name + '"?')) return;
+                if (!await window.cshDialog.confirm('Delete preset "' + name + '"?',
+                        { title: 'Delete preset', confirmLabel: 'Delete', destructive: true })) return;
                 await deletePreset(name);
                 await refreshPresetSelect();
             });

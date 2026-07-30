@@ -651,7 +651,7 @@ function cshRenderDeployHelper() {
 }
 
 
-function testDeploy() {
+async function testDeploy() {
 	// Mode controls whether this is a dry-run (checkOnly=true) or an actual
 	// deploy that applies the change set in the target org (checkOnly=false).
 	// The direct-deploy path lands changes irreversibly — hence the strong
@@ -667,7 +667,7 @@ function testDeploy() {
 			'This WILL apply the change set to the target org. Salesforce ' +
 			'does not support rollback of a succeeded deploy — you can only ' +
 			'undo it by deploying the previous state. Continue?';
-		if (!confirm(msg)) return;
+		if (!await window.cshDialog.confirm(msg, { title: 'Deploy to target org', confirmLabel: 'Deploy', destructive: true })) return;
 	}
 
 	var testLevel = $("#testLevelInput :selected").val();
@@ -911,12 +911,14 @@ function cshOnConnectSavedOrg() {
 	});
 }
 
-function cshOnDeleteSavedOrg() {
+async function cshOnDeleteSavedOrg() {
 	var orgId = $('#savedOrgsSelect').val();
 	if (!orgId) return;
 	var $sel = $('#savedOrgsSelect');
 	var label = $sel.find('option:selected').text();
-	if (!confirm('Forget saved org?\n\n' + label + '\n\nYou will be asked to sign in again next time you use it.')) {
+	if (!await window.cshDialog.confirm(
+			'Forget saved org?\n\n' + label + '\n\nYou will be asked to sign in again next time you use it.',
+			{ title: 'Forget saved org', confirmLabel: 'Forget', destructive: true })) {
 		return;
 	}
 	chrome.runtime.sendMessage({
@@ -1094,8 +1096,11 @@ function cancelDeploy() {
     );
 }
 
-function quickDeploy() {
-	if (confirm('Are you sure?  This will deploy this change')) {
+async function quickDeploy() {
+	if (await window.cshDialog.confirm(
+			'Deploy this validated change set to the target org?\n\n' +
+			'Salesforce does not support rollback of a succeeded deploy.',
+			{ title: 'Quick Deploy', confirmLabel: 'Deploy', destructive: true })) {
 		var currentId = $("#currentDeployId").val();
 
 		console.log("Quick deploy validation id:" + currentId);

@@ -719,10 +719,12 @@
         if (row && colIndex.type >= 0 && row.children[colIndex.type]) {
             type = (row.children[colIndex.type].textContent || '').trim();
         }
-        if (!confirm('Remove "' + label + '" from this change set? This cannot be undone.')) return;
+        if (!await window.cshDialog.confirm(
+                'Remove "' + label + '" from this change set? This cannot be undone.',
+                { title: 'Remove component', confirmLabel: 'Remove', destructive: true })) return;
         if (!window.cshChangeSetOps || !window.cshChangeSetOps.removeById) {
             console.error('[CSH] cshChangeSetOps not available for single remove');
-            alert('Change Set Helper is still loading — try again in a moment.');
+            window.cshDialog.alert('Change Set Helper is still loading — try again in a moment.');
             return;
         }
         if (row) row.style.opacity = '0.5';
@@ -745,7 +747,7 @@
                 window.cshToast.show('Failed to remove "' + label + '": ' + msg,
                     { type: 'error', duration: 8000 });
             } else {
-                alert('Remove failed: ' + msg);
+                window.cshDialog.alert('Remove failed: ' + msg, { title: 'Remove failed' });
             }
         }
     }
@@ -1718,7 +1720,9 @@
     async function handleRemoveSelected() {
         var items = Array.from(selectedItems.values());
         if (items.length === 0) return;
-        if (!confirm('Remove ' + items.length + ' component(s) from this change set? This cannot be undone.')) return;
+        if (!await window.cshDialog.confirm(
+                'Remove ' + items.length + ' component(s) from this change set? This cannot be undone.',
+                { title: 'Remove components', confirmLabel: 'Remove', destructive: true })) return;
 
         bulkCancelled = false;
         showProgressModal(items.length);

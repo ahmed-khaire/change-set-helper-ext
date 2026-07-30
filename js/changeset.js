@@ -3175,11 +3175,13 @@ function cshCompareOnConnectSavedOrg() {
     });
 }
 
-function cshCompareOnDeleteSavedOrg() {
+async function cshCompareOnDeleteSavedOrg() {
     var orgId = $('#compareSavedOrgsSelect').val();
     if (!orgId) return;
     var label = $('#compareSavedOrgsSelect option:selected').text();
-    if (!confirm('Forget saved org?\n\n' + label + '\n\nYou will be asked to sign in again next time you use it.')) {
+    if (!await window.cshDialog.confirm(
+            'Forget saved org?\n\n' + label + '\n\nYou will be asked to sign in again next time you use it.',
+            { title: 'Forget saved org', confirmLabel: 'Forget', destructive: true })) {
         return;
     }
     chrome.runtime.sendMessage({
@@ -3273,7 +3275,7 @@ function cshWarnStaleContext() {
     } else {
         // Toast hasn't mounted yet (very early in page life) — fall back to
         // alert so the user still sees something actionable.
-        try { alert(msg); } catch (_) {}
+        try { window.cshDialog.alert(msg, { title: 'Change Set Helper' }); } catch (_) {}
     }
 }
 
