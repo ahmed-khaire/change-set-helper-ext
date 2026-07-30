@@ -694,17 +694,76 @@ async function cshSubmitCartBatch(request, sender) {
         elapsedMs: Date.now() - startedAt,
         finalUrl: resp.url
     });
-    // Successful add-to-change-set usually returns a 302 redirect to the
-    // Outbound Change Set detail page. fetch follows redirects by default; a
-    // 200 on the detail URL is our success signal.
-    if (resp.ok || (resp.status >= 300 && resp.status < 400)) {
-        return { ok: true, finalUrl: resp.url };
-    }
     var text = await resp.text().catch(function () { return ''; });
-    return {
-        ok: false,
-        error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
-    };
+    if (!(resp.ok || (resp.status >= 300 && resp.status < 400))) {
+        return {
+            ok: false,
+            error: 'HTTP ' + resp.status + (text ? ': ' + text.slice(0, 240) : '')
+        };
+    }
+    // Successful add-to-change-set usually returns a 302 redirect to the
+    // Outbound Change Set detail page. fetch follows redirects by default, so
+    // a 200 on the detail URL is the happy path — but HTTP status ALONE is not
+    // a success signal: Salesforce answers 200 for the login page, for an
+    // expired-ViewState error, and for the Add page re-displayed with a
+    // validation message. Treating those as successful adds is what marks
+    // components 'done' that were never added, so they appear in the cart and
+    // then vanish on the next authoritative sync. Inspect the body before
+    // claiming success.
+    var failure = cshClassifyCartSubmitResponse(text, resp.url);
+    if (failure) {
+        return { ok: false, error: failure, finalUrl: resp.url };
+    }
+    return { ok: true, finalUrl: resp.url };
+}
+
+// Returns a human-readable reason string when a cart-submit response body is
+// recognisably NOT a successful add, or null when it looks like success.
+//
+// PRECISION MATTERS FAR MORE THAN RECALL HERE. A false negative is cheap: the
+// post-submit reconciliation in cart.js (reconcileSubmittedBatch) re-reads the
+// change set and is the real arbiter of what landed. A false positive is
+// expensive: it reports a successful add as failed and burns MAX_ATTEMPTS
+// retries. So this only matches tight, contiguous, unambiguous failure text —
+// never "page mentions viewstate somewhere AND mentions error somewhere",
+// which is true of essentially every Visualforce page including successful
+// ones (they all embed a ViewStateCsrf hidden input and inline error handlers).
+function cshClassifyCartSubmitResponse(text, finalUrl) {
+    var body = String(text || '');
+    var url = String(finalUrl || '');
+    // Session died: Salesforce serves a login form with HTTP 200, or redirects
+    // to the login host. Both are unambiguous.
+    if (/^https?:\/\/(?:[^\/]*\.)?login\.salesforce\.com\//i.test(url) ||
+            /\/secur\/login_portal\.jsp/i.test(url) ||
+            /<form[^>]+action="[^"]*\/secur\/login_portal\.jsp/i.test(body)) {
+        return 'Salesforce returned a login page — the session expired. ' +
+               'Reload the page, sign in, then retry.';
+    }
+    // Stale ViewState: the cached form shape outlived the page it was scraped
+    // from. Matched only on Salesforce's actual contiguous error wording.
+    if (/invalid or expired (?:view ?state|page state)/i.test(body) ||
+            /(?:view ?state|page state) (?:is |has )?(?:invalid|expired|been tampered)/i.test(body) ||
+            /browser has been idle .{0,80}(?:page has expired|expired)/i.test(body) ||
+            /ViewStateCsrf[^<]{0,60}(?:could not be verified|is invalid|invalid)/i.test(body)) {
+        return 'Salesforce rejected the cached form state (expired view state). ' +
+               'Reopen the Add Components page for this type so a fresh form is ' +
+               'captured, then retry.';
+    }
+    // Salesforce's dedicated permission-denied interstitial. Matched on its
+    // heading/title only — the bare phrase appears in help text on ordinary
+    // pages, so a whole-body substring test would false-positive.
+    if (/<title>[^<]*Insufficient Privileges[^<]*<\/title>/i.test(body) ||
+            /<h1[^>]*>\s*Insufficient Privileges\s*<\/h1>/i.test(body)) {
+        return 'Insufficient privileges to modify this change set. ' +
+               'Your user may lack "Modify All Data" or the change set may be closed.';
+    }
+    // Deliberately NOT classifying generic inline error blocks here. Any
+    // "class contains error" heuristic also matches the empty/hidden error
+    // containers Salesforce ships on successful pages, and a false positive
+    // reports a working add as failed and burns MAX_ATTEMPTS retries.
+    // reconcileSubmittedBatch re-reads the change set and is the authority on
+    // what actually landed, so an unrecognised body is safe to pass through.
+    return null;
 }
 
 // Offscreen document management
