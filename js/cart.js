@@ -82,6 +82,9 @@
             } catch (_) { markExtDead(); resolve({}); }
         });
     }
+    // Reason string for the most recent failed write, read by flushNow so it
+    // can tell the user what actually went wrong. Cleared on the next success.
+    var lastStorageError = null;
     function storageSet(obj) {
         return new Promise(function (resolve) {
             if (!cshExtAlive()) { markExtDead(); resolve(false); return; }
@@ -89,24 +92,45 @@
                 chrome.storage.local.set(obj, function () {
                     var err = chrome.runtime.lastError;
                     if (err) {
+                        var msg = err.message || 'unknown storage error';
                         // A quota failure is not extension death — flipping
                         // the "Extension was reloaded" banner would be wrong
                         // and non-actionable. Surface what the user can
                         // actually do about it instead.
-                        if (/quota/i.test(err.message || '')) {
+                        if (/quota|QUOTA_BYTES/i.test(msg)) {
+                            lastStorageError = 'Cart storage is full (browser limit reached).';
                             window.cshToast && window.cshToast.show(
                                 'Cart storage is full — remove completed items or clear the cart, then try again.',
                                 { type: 'error', duration: 8000 }
                             );
-                        } else {
+                        } else if (/context invalidated|Extension context/i.test(msg)) {
+                            // Genuine orphaned content script — the reload
+                            // banner IS the right response here.
+                            lastStorageError = msg;
                             markExtDead();
+                        } else {
+                            // Any other write failure: report it honestly
+                            // rather than mislabelling it as an extension
+                            // reload, which sent users chasing the wrong fix.
+                            lastStorageError = msg;
                         }
                         resolve(false);
                         return;
                     }
+                    lastStorageError = null;
                     resolve(true);
                 });
-            } catch (_) { markExtDead(); resolve(false); }
+            } catch (e) {
+                var thrown = (e && e.message) || String(e);
+                lastStorageError = thrown;
+                // Same classification as the callback path above — a synchronous
+                // throw that isn't context invalidation shouldn't raise the
+                // "Extension was reloaded" banner either.
+                if (/context invalidated|Extension context/i.test(thrown)) {
+                    markExtDead();
+                }
+                resolve(false);
+            }
         });
     }
 
@@ -256,6 +280,10 @@
     //                     mergeRelatedCarts); our version wins outright.
     var removedUids = {};
     var replacedCartIds = {};
+    // Set when a flush could not write to disk, so the panel can warn that the
+    // cart it is displaying only exists in memory. Null when storage is
+    // healthy.
+    var persistFailure = null;
     // Bumped by saveCart so an in-flight flush can tell whether a newer
     // mutation landed while its read/write was awaiting — if so it must not
     // clear pendingAll/tombstones out from under that mutation's own flush.
@@ -358,6 +386,18 @@
                 removedUids = {};
                 replacedCartIds = {};
             }
+            // A failed write leaves the cart live in memory but NOT on disk —
+            // the panel would keep rendering it as though it were saved, and
+            // the state silently disappears on refresh. Surface it so the user
+            // can act before losing work, and clear the warning once a write
+            // gets through.
+            if (!ok) {
+                persistFailure = lastStorageError || 'Could not save the cart to browser storage.';
+                console.error('[CSH] cart persist FAILED — in-memory state is not saved:', persistFailure);
+            } else {
+                persistFailure = null;
+            }
+            try { applySyncStateToPanel(); } catch (_) {}
         })();
         try { await flushInFlight; } finally { flushInFlight = null; }
     }
@@ -3074,7 +3114,14 @@
         var titleEl = panel.querySelector('.csh-cart-title');
         if (titleEl) {
             var base = 'Change Set Details';
-            if (syncState === 'syncing') {
+            // Unsaved state outranks sync status: a cart that isn't on disk is
+            // about to be lost on refresh, which the user must see first.
+            if (persistFailure) {
+                titleEl.innerHTML = escapeHtml(base) +
+                    ' <span class="csh-cart-sync-badge csh-cart-sync-badge-error" title="' +
+                    escapeAttr(persistFailure + ' Your cart is only in memory and will be lost on refresh.') +
+                    '">· Not saved</span>';
+            } else if (syncState === 'syncing') {
                 titleEl.innerHTML = escapeHtml(base) +
                     ' <span class="csh-cart-sync-badge">· Syncing' +
                     '<span class="csh-cart-sync-dot"></span></span>';
