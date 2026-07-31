@@ -1602,8 +1602,19 @@
     }
 
     var workerRunning = false;
+    // Resolves with an outcome summary so callers can tell success from
+    // silent failure. The Add-page submit bridge cancels Salesforce's native
+    // submit before delegating here; without a reported outcome a failed run
+    // consumed the user's click, added nothing, and surfaced no error.
+    //   { ran:false, reason }                        — never started
+    //   { ran:true, batches, submitted, failed, lastError }
     async function runWorker(changeSetId) {
-        if (workerRunning) return;
+        // `indeterminate` means at least one batch reached a state where the
+        // server outcome is unknown — the POST was reported failed but the
+        // follow-up read of the change set also failed, so we cannot tell
+        // whether it landed. Callers must NOT retry on their own after that.
+        var summary = { ran: true, batches: 0, submitted: 0, failed: 0, indeterminate: false, lastError: '' };
+        if (workerRunning) return { ran: false, reason: 'already running in this tab' };
         var acquired = await acquireWorkerLock(changeSetId);
         if (!acquired) {
             window.cshToast && window.cshToast.show(
@@ -1611,7 +1622,7 @@
                 'Wait for it to finish, then try again.',
                 { type: 'info', duration: 5000 }
             );
-            return;
+            return { ran: false, reason: 'another tab holds the submit lock' };
         }
         workerRunning = true;
         renderPanel();
@@ -1647,8 +1658,11 @@
                 );
                 renderPanel();
 
+                summary.batches++;
                 var formShape = cart.form && cart.form[type];
                 if (!formShape) {
+                    summary.failed += batchItems.length;
+                    summary.lastError = 'no cached form shape for ' + type;
                     await updateItemStatuses(
                         changeSetId,
                         function (it) { return it.batchId === batchId; },
@@ -1737,6 +1751,16 @@
                         );
                         reportedToUser = true;
                     }
+                    if (verified) {
+                        summary.submitted += verified.present || 0;
+                        summary.failed += verified.missing || 0;
+                    } else {
+                        // Unverified: the POST succeeded, so count it as
+                        // submitted rather than reporting a false zero to the
+                        // caller (which would trigger a duplicate native
+                        // submit) — the rows carry `unverified` for the UI.
+                        summary.submitted += batchItems.length;
+                    }
                     if (verified && verified.missing) {
                         window.cshToast && window.cshToast.show(
                             'Cart: added ' + verified.present + ' ' + type + ' item(s); ' +
@@ -1759,6 +1783,12 @@
                             lastError
                         );
                     } catch (e) {
+                        // POST reported failure AND we could not re-read the
+                        // change set to check. The rows are marked failed for
+                        // the UI, but the server outcome is genuinely unknown,
+                        // so the caller must not treat this as "nothing landed"
+                        // and submit again.
+                        summary.indeterminate = true;
                         console.warn('[CSH] post-failure verification failed:', e && e.message);
                         await updateItemStatuses(
                             changeSetId,
@@ -1767,6 +1797,11 @@
                             { flush: true }
                         );
                     }
+                    summary.submitted += (reconciledFailure && reconciledFailure.present) || 0;
+                    summary.failed += reconciledFailure
+                        ? (reconciledFailure.missing || 0)
+                        : batchItems.length;
+                    summary.lastError = lastError || summary.lastError;
                     window.cshToast && window.cshToast.show(
                         reconciledFailure && reconciledFailure.present
                             ? ('Cart: added ' + reconciledFailure.present + ' ' + type +
@@ -1782,6 +1817,7 @@
             await releaseWorkerLock();
             renderPanel();
         }
+        return summary;
     }
 
     async function retryFailed(changeSetId) {
@@ -2258,8 +2294,28 @@
         });
     }
 
+    // Complete-or-throw scraper for reconcileSubmittedBatch, its only caller.
+    // Reconciliation marks every batch item NOT found in this list as failed
+    // (and, in the caller's failed-POST branch, decides whether a native
+    // re-submit is safe), so a silently partial list here converts "we could
+    // not read the server" into "the server does not have it" — which either
+    // fails rows that actually landed or triggers a duplicate submit. Unlike
+    // the additive sync paths there is no safe way to consume a partial
+    // result, so any incompleteness throws:
+    //   * pagination broke mid-chain or the safety budget ran out;
+    //   * a page rendered rows but we could not parse ALL of them (the
+    //     localized/renamed-header case drops every row as no-type).
+    // Callers already handle the throw as "unverified" (successful POST) or
+    // "indeterminate" (failed POST).
     async function fetchChangeSetViewItems(packageId) {
         var items = [];
+        // Zero rows only counts as "genuinely empty" when page 1 carried the
+        // classic view's own empty placeholder — the same rule the
+        // authoritative sync uses (sawEmptyListMarker). An unexpected page can
+        // contain an empty table.list too, and returning [] for it would be a
+        // false confirmed-zero: reconciliation would fail rows that may have
+        // landed, and the submit bridge would native-resubmit on top of them.
+        var emptyConfirmed = false;
         var appOrigin = _appOriginForChangeSetView();
         var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
         var safety = 200;
@@ -2271,8 +2327,9 @@
             var doc = new DOMParser().parseFromString(r.text, 'text/html');
             var table = doc.querySelector('table.list');
             if (!table) {
-                if (pageNum === 1) throw new Error('No table.list on classic components view (' + r.url + ')');
-                break;
+                throw new Error('No table.list on classic components view page ' + pageNum +
+                    ' (' + r.url + ') — membership list would be ' +
+                    (pageNum === 1 ? 'unreadable' : 'incomplete'));
             }
             var header = table.querySelector('tr.headerRow');
             var idx = { name: -1, type: -1, fullName: -1 };
@@ -2285,16 +2342,21 @@
                 });
             }
             var rows = table.querySelectorAll('tr.dataRow');
+            if (pageNum === 1 && rows.length === 0) {
+                emptyConfirmed = !!table.querySelector('.noRowsHeader') ||
+                    /no (records to display|package components defined)/i.test(table.textContent || '');
+            }
+            var dropped = { noCid: 0, noType: 0 };
             rows.forEach(function (row) {
                 // Prefer componentId below; href is kept for removeHref only.
                 var href = _findDelHrefInRow(row);
                 var componentId = _findCidInRowAnchors(row, packageId, idx.name);
                 var fieldId = _findCidInRowFields(row, packageId);
                 var cid = componentId || fieldId || _extractCidFromDelHref(href);
-                if (!cid) return;
+                if (!cid) { dropped.noCid++; return; }
                 var cells = row.children;
                 var type = idx.type >= 0 && cells[idx.type] ? (cells[idx.type].textContent || '').trim() : '';
-                if (!type) return;
+                if (!type) { dropped.noType++; return; }
                 var name = idx.name >= 0 && cells[idx.name] ? (cells[idx.name].textContent || '').trim() : '';
                 var fullName = idx.fullName >= 0 && cells[idx.fullName] ? (cells[idx.fullName].textContent || '').trim() : '';
                 var it = { id: cid, type: type, name: name || cid };
@@ -2305,8 +2367,21 @@
                 }
                 items.push(it);
             });
+            if (dropped.noCid > 0 || dropped.noType > 0) {
+                throw new Error('Could not parse ' + (dropped.noCid + dropped.noType) + ' of ' +
+                    rows.length + ' row(s) on page ' + pageNum +
+                    ' (noCid=' + dropped.noCid + ', noType=' + dropped.noType +
+                    ', headerIdx=' + JSON.stringify(idx) + ') — refusing to reconcile against a partial list');
+            }
             var nextHref = _findNextPageHrefInDoc(doc);
             nextUrl = nextHref ? new URL(nextHref, nextUrl).href : null;
+        }
+        if (nextUrl && safety <= 0) {
+            throw new Error('Pagination safety budget exhausted with pages remaining — membership list incomplete');
+        }
+        if (items.length === 0 && !emptyConfirmed) {
+            throw new Error('Scrape returned zero components but the classic view never showed its ' +
+                'empty-list placeholder — cannot distinguish "empty change set" from "wrong page".');
         }
         return items;
     }

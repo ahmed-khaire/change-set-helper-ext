@@ -1675,6 +1675,47 @@ function cshIsCancelSubmit(event) {
     return name === 'cancel' || value === 'cancel';
 }
 
+// Hand the form back to Salesforce.
+//
+// HTMLFormElement.prototype.submit() deliberately does NOT fire the submit
+// event (so this can't recurse into our own bridge) — but it also omits the
+// submit button's own name/value, and Salesforce's AddToPackage handler
+// dispatches on `save=Add To Change Set`. Submitting without it silently does
+// the wrong thing, so re-add the control that was actually clicked as a hidden
+// field first.
+function cshSubmitNatively(form, submitter) {
+    try {
+        var control = submitter;
+        if (!control) {
+            control = form.querySelector('input[type="submit"][name="save"]') ||
+                      form.querySelector('input[type="submit"][name]');
+        }
+        if (control && control.name) {
+            var hidden = form.querySelector('input[data-csh-submitter="1"]');
+            if (!hidden) {
+                hidden = document.createElement('input');
+                hidden.type = 'hidden';
+                hidden.setAttribute('data-csh-submitter', '1');
+                form.appendChild(hidden);
+            }
+            hidden.name = control.name;
+            hidden.value = control.value || '';
+        }
+    } catch (e) {
+        console.warn('CSH: could not re-attach submit control:', e && e.message);
+    }
+    try {
+        HTMLFormElement.prototype.submit.call(form);
+    } catch (e) {
+        // Submission failed synchronously, so we are NOT navigating away and
+        // the injected field would otherwise sit in the DOM and contaminate
+        // whatever the user submits next.
+        var stale = form.querySelector('input[data-csh-submitter="1"]');
+        if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
+        throw e;
+    }
+}
+
 function cshInstallAddPageSubmitBridge() {
     if (!$('#entityType').length) {
         $("#editPage").off('submit.cshSubmitBridge').on('submit.cshSubmitBridge', function () {
@@ -1685,11 +1726,48 @@ function cshInstallAddPageSubmitBridge() {
     }
     $("#editPage").off('submit.cshSubmitBridge').on('submit.cshSubmitBridge', function (event) {
         if (cshIsCancelSubmit(event)) return true;
+        var form = this;
+        var submitter = event.originalEvent && event.originalEvent.submitter;
+
+        // Read the selection BEFORE anything redraws the table. clearFilters()
+        // calls DataTables .draw(), which with paging/deferRender adds and
+        // removes <tr> nodes — so reading afterwards can miss rows, and worse,
+        // redrawing before a native submit can pull a checked row out of the
+        // form entirely.
+        //
+        // Two selectors, because Salesforce is not consistent: most orgs name
+        // the row checkbox `ids`, but some releases give the visible checkbox a
+        // different name (see the findRowCheckboxes note in cart.js) — and a
+        // selection we fail to see here falls through to the cart path, which
+        // is precisely the "my click submitted something else" bug this guard
+        // exists to prevent. :checked only matches checkboxes/radios, so the
+        // hidden id inputs some layouts use cannot inflate the count.
+        var checkedCount = form.querySelectorAll(
+            'input[name="ids"]:checked, table.list tr.dataRow input[type="checkbox"]:checked'
+        ).length;
+
+        // An explicit selection is an explicit instruction: submit THESE. Hand
+        // straight back to Salesforce, untouched — no preventDefault, no
+        // re-submit, and the real submitter (save=Add To Change Set) is carried
+        // naturally.
+        //
+        // The bridge used to divert the click to the cart worker whenever the
+        // cart held any staged row, so "tick a box, press Add To Change Set"
+        // submitted whatever the cart happened to contain instead of the
+        // selection — and with a stale cart it added nothing at all while
+        // consuming the click. Cross-type and off-page cart work now belongs to
+        // the cart panel's Submit All, which is the affordance built for it.
+        if (checkedCount > 0) return true;
+
         clearFilters();
         if (!window.cshCart || !window.cshCart.getCart || !window.cshCart.runWorker) return true;
 
-        var form = this;
         event.preventDefault();
+        // Tracks whether we have reached the point where a POST may have been
+        // sent. Before that, falling back to the native submit is always safe;
+        // after it, the server outcome is unknown and a second submit could
+        // double-add.
+        var workerStarted = false;
         Promise.resolve()
             .then(function () {
                 if (window.cshCart.flushNow) return window.cshCart.flushNow();
@@ -1702,23 +1780,82 @@ function cshInstallAddPageSubmitBridge() {
                 var staged = cart && cart.items ? cart.items.filter(function (it) {
                     return it && it.status === 'staged' && it.salesforceId;
                 }) : [];
+                // Nothing ticked here and nothing staged anywhere — let
+                // Salesforce answer (it shows its own "select something" path).
                 if (!staged.length) {
-                    HTMLFormElement.prototype.submit.call(form);
+                    cshSubmitNatively(form, submitter);
                     return;
                 }
                 window.cshToast && window.cshToast.show(
-                    'Submitting ' + staged.length.toLocaleString() + ' staged component(s) in the background.',
+                    'Submitting ' + staged.length.toLocaleString() +
+                    ' staged component(s) in the background.',
                     { type: 'info', duration: 4000 }
                 );
+                workerStarted = true;
                 return window.cshCart.runWorker(changeSetId);
             })
+            .then(function (result) {
+                // runWorker handles its own per-batch errors and resolves
+                // normally, so a failure never reached the catch below — the
+                // click was consumed, nothing was added, the page never moved
+                // and the user saw nothing. Inspect the outcome instead.
+                //
+                // But "submitted === 0" is NOT proof that nothing landed. Only
+                // fall back to a second submit when the worker is certain it
+                // sent nothing; otherwise report and stop, because a duplicate
+                // add is worse than an unresolved one.
+                if (!result) return; // native-submit branch above already ran
+                if (result.ran === false) {
+                    // Another tab may be mid-submit on these very rows right
+                    // now. Submitting alongside it would race.
+                    window.cshToast && window.cshToast.show(
+                        'Cart submit did not start (' + (result.reason || 'busy') + '). ' +
+                        'Nothing was submitted — wait for the other tab to finish, then press ' +
+                        'Add To Change Set again.',
+                        { type: 'warning', duration: 9000 }
+                    );
+                    return;
+                }
+                if (result.indeterminate) {
+                    window.cshToast && window.cshToast.show(
+                        'Submitted, but Salesforce could not be re-read to confirm what landed' +
+                        (result.lastError ? ' (' + result.lastError + ')' : '') +
+                        '. Not retrying automatically — use Full Sync to check before resubmitting.',
+                        { type: 'warning', duration: 10000 }
+                    );
+                    return;
+                }
+                if (!result.submitted) {
+                    // Confirmed zero: nothing reached the server, so re-running
+                    // the native submit cannot double-add. Let Salesforce answer
+                    // — and show its error instead of swallowing the click.
+                    window.cshToast && window.cshToast.show(
+                        'Background submit added nothing' +
+                        (result.lastError ? ' (' + result.lastError + ')' : '') +
+                        '. Falling back to the standard Salesforce submit.',
+                        { type: 'warning', duration: 8000 }
+                    );
+                    cshSubmitNatively(form, submitter);
+                }
+            })
             .catch(function (e) {
-                console.warn('CSH submit bridge failed, falling back to standard submit:', e && e.message);
+                console.warn('CSH submit bridge failed:', e && e.message);
+                if (workerStarted) {
+                    // The worker threw after it may already have POSTed. The
+                    // server state is unknown, so do not submit again.
+                    window.cshToast && window.cshToast.show(
+                        'Background submit failed partway (' + ((e && e.message) || 'unknown') + '). ' +
+                        'Some components may already have been added — use Full Sync to check ' +
+                        'before retrying.',
+                        { type: 'error', duration: 10000 }
+                    );
+                    return;
+                }
                 window.cshToast && window.cshToast.show(
                     'Enhanced submit failed. Using the standard Salesforce submit for visible rows only.',
                     { type: 'warning', duration: 7000 }
                 );
-                HTMLFormElement.prototype.submit.call(form);
+                cshSubmitNatively(form, submitter);
             });
         return false;
     });
