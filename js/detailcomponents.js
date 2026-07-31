@@ -808,12 +808,15 @@
         var fullSyncControl = FULL_SYNC_ENABLED
             ? '<button type="button" class="csh-dc-full-sync-btn" title="Refresh the full server-side change set membership cache">Full Sync</button>'
             : '';
-        var actionRow = (bulkControls || fullSyncControl)
-            ? '<div class="csh-dc-action-row">' +
+        var browseControl =
+            '<button type="button" class="csh-dc-browse-btn" ' +
+            'title="Load every component in this change set into a filterable table: pick a component type, search, select across pages, bulk remove, and see cached created/modified metadata">' +
+            'Browse &amp; Filter</button>';
+        var actionRow = '<div class="csh-dc-action-row">' +
                 bulkControls +
+                browseControl +
                 fullSyncControl +
-              '</div>'
-            : '';
+              '</div>';
         var toolbar = document.createElement('div');
         toolbar.className = 'csh-dc-toolbar';
         toolbar.innerHTML = filterRow + actionRow;
@@ -994,6 +997,8 @@
                 handleRemoveSelected();
             } else if (t.classList.contains('csh-dc-full-sync-btn')) {
                 forceFullSync(table);
+            } else if (t.classList.contains('csh-dc-browse-btn')) {
+                toggleComponentsBrowser();
             }
         });
     }
@@ -1611,6 +1616,15 @@
                     map.set(componentId, absHref);
                     if (componentId.length === 18) map.set(componentId.slice(0, 15), absHref);
                 }
+                // Hidden-field ids too: fetchAllChangeSetComponents can pick
+                // a row's id from findCidInRowFields, and a cid the scraper
+                // can produce must be resolvable here or its removal fails
+                // with "Del URL not found".
+                var fieldCid = findCidInRowFields(row, csId);
+                if (fieldCid && fieldCid !== rawCid && fieldCid !== componentId) {
+                    map.set(fieldCid, absHref);
+                    if (fieldCid.length === 18) map.set(fieldCid.slice(0, 15), absHref);
+                }
                 rowsKept++;
             });
             // If we saw rows but matched nothing, the Action anchor shape has
@@ -1846,6 +1860,289 @@
         }
         finishProgressModal(result.done, result.failed);
         updateSelectionCount();
+    }
+
+    // -----------------------------------------------------------------------
+    // Components browser — the "DataTables-backed full-dataset view fed by
+    // fetchAllChangeSetComponents" the disabled filter toolbar always pointed
+    // at. Salesforce's native table renders one A4J page at a time and can't
+    // filter; this loads the COMPLETE membership once (on demand — no
+    // page-load traffic), joins the IndexedDB metadata cache for created/
+    // modified columns like the Add page's table, and supports type filter +
+    // search + cross-page selection + bulk remove through the same classic
+    // Del-URL machinery as the native-table toolbar.
+    //
+    // Metadata join is fullName-first: the Add page's row ids are package-
+    // member ids while the metadata cache keys real component ids, so names
+    // are the reliable bridge (same reason the Add page joins on
+    // data-fullName). Cells without cached metadata stay blank — the cache
+    // fills as types are visited in Add Components.
+    // -----------------------------------------------------------------------
+    var browserEl = null;          // container div, null until first open
+    var browserTable = null;       // DataTables instance
+    var browserItems = {};         // cid -> {id, type, name, fullName}
+    var browserSelected = {};      // cid -> true
+    var browserLoading = false;
+    // Bumped on every load; an in-flight load whose generation is stale (a
+    // Reload or an A4J reset started a newer one) must not render into the
+    // newer panel.
+    var browserGen = 0;
+
+    function browserEsc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+    }
+
+    function browserFmtDate(d) {
+        if (!d) return '';
+        try {
+            var m = moment(d);
+            return m.isValid() ? m.format('DD MMM YYYY') : '';
+        } catch (_) { return ''; }
+    }
+
+    function toggleComponentsBrowser() {
+        // A4J can replace the whole components section, orphaning the panel:
+        // toggling a detached node looks like a dead button. Detect and
+        // rebuild instead.
+        if (browserEl && !browserEl.isConnected) {
+            if (browserTable) { try { browserTable.destroy(); } catch (_) {} }
+            browserTable = null;
+            browserEl = null;
+            // Invalidate any in-flight load: its generation must not render
+            // into the rebuilt panel, and its loading flag must not block the
+            // rebuild.
+            browserGen++;
+            browserLoading = false;
+        }
+        if (browserEl && browserEl.style.display !== 'none') {
+            browserEl.style.display = 'none';
+            return;
+        }
+        if (browserEl) {
+            browserEl.style.display = '';
+            return;
+        }
+        loadComponentsBrowser();
+    }
+
+    async function loadComponentsBrowser() {
+        if (browserLoading) return;
+        browserLoading = true;
+        var gen = ++browserGen;
+        var toolbar = document.querySelector('.csh-dc-toolbar');
+        // Per-load LOCAL element: every later touch checks both the
+        // generation and that this element still IS the module's panel, so a
+        // load orphaned by an A4J detach can never render into (or crash on)
+        // a newer or reset panel.
+        var el = document.createElement('div');
+        browserEl = el;
+        el.className = 'csh-dc-browser';
+        el.style.cssText = 'margin:8px 0;border:1px solid #d8d8d8;border-radius:6px;padding:10px;background:#fff;';
+        el.innerHTML = '<em>Loading all change set components\u2026</em>';
+        toolbar.parentNode.insertBefore(el, toolbar.nextSibling);
+        try {
+            var csId = urlChangeSetId();
+            var packageId = await resolvePackageId(csId);
+            if (!packageId) throw new Error('could not resolve the 033 package id');
+            var scrape = await fetchAllChangeSetComponents(csId, packageId);
+            var items = scrape.items;
+            if (!scrape.complete) {
+                window.cshToast && window.cshToast.show(
+                    'Loaded a partial component list (pagination broke mid-scan) — the browser may be missing rows.',
+                    { type: 'warning', duration: 7000 });
+            }
+            // Metadata join, fullName-first, from the per-type cache.
+            var byTypeNames = {};
+            items.forEach(function (it) {
+                (byTypeNames[it.type] = byTypeNames[it.type] || []).push(it);
+            });
+            var metaByKey = {};   // 'type||lowername' -> record
+            var apiFor = (window.cshCart && window.cshCart.apiTypeForCartLabel)
+                ? window.cshCart.apiTypeForCartLabel
+                : function (t) { return String(t || '').replace(/ /g, ''); };
+            var types = Object.keys(byTypeNames);
+            for (var i = 0; i < types.length; i++) {
+                var label = types[i];
+                var apiName = apiFor(label);
+                var recs = [];
+                if (window.cshDb && window.cshDb.getComponentsByType) {
+                    try {
+                        recs = await window.cshDb.getComponentsByType(apiName) || [];
+                        if (!recs.length && apiName !== label) {
+                            recs = await window.cshDb.getComponentsByType(label) || [];
+                        }
+                    } catch (e) {
+                        console.warn('[CSH] browser metadata lookup failed for', apiName, e && e.message);
+                    }
+                }
+                recs.forEach(function (r) {
+                    [r.fullName, r.name].forEach(function (n) {
+                        if (n) metaByKey[label + '||' + String(n).toLowerCase()] = r;
+                    });
+                });
+            }
+            browserItems = {};
+            var rows = items.map(function (it) {
+                var fullName = (it.extra && it.extra.fullName) || '';
+                var meta = metaByKey[it.type + '||' + String(fullName || it.name).toLowerCase()] ||
+                           metaByKey[it.type + '||' + String(it.name).toLowerCase()] || {};
+                browserItems[it.id] = { id: it.id, type: it.type, name: it.name, fullName: fullName };
+                return [
+                    '<input type="checkbox" class="csh-dc-browser-cb" data-cid="' + browserEsc(it.id) + '">',
+                    browserEsc(it.name),
+                    browserEsc(it.type),
+                    browserEsc(fullName),
+                    browserEsc(browserFmtDate(meta.lastModifiedDate)),
+                    browserEsc(meta.lastModifiedByName || ''),
+                    browserEsc(browserFmtDate(meta.createdDate)),
+                    browserEsc(meta.createdByName || '')
+                ];
+            });
+            if (gen !== browserGen || el !== browserEl) return; // orphaned load
+            renderComponentsBrowser(rows, byTypeNames, items.length);
+        } catch (e) {
+            if (gen !== browserGen || el !== browserEl) return;
+            el.innerHTML = '<span style="color:#ba0517">Could not load components: ' +
+                browserEsc((e && e.message) || e) + '</span> ' +
+                '<button type="button" class="csh-dc-browser-retry">Retry</button>';
+            el.querySelector('.csh-dc-browser-retry').addEventListener('click', function () {
+                if (browserEl === el) browserEl = null;
+                el.remove();
+                loadComponentsBrowser();
+            });
+        } finally {
+            // Only the load that still owns the panel may clear the flag — a
+            // detach already cleared it (and may have started a rebuild whose
+            // own flag we must not stomp).
+            if (gen === browserGen) browserLoading = false;
+        }
+    }
+
+    function renderComponentsBrowser(rows, byTypeNames, total) {
+        browserSelected = {};
+        var typeOptions = Object.keys(byTypeNames).sort().map(function (t) {
+            return '<option value="' + browserEsc(t) + '">' + browserEsc(t) +
+                ' (' + byTypeNames[t].length + ')</option>';
+        }).join('');
+        browserEl.innerHTML =
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">' +
+              '<strong style="margin-right:4px;">All components (' + total + ')</strong>' +
+              '<label>Type: <select class="csh-dc-browser-type"><option value="">All types</option>' + typeOptions + '</select></label>' +
+              '<span class="csh-dc-browser-count">0 selected</span>' +
+              '<button type="button" class="csh-dc-browser-remove" disabled>Remove selected</button>' +
+              '<button type="button" class="csh-dc-browser-reload" title="Re-fetch the component list from Salesforce">Reload</button>' +
+              '<button type="button" class="csh-dc-browser-close">Hide</button>' +
+            '</div>' +
+            '<table class="csh-dc-browser-table list" style="width:100%"><thead><tr>' +
+              '<th></th><th>Name</th><th>Type</th><th>API Name</th>' +
+              '<th>Last Modified</th><th>Modified By</th><th>Created</th><th>Created By</th>' +
+            '</tr></thead></table>';
+        var $tbl = $(browserEl).find('.csh-dc-browser-table');
+        browserTable = $tbl.DataTable({
+            data: rows,
+            paging: true,
+            pageLength: 25,
+            order: [[1, 'asc']],
+            columnDefs: [{ targets: 0, orderable: false, searchable: false, width: '24px' }],
+            autoWidth: false
+        });
+        // Selection survives paging/filtering: state lives in browserSelected,
+        // checkboxes re-sync on every draw.
+        browserTable.on('draw', function () {
+            $(browserEl).find('.csh-dc-browser-cb').each(function () {
+                this.checked = !!browserSelected[this.getAttribute('data-cid')];
+            });
+        });
+        $(browserEl)
+            .off('.cshBrowser')
+            .on('change.cshBrowser', '.csh-dc-browser-cb', function () {
+                var cid = this.getAttribute('data-cid');
+                if (this.checked) browserSelected[cid] = true;
+                else delete browserSelected[cid];
+                updateBrowserCount();
+            })
+            .on('change.cshBrowser', '.csh-dc-browser-type', function () {
+                var v = this.value;
+                // exact-match column filter; regex-escape the label
+                browserTable.column(2).search(
+                    v ? '^' + v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$' : '',
+                    true, false).draw();
+            })
+            .on('click.cshBrowser', '.csh-dc-browser-remove', function () {
+                browserRemoveSelected();
+            })
+            .on('click.cshBrowser', '.csh-dc-browser-reload', function () {
+                if (browserTable) { browserTable.destroy(); browserTable = null; }
+                browserEl.innerHTML = '<em>Reloading\u2026</em>';
+                browserLoading = false;
+                var el = browserEl; browserEl = null;
+                el.remove();
+                loadComponentsBrowser();
+            })
+            .on('click.cshBrowser', '.csh-dc-browser-close', function () {
+                browserEl.style.display = 'none';
+            });
+        updateBrowserCount();
+    }
+
+    function updateBrowserCount() {
+        var n = Object.keys(browserSelected).length;
+        var countEl = browserEl.querySelector('.csh-dc-browser-count');
+        var removeBtn = browserEl.querySelector('.csh-dc-browser-remove');
+        if (countEl) countEl.textContent = n + ' selected';
+        if (removeBtn) removeBtn.disabled = n === 0;
+    }
+
+    async function browserRemoveSelected() {
+        var cids = Object.keys(browserSelected);
+        if (!cids.length) return;
+        if (!await window.cshDialog.confirm(
+                'Remove ' + cids.length + ' component(s) from this change set? This cannot be undone.',
+                { title: 'Remove components', confirmLabel: 'Remove', destructive: true })) return;
+        bulkCancelled = false;
+        showProgressModal(cids.length);
+        var removedItems = [];
+        var result = { done: 0, failed: cids.length };
+        try {
+        result = await window.cshChangeSetOps.removeManyByIds(cids, {
+            cancel: function () { return bulkCancelled; },
+            onItem: function (cid, ok, err) {
+                var it = browserItems[cid] || { name: cid, type: '' };
+                if (ok) {
+                    delete browserSelected[cid];
+                    removedItems.push({ id: cid, type: it.type, name: it.name });
+                    appendLog('\u2713 ' + it.name, 'ok');
+                } else {
+                    appendLog('\u2717 ' + it.name + ' \u2014 ' + ((err && err.message) || 'unknown'), 'fail');
+                }
+            },
+            onProgress: function (done, failed, totalN) { updateProgress(done + failed, totalN); }
+        });
+        if (removedItems.length) {
+            // Purge removed rows from OUR table without a refetch.
+            var removedSet = {};
+            removedItems.forEach(function (r) { removedSet[r.id] = true; });
+            browserTable.rows(function (idx, data) {
+                var m = String(data[0]).match(/data-cid="([^"]+)"/);
+                return !!(m && removedSet[m[1]]);
+            }).remove().draw(false);
+            await removeFromCartPanel(removedItems);
+            backgroundSyncCart(getCurrentTable(), { force: true }).catch(function (e) {
+                console.warn('[CSH] post-browser-remove sync failed:', e && e.message);
+            });
+        }
+        } catch (e) {
+            // The per-item paths surface their own failures; this catches
+            // the unexpected (table purge, cart cleanup) so the progress
+            // modal always reaches a terminal state instead of hanging.
+            console.error('[CSH] browser bulk remove failed:', e);
+            appendLog('\u2717 ' + ((e && e.message) || 'unexpected failure'), 'fail');
+        } finally {
+            finishProgressModal(result.done, result.failed);
+            updateBrowserCount();
+        }
     }
 
     function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }

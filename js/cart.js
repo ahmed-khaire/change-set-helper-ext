@@ -3349,6 +3349,7 @@
         clearDone: clearDone,
         clearStaged: clearStaged,
         clearWithPrompt: clearWithPrompt,
+        apiTypeForCartLabel: apiTypeForCartLabel,
         markNativeAddSubmitted: markNativeAddSubmitted,
         peekCart: peekCart,
         harvestNow: harvestNow,
