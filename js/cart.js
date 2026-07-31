@@ -2390,7 +2390,7 @@
     // a raw fetch+text() would produce: { ok, status, url, text }. Same-origin
     // fetches still go direct to avoid an unnecessary SW round trip on legacy
     // *.my.salesforce.com orgs.
-    function _fetchClassicPage(url) {
+    function _fetchClassicPageRaw(url) {
         var sameOrigin = (function () {
             try { return new URL(url).origin === location.origin; }
             catch (_) { return false; }
@@ -2419,6 +2419,70 @@
                 resolve({ ok: resp.ok, status: resp.status, url: resp.finalUrl || url, text: resp.text || '' });
             });
         });
+    }
+
+    // On some orgs (observed live on a large enhanced-domain sandbox),
+    // requesting /<033>?tab=PackageComponents redirects to Salesforce's
+    // "Bad External References" interstitial (/udd/AllPackage/
+    // badExternalRefs.apexp) — a warning page with no table.list, which used
+    // to surface as "No table.list on classic components view" and break both
+    // membership sync and bulk remove there. Other orgs serve the components
+    // table directly, so this is a per-org redirect, not a URL-scheme change.
+    // Recovery: scan the interstitial once for an onward link back to the
+    // components view (a continue/skip anchor or form) and follow it a single
+    // time. If no onward path exists, fail with a message that names the real
+    // condition instead of a generic parse error.
+    async function _fetchClassicPage(url) {
+        var r = await _fetchClassicPageRaw(url);
+        if (!/badExternalRefs\.apexp/i.test(String(r.url || ''))) return r;
+        console.warn('[CSH] classic components view redirected to badExternalRefs:', r.url);
+        var onward = null;
+        try {
+            var doc = new DOMParser().parseFromString(r.text, 'text/html');
+            // The 033 we asked for — the onward link must point at the SAME
+            // package, on the interstitial's own origin, or we could scrape a
+            // different package's membership as this change set's.
+            var wantedPkg = (String(url).match(/033[A-Za-z0-9]{12,15}/) || [null])[0];
+            var wantedPkg15 = wantedPkg ? wantedPkg.slice(0, 15) : null;
+            // Anchors, plus GET-only forms: a POST action cannot be replayed
+            // as a bare fetch without its method and field payload.
+            var candidates = [].concat(
+                [...doc.querySelectorAll('a[href]')].map(function (a) { return a.getAttribute('href'); }),
+                [...doc.querySelectorAll('form[action]')]
+                    .filter(function (f) { return !f.getAttribute('method') || /^get$/i.test(f.getAttribute('method')); })
+                    .map(function (f) { return f.getAttribute('action'); })
+            );
+            onward = candidates.find(function (href) {
+                if (!href || !/tab=PackageComponents/i.test(href) || /badExternalRefs/i.test(href)) return false;
+                try {
+                    var abs = new URL(href, r.url);
+                    if (abs.origin !== new URL(r.url).origin) return false;
+                    if (wantedPkg15) {
+                        var m = abs.href.match(/033[A-Za-z0-9]{12,15}/);
+                        if (!m || m[0].slice(0, 15) !== wantedPkg15) return false;
+                    }
+                    return true;
+                } catch (_) { return false; }
+            }) || null;
+            if (!onward) {
+                // Log what the page offered so the next report of this can be
+                // diagnosed from a console screenshot alone.
+                console.warn('[CSH] badExternalRefs page offered no onward link. anchors=',
+                    candidates.filter(Boolean).slice(0, 10));
+            }
+        } catch (e) {
+            console.warn('[CSH] could not parse badExternalRefs page:', e && e.message);
+        }
+        if (onward) {
+            var followed = await _fetchClassicPageRaw(new URL(onward, r.url).href);
+            if (!/badExternalRefs\.apexp/i.test(String(followed.url || ''))) {
+                console.log('[CSH] recovered components view via badExternalRefs onward link');
+                return followed;
+            }
+        }
+        throw new Error('Salesforce redirected the components view to its "Bad External References" ' +
+            'page for this package, and no usable continuation link was found on it. ' +
+            'The membership list cannot be read until Salesforce serves the components view.');
     }
 
     // Complete-or-throw scraper for reconcileSubmittedBatch, its only caller.

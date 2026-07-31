@@ -1163,7 +1163,7 @@
     // with host_permissions, so cross-origin classic-page requests proxy
     // through the service worker (cshClassicFetch / cshClassicFormSubmit).
     // Same-origin requests still go direct to skip the SW round trip.
-    function fetchClassicPage(url) {
+    function fetchClassicPageRaw(url) {
         var sameOrigin = (function () {
             try { return new URL(url).origin === location.origin; }
             catch (_) { return false; }
@@ -1183,6 +1183,62 @@
                 resolve({ ok: resp.ok, status: resp.status, url: resp.finalUrl || url, text: resp.text || '' });
             });
         });
+    }
+
+    // Same badExternalRefs interstitial recovery as cart.js:_fetchClassicPage
+    // — this file's scrapers (buildDelHrefMap, fetchAllChangeSetComponents)
+    // hit the identical URL family and broke identically on the org where
+    // Salesforce redirects it. One onward-link follow, then a descriptive
+    // failure instead of a generic "No table.list".
+    async function fetchClassicPage(url) {
+        var r = await fetchClassicPageRaw(url);
+        if (!/badExternalRefs\.apexp/i.test(String(r.url || ''))) return r;
+        console.warn('[CSH] classic components view redirected to badExternalRefs:', r.url);
+        var onward = null;
+        try {
+            var doc = new DOMParser().parseFromString(r.text, 'text/html');
+            // The 033 we asked for — the onward link must point at the SAME
+            // package, on the interstitial's own origin, or we could scrape a
+            // different package's membership as this change set's.
+            var wantedPkg = (String(url).match(/033[A-Za-z0-9]{12,15}/) || [null])[0];
+            var wantedPkg15 = wantedPkg ? wantedPkg.slice(0, 15) : null;
+            // Anchors, plus GET-only forms: a POST action cannot be replayed
+            // as a bare fetch without its method and field payload.
+            var candidates = [].concat(
+                [...doc.querySelectorAll('a[href]')].map(function (a) { return a.getAttribute('href'); }),
+                [...doc.querySelectorAll('form[action]')]
+                    .filter(function (f) { return !f.getAttribute('method') || /^get$/i.test(f.getAttribute('method')); })
+                    .map(function (f) { return f.getAttribute('action'); })
+            );
+            onward = candidates.find(function (href) {
+                if (!href || !/tab=PackageComponents/i.test(href) || /badExternalRefs/i.test(href)) return false;
+                try {
+                    var abs = new URL(href, r.url);
+                    if (abs.origin !== new URL(r.url).origin) return false;
+                    if (wantedPkg15) {
+                        var m = abs.href.match(/033[A-Za-z0-9]{12,15}/);
+                        if (!m || m[0].slice(0, 15) !== wantedPkg15) return false;
+                    }
+                    return true;
+                } catch (_) { return false; }
+            }) || null;
+            if (!onward) {
+                console.warn('[CSH] badExternalRefs page offered no onward link. anchors=',
+                    candidates.filter(Boolean).slice(0, 10));
+            }
+        } catch (e) {
+            console.warn('[CSH] could not parse badExternalRefs page:', e && e.message);
+        }
+        if (onward) {
+            var followed = await fetchClassicPageRaw(new URL(onward, r.url).href);
+            if (!/badExternalRefs\.apexp/i.test(String(followed.url || ''))) {
+                console.log('[CSH] recovered components view via badExternalRefs onward link');
+                return followed;
+            }
+        }
+        throw new Error('Salesforce redirected the components view to its "Bad External References" ' +
+            'page for this package, and no usable continuation link was found on it. ' +
+            'The membership list cannot be read until Salesforce serves the components view.');
     }
 
     function postClassicForm(url, body, method) {
