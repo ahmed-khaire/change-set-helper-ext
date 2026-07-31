@@ -34,20 +34,15 @@
     var delegatedEventsWired = false;
     var tableObserver = null;
     var pageObserverInstalled = false;
-    var initialAuthoritativeSyncStarted = false;
-    var cartSyncRequestWired = false;
     var cartDetailInitStarted = false;
 
     ensureDetailCartReady();
-    if (isWrappedDetailUrl()) {
-        setTimeout(function () {
-            if (initialAuthoritativeSyncStarted) return;
-            initialAuthoritativeSyncStarted = true;
-            backgroundSyncCart(null, { force: false }).catch(function (e) {
-                console.warn('[CSH] wrapped detail initial sync failed:', e && e.message);
-            });
-        }, 0);
-    }
+    // No page-load sync: the authoritative membership scrape used to run on
+    // every detail-page visit to feed the floating panel, and it is what
+    // produced the constant "Sync failed" (plus prune exposure) on orgs
+    // where the classic components URL redirects. The panel is gone;
+    // membership refresh is on demand via the toolbar's Full Sync button,
+    // and bulk remove still triggers its own post-remove sync.
 
     // Column indices resolved by scanning the header row once the table is
     // found. Keyed by header text lowercased; -1 if that header isn't present.
@@ -114,36 +109,16 @@
         wireDelegatedEvents(table);
         ensureDetailCartReady();
         if (FILTER_TOOLBAR_ENABLED) applyFilters(table); // populates the "N components" counter
-        var forceInitialSync = !initialAuthoritativeSyncStarted;
-        initialAuthoritativeSyncStarted = true;
-        backgroundSyncCart(table, { force: forceInitialSync });
         installPageObserver();
         console.log('detailcomponents: initialized on', table);
     }
 
     function ensureDetailCartReady() {
-        wireCartSyncRequest();
         if (!cartDetailInitStarted && window.cshCart && window.cshCart.init) {
             cartDetailInitStarted = true;
             window.cshCart.init({ changeSetId: urlChangeSetId() })
                 .catch(function (e) { console.warn('cshCart detail init failed:', e && e.message); });
         }
-    }
-
-    function wireCartSyncRequest() {
-        if (cartSyncRequestWired) return;
-        cartSyncRequestWired = true;
-        window.addEventListener('csh:cart-sync-request', async function (ev) {
-            if (ev.detail) ev.detail.handled = true;
-            var table = getCurrentTable();
-            var ok = await backgroundSyncCart(table, { force: true });
-            if (window.cshToast) {
-                window.cshToast.show(
-                    ok ? 'Change Set Details synced from Salesforce.' : 'Change Set Details sync failed.',
-                    { type: ok ? 'success' : 'error', duration: ok ? 3000 : 7000 }
-                );
-            }
-        });
     }
 
     function getCurrentTable() {
@@ -528,6 +503,11 @@
             var ok = await backgroundSyncCart(table, { force: true });
             if (ok && window.cshToast) {
                 window.cshToast.show('Full change set sync completed.', { type: 'success', duration: 3000 });
+            } else if (!ok && window.cshToast) {
+                // The panel's error badge used to show this; without a toast
+                // the button just resets and the failure is invisible.
+                window.cshToast.show('Full sync failed — the change set could not be read. See console for details.',
+                    { type: 'error', duration: 7000 });
             }
         } finally {
             if (btn) {

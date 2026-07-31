@@ -46,12 +46,12 @@
     // When the user updates/reloads the extension, every content script on
     // every tab becomes orphaned: chrome.runtime.id turns undefined and every
     // subsequent chrome.* call throws "Extension context invalidated". Before
-    // this guard, runRender would surface that error hundreds of times (once
-    // per mutation/scroll/render tick) and the cart UI silently froze.
+    // this guard, the render pipeline surfaced that error hundreds of times
+    // (once per mutation) and the cart UI silently froze.
     //
     // We now check cshExtAlive() before touching chrome.*, flip extDead once
-    // when it first reports false, and let runRender show a one-time refresh
-    // banner instead of re-throwing.
+    // when it first reports false, and show a one-time refresh banner
+    // (renderExtDeadBanner) instead of re-throwing.
     // -----------------------------------------------------------------------
     var extDead = false;
     function cshExtAlive() {
@@ -394,10 +394,18 @@
             if (!ok) {
                 persistFailure = lastStorageError || 'Could not save the cart to browser storage.';
                 console.error('[CSH] cart persist FAILED — in-memory state is not saved:', persistFailure);
+                // Quota failures already toast in storageSet; surface the
+                // rest here so unsaved state is never silent (the panel
+                // badge that used to show this is gone).
+                if (!/quota|QUOTA_BYTES|storage is full/i.test(persistFailure)) {
+                    window.cshToast && window.cshToast.show(
+                        'Cart could not be saved (' + persistFailure + ') — changes may be lost on refresh.',
+                        { type: 'error', duration: 8000 }
+                    );
+                }
             } else {
                 persistFailure = null;
             }
-            try { applySyncStateToPanel(); } catch (_) {}
         })();
         try { await flushInFlight; } finally { flushInFlight = null; }
     }
@@ -598,7 +606,7 @@
     }
 
     // Carts saved before the counts cache was introduced won't have .counts
-    // in storage — fall through to a one-shot recount so doRender can stay
+    // in storage — fall through to a one-shot recount so readers can stay
     // O(1) from then on. Fresh carts post-introduction carry .counts in
     // storage (set by recountCart in saveCart) and skip this.
     function ensureCounts(cart) {
@@ -1826,7 +1834,9 @@
             function (it) { return it.status === 'failed'; },
             { status: 'staged', error: '' }
         );
-        runWorker(changeSetId);
+        // Return the worker's outcome summary so the toolbar's Submit
+        // staged button can report a run that never started.
+        return runWorker(changeSetId);
     }
 
     // -----------------------------------------------------------------------
@@ -2803,305 +2813,57 @@
     }
 
     // -----------------------------------------------------------------------
-    // Floating panel UI
+    // Clear-cart flow — relocated from the removed floating panel; backs the
+    // Add-page toolbar's "Clear staged" button. Returns the action taken.
     // -----------------------------------------------------------------------
-    function ensurePanel() {
-        var panel = document.getElementById('csh-cart-panel');
-        if (panel) return panel;
-        panel = document.createElement('div');
-        panel.id = 'csh-cart-panel';
-        // Default to collapsed on all pages — the header bar stays visible
-        // and one click on "–" expands it. Avoids covering the component
-        // table on the Change Set Detail page and the Add Components grid
-        // on load.
-        panel.classList.add('csh-cart-collapsed');
-        panel.innerHTML =
-            '<div class="csh-cart-header">' +
-              '<span class="csh-cart-title">Change Set Details</span>' +
-              '<button class="csh-cart-sync-now" title="Sync added components from Salesforce" aria-label="Sync added components from Salesforce">↻</button>' +
-              '<button class="csh-cart-toggle-all" title="Collapse/expand all groups" aria-label="Collapse or expand all groups">⇅</button>' +
-              '<button class="csh-cart-close" title="Collapse" aria-label="Collapse">–</button>' +
-            '</div>' +
-            '<div class="csh-cart-search-row">' +
-              '<input type="search" class="csh-cart-search" placeholder="Search cart…" aria-label="Search cart items">' +
-            '</div>' +
-            '<div class="csh-cart-body"></div>' +
-            (CART_PRESETS_ENABLED
-                ? '<div class="csh-cart-section">' +
-                    '<label class="csh-cart-section-label">Saved presets</label>' +
-                    '<div class="csh-cart-section-row">' +
-                      '<select class="csh-cart-preset-select"><option value="">Load preset…</option></select>' +
-                      '<button class="csh-cart-save-preset" title="Save current cart as a named preset">Save</button>' +
-                      '<button class="csh-cart-delete-preset" title="Delete selected preset">Delete</button>' +
-                    '</div>' +
-                  '</div>'
-                : '') +
-            '<div class="csh-cart-section">' +
-              '<label class="csh-cart-section-label">package.xml</label>' +
-              '<div class="csh-cart-section-row">' +
-                '<button class="csh-cart-export-pkg" title="Download the cart as a Salesforce package.xml file">Export</button>' +
-                '<button class="csh-cart-import-pkg" title="Load a package.xml file into the cart">Import</button>' +
-                '<button class="csh-cart-import-info" type="button" title="What does Import do?" aria-label="About Import">i</button>' +
-                '<input type="file" class="csh-cart-pkg-file" accept=".xml,application/xml" style="display:none">' +
-              '</div>' +
-            '</div>' +
-            '<div class="csh-cart-footer">' +
-              '<button class="csh-cart-submit">Submit All</button>' +
-              '<button class="csh-cart-retry" style="display:none">Retry failed</button>' +
-              '<button class="csh-cart-clear">Clear cart</button>' +
-            '</div>';
-        document.body.appendChild(panel);
-        var searchInput = panel.querySelector('.csh-cart-search');
-        // Debounce live re-renders on each keystroke so a fast typist at a
-        // 4k cart doesn't queue a render per character. Render pipeline is
-        // already rAF-coalesced but the filter pass itself is O(n).
-        var searchDebounce = null;
-        searchInput.addEventListener('input', function () {
-            searchQuery = searchInput.value.trim().toLowerCase();
-            if (searchDebounce) clearTimeout(searchDebounce);
-            searchDebounce = setTimeout(function () {
-                searchDebounce = null;
-                renderPanel();
-            }, 80);
-        });
-        // <input type="search">'s native clear button fires a 'search' event;
-        // also handle it so clearing refreshes without waiting for blur.
-        searchInput.addEventListener('search', function () {
-            searchQuery = searchInput.value.trim().toLowerCase();
-            renderPanel();
-        });
-        panel.querySelector('.csh-cart-close').addEventListener('click', togglePanel);
-        panel.querySelector('.csh-cart-sync-now').addEventListener('click', function (ev) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            if (syncState === 'syncing') return;
-            var detail = { changeSetId: currentChangeSetId(), handled: false };
-            window.dispatchEvent(new CustomEvent('csh:cart-sync-request', { detail: detail }));
-            if (!detail.handled && window.cshToast) {
-                window.cshToast.show(
-                    'Open the Change Set Detail page to sync added components from Salesforce.',
-                    { type: 'info', duration: 5000 }
-                );
+    async function clearWithPrompt(changeSetId) {
+        if (!changeSetId) return 'cancel';
+        var { cart } = await getCart(changeSetId);
+        var counts = recountCart(cart);
+        var action = await showClearPrompt(counts);
+        if (action === 'cancel' || !action) return 'cancel';
+        if (action === 'staged') {
+            if (counts.staged + counts.failed) await clearStaged(changeSetId);
+        } else if (action === 'done') {
+            if (counts.done) await clearDone(changeSetId);
+        } else if (action === 'all') {
+            if (!await window.cshDialog.confirm(
+                    'Clear every cart item — staged, completed, and failed? This cannot be undone.',
+                    { title: 'Clear cart', confirmLabel: 'Clear everything', destructive: true })) {
+                return 'cancel';
             }
-        });
-        // Delegated chip click — chips live inside the body, which is
-        // re-rendered on every paint, so wire the listener on the stable
-        // panel element. Click toggles: same filter → clear; other → switch.
-        panel.addEventListener('click', function (ev) {
-            var removeType = ev.target.closest && ev.target.closest('.csh-cart-remove-type');
-            if (removeType && panel.contains(removeType)) {
-                ev.preventDefault();
-                ev.stopPropagation();
-                var changeSetId = currentChangeSetId();
-                var type = removeType.getAttribute('data-type');
-                if (!changeSetId || !type) return;
-                removeType.disabled = true;
-                removeDoneTypeFromServerAndCart(changeSetId, type)
-                    .then(function () {
-                        if (document.documentElement.contains(removeType)) removeType.disabled = false;
-                    })
-                    .catch(function (err) {
-                        removeType.disabled = false;
-                        var msg = (err && err.message) || String(err);
-                        console.error('[CSH] cart type remove failed:', err);
-                        window.cshToast && window.cshToast.show('Remove type failed: ' + msg, { type: 'error', duration: 8000 });
-                    });
-                return;
-            }
-            var chip = ev.target.closest && ev.target.closest('[data-status-filter]');
-            if (!chip || !panel.contains(chip)) return;
-            var f = chip.getAttribute('data-status-filter');
-            statusFilter = (statusFilter === f) ? '' : f;
-            renderPanel();
-        });
-        panel.querySelector('.csh-cart-toggle-all').addEventListener('click', function () {
-            // Mixed state (some open, some closed) → collapse-all wins so
-            // the click always produces a visibly uniform result. Pin the
-            // decision via expandOverride so the next render honours it.
-            var groups = panel.querySelectorAll('.csh-cart-body details.csh-cart-group');
-            if (!groups.length) return;
-            var anyOpen = Array.prototype.some.call(groups, function (d) { return d.open; });
-            var openAll = !anyOpen;
-            Array.prototype.forEach.call(groups, function (d) {
-                var key = d.getAttribute('data-group-key');
-                if (key) expandOverride.set(key, openAll);
-            });
-            renderPanel();
-        });
-        panel.querySelector('.csh-cart-submit').addEventListener('click', function () {
-            var changeSetId = currentChangeSetId();
-            if (changeSetId) runWorker(changeSetId);
-        });
-        panel.querySelector('.csh-cart-retry').addEventListener('click', function () {
-            var changeSetId = currentChangeSetId();
-            if (changeSetId) retryFailed(changeSetId);
-        });
-        panel.querySelector('.csh-cart-clear').addEventListener('click', async function () {
-            var changeSetId = currentChangeSetId();
-            if (!changeSetId) return;
-            var { cart } = await getCart(changeSetId);
-            var counts = recountCart(cart);
-            var stagedAndFailed = counts.staged + counts.failed;
-            var action = await showClearPrompt(counts);
-            if (action === 'cancel' || !action) return;
-            if (action === 'staged') {
-                if (!stagedAndFailed) return;
-                await clearStaged(changeSetId);
-            } else if (action === 'done') {
-                if (!counts.done) return;
-                await clearDone(changeSetId);
-            } else if (action === 'all') {
-                if (!await window.cshDialog.confirm(
-                        'Clear every cart item — staged, completed, and failed? This cannot be undone.',
-                        { title: 'Clear cart', confirmLabel: 'Clear everything', destructive: true })) return;
-                // Re-read via getCart so an unflushed snapshot isn't lost,
-                // and mark the wipe wholesale so the flush merge doesn't
-                // restore rows from another tab's copy.
-                var fresh = await getCart(changeSetId);
-                fresh.cart.items = [];
-                markCartReplaced(changeSetId);
-                await saveCart(fresh.all);
-                uncheckAllRowCheckboxes();
-            }
-        });
-
-        // Preset save/load/delete handlers are only wired when the presets UI
-        // is enabled — otherwise the querySelectors below return null and
-        // addEventListener throws on page init.
-        if (CART_PRESETS_ENABLED) {
-            panel.querySelector('.csh-cart-save-preset').addEventListener('click', async function () {
-                var name = await window.cshDialog.prompt('Name for this preset?',
-                        { title: 'Save cart as preset' });
-                if (!name) return;
-                try {
-                    var p = await savePreset(name);
-                    window.cshToast && window.cshToast.show('Saved "' + p.name + '" (' + p.itemCount + ' item(s))', { type: 'success' });
-                    await refreshPresetSelect();
-                } catch (e) {
-                    window.cshToast && window.cshToast.show('Save preset failed: ' + e.message, { type: 'error' });
-                }
-            });
-
-            panel.querySelector('.csh-cart-preset-select').addEventListener('change', async function () {
-                var name = this.value;
-                if (!name) return;
-                try {
-                    var res = await loadPreset(name);
-                    window.cshToast && window.cshToast.show(
-                        'Loaded "' + name + '": added ' + res.added + ' new staged item(s). ' +
-                        (res.added < res.total ? (res.total - res.added) + ' were already in cart.' : ''),
-                        { type: 'success' }
-                    );
-                } catch (e) {
-                    window.cshToast && window.cshToast.show('Load preset failed: ' + e.message, { type: 'error' });
-                }
-                this.value = '';
-            });
-
-            panel.querySelector('.csh-cart-delete-preset').addEventListener('click', async function () {
-                var select = panel.querySelector('.csh-cart-preset-select');
-                var name = select.value;
-                if (!name) {
-                    window.cshDialog.alert('Pick a preset from the dropdown first.');
-                    return;
-                }
-                if (!await window.cshDialog.confirm('Delete preset "' + name + '"?',
-                        { title: 'Delete preset', confirmLabel: 'Delete', destructive: true })) return;
-                await deletePreset(name);
-                await refreshPresetSelect();
-            });
+            // Re-read via getCart so an unflushed snapshot isn't lost, and
+            // mark the wipe wholesale so the flush merge doesn't restore
+            // rows from another tab's copy.
+            var fresh = await getCart(changeSetId);
+            fresh.cart.items = [];
+            markCartReplaced(changeSetId);
+            await saveCart(fresh.all);
+            uncheckAllRowCheckboxes();
         }
-
-        // Package.xml export
-        panel.querySelector('.csh-cart-export-pkg').addEventListener('click', async function () {
-            try { await exportCartAsPackageXml(); }
-            catch (e) { window.cshToast && window.cshToast.show('Export failed: ' + e.message, { type: 'error' }); }
-        });
-
-        // Package.xml import
-        var pkgFileInput = panel.querySelector('.csh-cart-pkg-file');
-        panel.querySelector('.csh-cart-import-pkg').addEventListener('click', function () {
-            pkgFileInput.click();
-        });
-        panel.querySelector('.csh-cart-import-info').addEventListener('click', function () {
-            window.cshToast && window.cshToast.show(
-                'Import loads items from a package.xml into the cart as staged selections only. ' +
-                'They are not added to the change set yet — click "Submit All" to send them to Salesforce.',
-                { type: 'info', duration: 9000 }
-            );
-        });
-        pkgFileInput.addEventListener('change', async function (ev) {
-            var file = ev.target.files && ev.target.files[0];
-            if (!file) return;
-            try {
-                var text = await file.text();
-                var added = await importPackageXml(text);
-                window.cshToast && window.cshToast.show(
-                    'Imported ' + added + ' item(s) from ' + file.name + '. ' +
-                    'Items without a Salesforce Id will resolve when you visit each type.',
-                    { type: 'success', duration: 6000 }
-                );
-            } catch (e) {
-                window.cshToast && window.cshToast.show('Import failed: ' + e.message, { type: 'error' });
-            }
-            pkgFileInput.value = '';
-        });
-
-        return panel;
+        return action;
     }
 
-    async function refreshPresetSelect() {
-        var panel = ensurePanel();
-        var select = panel.querySelector('.csh-cart-preset-select');
-        if (!select) return;
-        var presets = await listPresets();
-        select.innerHTML = '<option value="">Load preset…</option>' +
-            presets.map(function (p) {
-                var label = p.name + ' (' + p.itemCount + ')';
-                return '<option value="' + escapeAttr(p.name) + '">' + escapeHtml(label) + '</option>';
-            }).join('');
-    }
-
-    function togglePanel() {
-        var panel = ensurePanel();
-        panel.classList.toggle('csh-cart-collapsed');
-    }
-
-    // Render coalescing — dirty-flag pattern.
-    // At most one render is scheduled or in flight at any time. Calls during
-    // an in-flight render flip renderPending; when the current render finishes
-    // we re-schedule exactly once, so a burst of N notifyCartChanged() calls
-    // produces at most 2 renders (the one in flight + one trailing). Critical
-    // for bg sync at 4k items where hundreds of mutations can arrive per
-    // second.
+    // The floating "Change Set Details" panel is gone — keeping its display
+    // truthful required an authoritative server sync on every page load, and
+    // that machinery (plus its prune) caused more breakage than the panel
+    // was worth. renderPanel survives as the cart's change beacon: worker
+    // and storage code still call it after every mutation, and toolbar UIs
+    // (changeset.js) listen for the event to refresh their staged counts.
+    // The extension-reload banner keeps its old behaviour.
     var renderScheduled = false;
-    var renderPending = false;
     function renderPanel() {
-        if (renderScheduled) { renderPending = true; return; }
-        renderScheduled = true;
-        requestAnimationFrame(function () { runRender(); });
-    }
-    async function runRender() {
-        renderPending = false;
-        try {
-            if (extDead || !cshExtAlive()) {
-                if (!extDead) markExtDead();
-                renderExtDeadBanner();
-            } else {
-                await doRender();
-            }
-        } catch (e) {
-            var msg = e && e.message ? e.message : String(e);
-            if (/Extension context invalidated/i.test(msg)) {
-                markExtDead();
-                try { renderExtDeadBanner(); } catch (_) {}
-            } else {
-                console.warn('cshCart render failed:', msg);
-            }
-        } finally {
-            renderScheduled = false;
-            if (renderPending && !extDead) renderPanel();
+        if (extDead || !cshExtAlive()) {
+            if (!extDead) markExtDead();
+            try { renderExtDeadBanner(); } catch (_) {}
+            return;
         }
+        if (renderScheduled) return;
+        renderScheduled = true;
+        requestAnimationFrame(function () {
+            renderScheduled = false;
+            try { window.dispatchEvent(new CustomEvent('csh:cart-changed')); } catch (_) {}
+        });
     }
 
     // Shown in place of the cart when the content script is orphaned by an
@@ -3111,17 +2873,16 @@
     function renderExtDeadBanner() {
         var panel = document.getElementById('csh-cart-panel');
         if (!panel) {
-            // Can't use ensurePanel() here because its handlers touch chrome.*
-            // indirectly. Build a minimal standalone panel.
+            // Standalone on purpose: this banner must not depend on any
+            // chrome.* API (the context is already dead).
             panel = document.createElement('div');
             panel.id = 'csh-cart-panel';
             panel.className = 'csh-cart-ext-dead';
             document.body.appendChild(panel);
         }
         panel.classList.add('csh-cart-ext-dead');
-        // The banner replaces the header with a non-toggleable one, so if
-        // the panel was left collapsed by ensurePanel() the reload message
-        // in the body would be hidden with no way to open it.
+        // Non-collapsed and non-toggleable so the reload message is always
+        // visible.
         panel.classList.remove('csh-cart-collapsed');
         panel.style.display = '';
         panel.innerHTML =
@@ -3144,84 +2905,8 @@
         var btn = panel.querySelector('#csh-cart-ext-dead-reload');
         if (btn) btn.addEventListener('click', function () { location.reload(); });
     }
-    // -----------------------------------------------------------------------
-    // Virtualization — per-group windowed rendering.
-    //
-    // At 4k items rendering every <li> burns DOM nodes and re-layout time
-    // on every cart mutation. Groups past VIRT_THRESHOLD get a fixed-height
-    // scroll container whose inner spacer matches total*ITEM_H; only rows
-    // inside the viewport (+ buffer) actually exist in the DOM. The scroll
-    // handler recomputes the window and rewrites rows in place — no full
-    // rebuild per scroll tick.
-    //
-    // Row height is fixed to VIRT_ITEM_H and names single-line with CSS
-    // ellipsis when virtualized. Full name/subname are preserved in the
-    // row's title attribute so hovering still reveals them. Click removal
-    // uses delegation on body so we don't have to rewire listeners when
-    // rows are swapped mid-scroll.
-    // -----------------------------------------------------------------------
-    var VIRT_THRESHOLD = 80;
-    var VIRT_ITEM_H = 25;
-    var VIRT_VIEWPORT_H = 320;
-    var VIRT_BUFFER = 4;
-
-    // Live search filter — user-typed query applied in doRender against
-    // name / fullName / salesforceId. Lowercased once on input, compared
-    // with substring matches. Empty string means no filter.
-    var searchQuery = '';
-
-    // Status filter — click-to-toggle on the top chips. '' = no filter.
-    // Valid values: 'staged' | 'submitting' | 'done' | 'failed'.
-    var statusFilter = '';
-
-    // Background-sync status. Updated by setSyncState() from callers like
-    // detailcomponents.js while syncItemsFromServer is in flight. The render
-    // layer reflects this in the header (adds "· Syncing…" and a spinner
-    // that's visible even when the panel is collapsed) so users get feedback
-    // while the cart reconciles against the server.
     var syncState = 'idle'; // 'idle' | 'syncing' | 'error'
     var syncStateDetail = '';
-
-    function applySyncStateToPanel() {
-        var panel = document.getElementById('csh-cart-panel');
-        if (!panel) return;
-        panel.classList.toggle('csh-cart-syncing', syncState === 'syncing');
-        panel.classList.toggle('csh-cart-sync-error', syncState === 'error');
-        var syncBtn = panel.querySelector('.csh-cart-sync-now');
-        if (syncBtn) {
-            syncBtn.disabled = syncState === 'syncing';
-            syncBtn.title = syncState === 'syncing'
-                ? 'Syncing added components from Salesforce'
-                : 'Sync added components from Salesforce';
-        }
-        var titleEl = panel.querySelector('.csh-cart-title');
-        if (titleEl) {
-            var base = 'Change Set Details';
-            // Unsaved state outranks sync status: a cart that isn't on disk is
-            // about to be lost on refresh, which the user must see first.
-            if (persistFailure) {
-                titleEl.innerHTML = escapeHtml(base) +
-                    ' <span class="csh-cart-sync-badge csh-cart-sync-badge-error" title="' +
-                    escapeAttr(persistFailure + ' Your cart is only in memory and will be lost on refresh.') +
-                    '">· Not saved</span>';
-            } else if (syncState === 'syncing') {
-                titleEl.innerHTML = escapeHtml(base) +
-                    ' <span class="csh-cart-sync-badge">· Syncing' +
-                    '<span class="csh-cart-sync-dot"></span></span>';
-            } else if (syncState === 'error') {
-                titleEl.innerHTML = escapeHtml(base) +
-                    ' <span class="csh-cart-sync-badge csh-cart-sync-badge-error" title="' +
-                    escapeAttr(syncStateDetail || 'Sync failed') + '">· Sync failed</span>';
-            } else {
-                titleEl.textContent = base;
-            }
-        }
-        // When the panel has no visible items but a sync is running, show
-        // the panel anyway so the loading badge isn't hidden.
-        if (syncState === 'syncing' && panel.style.display === 'none') {
-            panel.style.display = '';
-        }
-    }
 
     function setSyncState(state, detail) {
         if (state !== 'idle' && state !== 'syncing' && state !== 'error') {
@@ -3229,376 +2914,6 @@
         }
         syncState = state;
         syncStateDetail = detail || '';
-        applySyncStateToPanel();
-    }
-
-    function itemMatchesSearch(it, q) {
-        if (!q) return true;
-        var name = (it.name || '').toLowerCase();
-        if (name.indexOf(q) !== -1) return true;
-        var fullName = (it.fullName || '').toLowerCase();
-        if (fullName.indexOf(q) !== -1) return true;
-        var sfid = (it.salesforceId || '').toLowerCase();
-        if (sfid.indexOf(q) !== -1) return true;
-        return false;
-    }
-
-    // Auto-collapse groups when the whole cart exceeds this. Avoids mounting
-    // N large group bodies up front on cart open — user picks which ones to
-    // expand. Toggles still virtualize inside; collapsing just hides the
-    // virtualized container entirely.
-    var AUTO_COLLAPSE_TOTAL = 500;
-    // Session-scoped "user expanded X" memory so re-renders don't reset the
-    // user's manual toggles. Keyed by changeSetId + type like scroll state.
-    var expandOverride = new Map(); // groupKey -> true/false (user set)
-
-    // scroll-top persisted across re-renders so the user's viewport isn't
-    // kicked back to the top every time an item status flips.
-    var scrollTopByGroupKey = new Map();
-    // Live registry of virtualized group containers on the current panel.
-    // Rebuilt on every render; scroll handlers look up the list from here.
-    var virtGroupState = new Map();
-
-    function groupKey(changeSetId, type) {
-        return changeSetId + '::' + type;
-    }
-
-    function itemRowHtml(it, primary, secondary, positioned) {
-        var virtualized = positioned != null;
-        var tag = virtualized ? 'div' : 'li';
-        var style = virtualized
-            ? ' style="position:absolute;top:' + (positioned * VIRT_ITEM_H) + 'px;left:0;right:0;height:' + VIRT_ITEM_H + 'px;"'
-            : '';
-        var cls = 'csh-cart-item status-' + it.status + (virtualized ? ' csh-cart-item-virt' : '');
-        return '<' + tag + ' class="' + cls + '" data-uid="' + escapeAttr(it.uid) + '"' + style +
-                  ' title="' + escapeAttr(primary + (secondary ? '\n' + secondary : '')) + '">' +
-                  '<div class="csh-cart-item-text">' +
-                    '<div class="csh-cart-item-name">' + escapeHtml(primary) + '</div>' +
-                    (secondary && !virtualized ? '<div class="csh-cart-item-subname">' + escapeHtml(secondary) + '</div>' : '') +
-                  '</div>' +
-                  // escapeHtml: statusLabel embeds it.error, which can contain a raw
-                  // slice of an HTTP response body (see cshSubmitCartBatch).
-                  '<span class="csh-cart-item-status">' + escapeHtml(statusLabel(it)) + '</span>' +
-                  (it.status === 'done'
-                    ? '<button class="csh-cart-remove" data-server-remove="1" title="' + escapeAttr(removeTitle(it)) + '">x</button>'
-                    : '') +
-                  // Non-done rows remove locally. Done rows remove from
-                  // Salesforce first, using cshChangeSetOps on the Detail
-                  // page or the classic PackageComponents fallback elsewhere.
-                  (it.status === 'done'
-                    ? ''
-                    : '<button class="csh-cart-remove" title="' + escapeAttr(removeTitle(it)) + '"' +
-                        (it.status === 'submitting' ? ' data-submitting="1"' : '') +
-                        '>×</button>') +
-                '</' + tag + '>';
-    }
-
-    // Choose primary/secondary display names for an item.
-    function itemNames(it) {
-        var primary = bestDisplayName(it);
-        var secondary = '';
-        if (it.fullName && it.name && it.fullName !== it.name && primary === it.fullName) {
-            secondary = it.name;
-        } else if (it.fullName && it.name && it.fullName !== it.name && primary === it.name) {
-            secondary = it.fullName;
-        }
-        return { primary: primary, secondary: secondary };
-    }
-
-    function renderInlineItemsHtml(list) {
-        var out = '';
-        for (var i = 0; i < list.length; i++) {
-            var it = list[i];
-            var n = itemNames(it);
-            out += itemRowHtml(it, n.primary, n.secondary, null);
-        }
-        return out;
-    }
-
-    // Renders just the outer virtualized shell — rows are injected by
-    // updateVirtWindow() once the DOM is live and we can read scrollTop.
-    function renderVirtShellHtml(groupKey, list) {
-        var totalH = list.length * VIRT_ITEM_H;
-        return '<div class="csh-cart-virt" data-group-key="' + escapeAttr(groupKey) + '"' +
-                 ' style="max-height:' + VIRT_VIEWPORT_H + 'px;overflow-y:auto;position:relative;">' +
-                 '<div class="csh-cart-virt-inner" style="position:relative;height:' + totalH + 'px;">' +
-                 '</div>' +
-               '</div>';
-    }
-
-    function updateVirtWindow(container, list) {
-        var inner = container.querySelector('.csh-cart-virt-inner');
-        if (!inner) return;
-        var scrollTop = container.scrollTop;
-        var viewH = container.clientHeight || VIRT_VIEWPORT_H;
-        var first = Math.max(0, Math.floor(scrollTop / VIRT_ITEM_H) - VIRT_BUFFER);
-        var visibleCount = Math.ceil(viewH / VIRT_ITEM_H) + 2 * VIRT_BUFFER;
-        var last = Math.min(list.length, first + visibleCount);
-        var html = '';
-        for (var i = first; i < last; i++) {
-            var it = list[i];
-            var n = itemNames(it);
-            html += itemRowHtml(it, n.primary, n.secondary, i);
-        }
-        inner.innerHTML = html;
-    }
-
-    function wireVirtGroup(container, list, savedScrollTop) {
-        virtGroupState.set(container, list);
-        if (savedScrollTop) container.scrollTop = savedScrollTop;
-        updateVirtWindow(container, list);
-        // rAF-coalesce scroll — a fast scroll generates many events but we
-        // only need one DOM rewrite per frame.
-        var scrollPending = false;
-        container.addEventListener('scroll', function () {
-            if (scrollPending) return;
-            scrollPending = true;
-            requestAnimationFrame(function () {
-                scrollPending = false;
-                var current = virtGroupState.get(container);
-                if (current) updateVirtWindow(container, current);
-            });
-            var key = container.getAttribute('data-group-key');
-            if (key) scrollTopByGroupKey.set(key, container.scrollTop);
-        });
-        // When a collapsed <details> re-opens, the container's clientHeight
-        // was 0 at wire time — repaint now that it's visible.
-        var details = container.closest('details.csh-cart-group');
-        if (details) {
-            details.addEventListener('toggle', function () {
-                if (details.open) {
-                    var current = virtGroupState.get(container);
-                    if (current) updateVirtWindow(container, current);
-                }
-            });
-        }
-    }
-
-    async function doRender() {
-            var panel = ensurePanel();
-            var changeSetId = currentChangeSetId();
-            if (!changeSetId) { panel.style.display = 'none'; return; }
-            var { cart } = await getCart(changeSetId);
-            var items = cart.items || [];
-            if (items.length === 0 && syncState !== 'syncing') {
-                panel.style.display = 'none';
-                return;
-            }
-            panel.style.display = '';
-            if (items.length === 0) {
-                // Empty cart + active sync: show a loading shell so the user
-                // sees feedback while the sync discovers items.
-                var emptyBody = panel.querySelector('.csh-cart-body');
-                if (emptyBody) {
-                    emptyBody.innerHTML = '<div class="csh-cart-empty">Syncing cart with server…</div>';
-                }
-                applySyncStateToPanel();
-                return;
-            }
-            var q = searchQuery;
-            var sf = statusFilter;
-            var byType = {};
-            var doneCountByType = {};
-            var visibleTotal = 0;
-            items.forEach(function (it) {
-                if (it.status === 'done' && it.salesforceId) {
-                    doneCountByType[it.type] = (doneCountByType[it.type] || 0) + 1;
-                }
-            });
-            items.forEach(function (it) {
-                if (!itemMatchesSearch(it, q)) return;
-                if (sf && (it.status || 'staged') !== sf) return;
-                (byType[it.type] = byType[it.type] || []).push(it);
-                visibleTotal++;
-            });
-            // Top chips stay as overall cart state so users still see the
-            // submission pipeline while filtering. Per-group (N) counts
-            // below naturally reflect the filter.
-            var counts = ensureCounts(cart);
-            virtGroupState = new Map(); // reset per render; populated below
-            var body = panel.querySelector('.csh-cart-body');
-            function statusChipHtml(filter, count, label, colorClass, alwaysShow) {
-                // Render when the chip has a count OR is the active filter —
-                // otherwise the user would lose the handle to clear a filter
-                // whose last matching item just changed state.
-                if (!count && !alwaysShow && sf !== filter) return '';
-                var active = sf === filter;
-                return '<span class="chip ' + colorClass +
-                    (active ? ' chip-active' : '') +
-                    '" data-status-filter="' + filter +
-                    '" role="button" tabindex="0" title="Click to ' +
-                    (active ? 'clear filter' : 'show only ' + label) +
-                    '">' + count + ' ' + label + '</span>';
-            }
-            var html = '<div class="csh-cart-counts">' +
-                statusChipHtml('staged', counts.staged, 'staged', 'chip-staged', true) +
-                statusChipHtml('submitting', counts.submitting, 'submitting', 'chip-submitting', false) +
-                statusChipHtml('done', counts.done, 'added', 'chip-done', false) +
-                statusChipHtml('failed', counts.failed, 'failed', 'chip-failed', false) +
-                (q ? '<span class="chip chip-filter">' + visibleTotal + ' matching “' + escapeHtml(q) + '”</span>' : '') +
-                '</div>';
-            if ((q || sf) && visibleTotal === 0) {
-                html += '<div class="csh-cart-empty">No items match the current filter.</div>';
-            }
-            var virtualizedGroups = []; // {key, list} — wired post-innerHTML
-            // With a search active, auto-expand every group so the user
-            // sees matches immediately without hunting through collapsed
-            // groups. When search clears, saved overrides / auto-collapse
-            // resume as before.
-            var autoCollapseAll = !q && items.length > AUTO_COLLAPSE_TOTAL;
-            Object.keys(byType).sort().forEach(function (type) {
-                var list = byType[type];
-                var key = groupKey(changeSetId, type);
-                // Expand decision: user override wins; otherwise default is
-                // open when total cart is small, collapsed when large so the
-                // initial paint stays cheap.
-                var override = expandOverride.get(key);
-                // With search active, always expand matching groups so the
-                // hits are visible. Otherwise honour the user's override or
-                // fall back to the auto-collapse default.
-                var isOpen = q
-                    ? true
-                    : (override != null ? override : !autoCollapseAll);
-                // Summary shows a preview of the first few names so the user
-                // can scan the cart without having to expand every group.
-                var previewNames = list
-                    .slice(0, 3)
-                    .map(function (it) { return bestDisplayName(it); })
-                    .join(', ');
-                if (list.length > 3) previewNames += ', +' + (list.length - 3) + ' more';
-                var doneInType = doneCountByType[type] || 0;
-                var removeTypeButton = doneInType
-                    ? '<button type="button" class="csh-cart-remove-type" data-type="' + escapeAttr(type) +
-                        '" title="Remove all added ' + escapeAttr(type) + ' components from this change set" ' +
-                        'aria-label="Remove all added ' + escapeAttr(type) + ' components from this change set">×</button>'
-                    : '';
-
-                html += '<details class="csh-cart-group"' + (isOpen ? ' open' : '') + ' data-group-key="' + escapeAttr(key) + '">' +
-                        '<summary>' +
-                          '<span class="csh-cart-group-type">' + escapeHtml(type) + '</span> ' +
-                          '<span class="csh-cart-type-count">(' + list.length + ')</span>' +
-                          removeTypeButton +
-                          '<div class="csh-cart-group-preview" title="' + escapeAttr(previewNames) + '">' +
-                            escapeHtml(previewNames) +
-                          '</div>' +
-                        '</summary>';
-                if (list.length > VIRT_THRESHOLD) {
-                    html += renderVirtShellHtml(key, list);
-                    virtualizedGroups.push({ key: key, list: list });
-                } else {
-                    html += '<ul>' + renderInlineItemsHtml(list) + '</ul>';
-                }
-                html += '</details>';
-            });
-            body.innerHTML = html;
-            virtualizedGroups.forEach(function (g) {
-                var container = body.querySelector('.csh-cart-virt[data-group-key="' + cssSel(g.key) + '"]');
-                if (container) {
-                    wireVirtGroup(container, g.list, scrollTopByGroupKey.get(g.key));
-                }
-            });
-            wireRemoveClickDelegation(body);
-            wireExpandOverrideTracking(body);
-            panel.querySelector('.csh-cart-retry').style.display = counts.failed ? '' : 'none';
-            panel.querySelector('.csh-cart-submit').disabled = (counts.staged === 0) || workerRunning;
-            panel.querySelector('.csh-cart-submit').textContent = workerRunning
-                ? 'Submitting…'
-                : 'Submit All (' + counts.staged + ')';
-            applySyncStateToPanel();
-    }
-
-    // CSS attribute-selector escape for data-group-key lookups. changeSetId
-    // and type are usually safe identifiers but we escape defensively.
-    function cssSel(s) {
-        return String(s).replace(/["\\]/g, '\\$&');
-    }
-
-    // One delegated toggle listener: when the user opens or closes a group,
-    // remember that choice so re-renders don't fight the user. The toggle
-    // event doesn't bubble natively — use capture so we catch it on body.
-    function wireExpandOverrideTracking(body) {
-        if (body._cshToggleWired) return;
-        body._cshToggleWired = true;
-        body.addEventListener('toggle', function (ev) {
-            var det = ev.target;
-            if (!det || det.tagName !== 'DETAILS') return;
-            var key = det.getAttribute('data-group-key');
-            if (!key) return;
-            expandOverride.set(key, !!det.open);
-        }, true);
-    }
-
-    // One delegated click listener for the lifetime of the body element.
-    // Reads the current change-set id inside the handler so navigations
-    // within the same panel target the right cart.
-    function wireRemoveClickDelegation(body) {
-        if (body._cshRemoveWired) return;
-        body._cshRemoveWired = true;
-        body.addEventListener('click', function (ev) {
-            var btn = ev.target.closest && ev.target.closest('.csh-cart-remove');
-            if (!btn) return;
-            // Block remove while the worker is actively submitting this row.
-            // The worker reconciles status by uid/predicate, so pulling the
-            // row out from under it isn't outright corrupting — but it means
-            // the user could see a stale "submitting…" flash re-appear if
-            // the row is re-added, which is confusing. Simpler to block.
-            if (btn.getAttribute('data-submitting') === '1' && workerRunning) {
-                if (window.cshToast) {
-                    window.cshToast.show(
-                        'Can\'t remove an item that\'s currently submitting. Wait for it to finish.',
-                        { type: 'warning', duration: 4000 }
-                    );
-                }
-                return;
-            }
-            var li = btn.closest('.csh-cart-item');
-            if (!li) return;
-            var csId = currentChangeSetId();
-            if (!csId) return;
-            if (btn.getAttribute('data-server-remove') === '1') {
-                btn.disabled = true;
-                removeDoneItemFromServerAndCart(csId, li.getAttribute('data-uid'))
-                    .catch(function (err) {
-                        btn.disabled = false;
-                        var msg = (err && err.message) || String(err);
-                        console.error('[CSH] cart server remove failed:', err);
-                        window.cshToast && window.cshToast.show('Remove failed: ' + msg, { type: 'error' });
-                    });
-                return;
-            }
-            removeItem(csId, li.getAttribute('data-uid'));
-        });
-    }
-
-    function statusLabel(it) {
-        if (it.status === 'staged') return 'staged';
-        if (it.status === 'submitting') return 'submitting…';
-        // A submit whose post-check couldn't reach the classic view. Saying
-        // plain "added" would assert a confirmation we never got — the whole
-        // point of the flag is that the user can see which rows are unproven.
-        if (it.status === 'done' && it.unverified) return 'added (unverified)';
-        if (it.status === 'done') return 'added';
-        if (it.status === 'failed') return 'failed — ' + (it.error || '');
-        return it.status;
-    }
-
-    // Tooltip text for the per-row × button. Conveys the real effect of the
-    // click, which differs by status. Server-side delete isn't implemented
-    // here yet (blocked on bulk-remove #1), so 'done' rows only remove from
-    // the local cart — background sync on next detail-page visit will re-
-    // add them from the server as source:'server-sync'.
-    function removeTitle(it) {
-        if (!it) return 'Remove';
-        if (it.status === 'staged') return 'Remove (not yet submitted)';
-        if (it.status === 'failed') return 'Remove failed item from cart';
-        if (it.status === 'submitting') return 'Submission in progress — cannot remove yet';
-        if (it.status === 'done') {
-            if (it.source === 'server-sync') {
-                return 'Remove from change set';
-            }
-            return 'Remove from change set';
-        }
-        return 'Remove';
     }
 
     // Choose the most human-readable identifier for a cart item.
@@ -3620,54 +2935,6 @@
 
     function notifyCartChanged() {
         renderPanel();
-    }
-
-    // -----------------------------------------------------------------------
-    // Type-switch prompt
-    //   Wraps the Component Type dropdown so we can intercept before
-    //   Salesforce reloads the page.
-    // -----------------------------------------------------------------------
-    function installTypeSwitchGuard(currentType) {
-        var $typeSelect = $('#entityType').length
-            ? $('#entityType')
-            : $('select[name="entityType"], select[name="p3"]').first();
-        if (!$typeSelect.length) return;
-
-        $typeSelect.off('change.csh').on('change.csh', async function (e) {
-            var checked = harvestChecked();
-            if (checked.length === 0) return; // nothing to stage, let it navigate
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            var newType = $typeSelect.val();
-            var action = await showStagingPrompt(currentType, newType, checked.length);
-            var changeSetId = currentChangeSetId();
-            if (!changeSetId) return;
-            if (action === 'cancel') {
-                // revert the select to the previous type
-                $typeSelect.val(currentType);
-                return;
-            }
-            if (action === 'stage') {
-                await addItems(changeSetId, currentType, checked);
-            } else if (action === 'submit') {
-                await addItems(changeSetId, currentType, checked);
-                runWorker(changeSetId); // fire-and-forget
-            }
-            // discard = do nothing to the cart; just navigate
-            navigateToType($typeSelect, newType);
-        });
-    }
-
-    function navigateToType($typeSelect, newType) {
-        // Re-fire Salesforce's own change handler by removing our namespace
-        // and calling change() once more. If Salesforce's handler is bound
-        // via inline onchange we trigger that too.
-        $typeSelect.off('change.csh');
-        var onchange = $typeSelect.attr('onchange');
-        if (onchange) {
-            try { new Function('event', onchange).call($typeSelect[0]); return; } catch (_) {}
-        }
-        $typeSelect.trigger('change');
     }
 
     // Three-way clear picker: staged+failed only, completed only, or
@@ -3718,33 +2985,6 @@
         });
     }
 
-    function showStagingPrompt(currentType, newType, count) {
-        return new Promise(function (resolve) {
-            var scrim = document.createElement('div');
-            scrim.className = 'csh-modal-scrim';
-            scrim.innerHTML =
-                '<div class="csh-modal">' +
-                  '<h3>Save your ' + escapeHtml(currentType) + ' selections?</h3>' +
-                  '<p>You have <strong>' + count + '</strong> unsaved ' + escapeHtml(currentType) +
-                  ' selection(s). Switching to <strong>' + escapeHtml(newType) +
-                  '</strong> will lose them unless you stage them first.</p>' +
-                  '<div class="csh-modal-actions">' +
-                    '<button data-action="stage" class="btn-primary">Save to cart</button>' +
-                    '<button data-action="submit">Save &amp; submit in background</button>' +
-                    '<button data-action="discard">Discard selections</button>' +
-                    '<button data-action="cancel" class="btn-ghost">Cancel</button>' +
-                  '</div>' +
-                '</div>';
-            document.body.appendChild(scrim);
-            scrim.addEventListener('click', function (e) {
-                var action = e.target && e.target.getAttribute('data-action');
-                if (!action) return;
-                scrim.remove();
-                resolve(action);
-            });
-        });
-    }
-
     // -----------------------------------------------------------------------
     // Entry point
     // -----------------------------------------------------------------------
@@ -3769,6 +3009,14 @@
             var restored = await restoreFromCart(_currentChangeSetId, currentType);
             if (restored > 0) {
                 console.log('cshCart: restored', restored, 'checkbox(es) from cart');
+                // Visible, with an exit: silently re-ticked stale selections
+                // were how 67 forgotten Apps ended up one click from being
+                // submitted. Clear staged in the toolbar is the undo.
+                window.cshToast && window.cshToast.show(
+                    'Restored ' + restored + ' saved selection(s) from your last visit. ' +
+                    'Untick any you no longer want, or use "Clear cart" in the toolbar.',
+                    { type: 'info', duration: 8000 }
+                );
             }
         }
 
@@ -3800,10 +3048,6 @@
         // navigate freely because state is already persisted on every click.
         // (Previously a modal tried to intercept and lost the race.)
         renderPanel();
-        // Populate the presets dropdown asynchronously; doesn't gate init.
-        refreshPresetSelect().catch(function (e) {
-            console.warn('refreshPresetSelect failed:', e && e.message);
-        });
         // Lazily resolve any imported-but-unresolved items for this type.
         if (currentType) {
             rescanForFullNames(_currentChangeSetId, currentType).catch(function () {});
@@ -3832,6 +3076,7 @@
         clearType: clearType,
         clearDone: clearDone,
         clearStaged: clearStaged,
+        clearWithPrompt: clearWithPrompt,
         runWorker: runWorker,
         retryFailed: retryFailed,
         harvestChecked: harvestChecked,

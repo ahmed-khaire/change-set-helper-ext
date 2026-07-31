@@ -1877,6 +1877,8 @@ function cshInstallToolbarActions() {
               '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
               '<input type="button" value="Refresh Type"           class="cshRefreshType btn"   title="Refresh the selected component type from Salesforce and update the local cache" />' +
               '<input type="button" value="Full Sync"              class="cshFullSync btn"      title="Refresh the full server-side change set membership cache" />' +
+              '<input type="button" value="Submit staged"          class="cshSubmitStaged btn"  style="display:none" title="Submit the cart\'s staged components (package.xml imports and selections saved earlier) to the change set in the background" />' +
+              '<input type="button" value="Clear cart"             class="cshClearStaged btn"   style="display:none" title="Clear staged, completed, or all items from the local cart" />' +
               '<span class="csh-type-sync-status" style="align-self:center;margin-left:4px;color:#666;font-size:12px;"></span>' +
               '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
             '</span>'
@@ -1978,14 +1980,128 @@ function cshWireToolbarActions() {
                 var added = await window.cshCart.importPackageXml(text);
                 window.cshToast && window.cshToast.show(
                     'Imported ' + added + ' item(s) from ' + file.name + '. ' +
-                    'Items without a Salesforce Id will resolve when you visit each type.',
-                    { type: 'success', duration: 6000 }
+                    'Items without a Salesforce Id will resolve when you visit each type; ' +
+                    'then press "Submit staged" in this toolbar.',
+                    { type: 'success', duration: 7000 }
                 );
             } catch (e) {
                 window.cshToast && window.cshToast.show('Import failed: ' + e.message, { type: 'error' });
             }
             ev.target.value = '';
+            cshRefreshCartToolbar();
         });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshSubmitStaged')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshSubmitStaged', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cshRunSubmitStaged();
+        });
+
+    $(document)
+        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshClearStaged')
+        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshClearStaged', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cshRunClearStaged();
+        });
+
+    if (!cshCartToolbarListenerInstalled) {
+        cshCartToolbarListenerInstalled = true;
+        // cart.js dispatches this after every cart mutation (its renderPanel
+        // beacon — the panel it used to repaint is gone).
+        window.addEventListener('csh:cart-changed', function () { cshRefreshCartToolbar(); });
+    }
+    cshRefreshCartToolbar();
+}
+
+// ---------------------------------------------------------------------------
+// Cart controls on the toolbar — the replacement surface for the removed
+// "Change Set Details" floating panel. Submit staged / Clear staged appear
+// only when the cart actually holds staged or failed work, so the toolbar
+// stays uncluttered for users who never touch package.xml import or
+// cross-type staging.
+// ---------------------------------------------------------------------------
+var cshCartToolbarListenerInstalled = false;
+var cshSubmitStagedRunning = false;
+
+function cshCartToolbarKey() {
+    return cshAddPagePackageId || cshAddPageChangeSetId || $('#id').val() || null;
+}
+
+async function cshRefreshCartToolbar() {
+    var $submit = $('.csh-toolbar-actions .cshSubmitStaged');
+    var $clear = $('.csh-toolbar-actions .cshClearStaged');
+    if (!$submit.length || !window.cshCart || !window.cshCart.getCart) return;
+    var key = cshCartToolbarKey();
+    if (!key) { $submit.hide(); $clear.hide(); return; }
+    try {
+        var state = await window.cshCart.getCart(key);
+        var staged = 0, failed = 0, done = 0;
+        (state && state.cart && state.cart.items || []).forEach(function (it) {
+            if (!it) return;
+            if (it.status === 'staged') staged++;
+            else if (it.status === 'failed') failed++;
+            else if (it.status === 'done') done++;
+        });
+        if (staged + failed > 0) {
+            $submit.val(failed > 0
+                ? 'Submit staged (' + staged + ' + ' + failed + ' failed)'
+                : 'Submit staged (' + staged + ')').show();
+        } else {
+            $submit.hide();
+        }
+        // Clear covers completed rows too — without this, a cart holding only
+        // 'done' rows would have no cleanup control at all (the clearDone flow
+        // would be unreachable).
+        if (staged + failed + done > 0) {
+            $clear.show();
+        } else {
+            $clear.hide();
+        }
+    } catch (e) {
+        console.warn('[CSH] cart toolbar refresh failed:', e && e.message);
+    }
+}
+
+async function cshRunSubmitStaged() {
+    if (cshSubmitStagedRunning) return;
+    var key = cshCartToolbarKey();
+    if (!key || !window.cshCart || !window.cshCart.retryFailed) return;
+    var $btn = $('.csh-toolbar-actions .cshSubmitStaged');
+    cshSubmitStagedRunning = true;
+    $btn.prop('disabled', true);
+    try {
+        // retryFailed re-stages failed rows (no-op when there are none) and
+        // then runs the worker, whose per-batch toasts report the outcomes.
+        var result = await window.cshCart.retryFailed(key);
+        if (result && result.ran === false) {
+            window.cshToast && window.cshToast.show(
+                'Cart submit did not start (' + (result.reason || 'busy') + ').',
+                { type: 'warning', duration: 6000 }
+            );
+        }
+    } catch (e) {
+        window.cshToast && window.cshToast.show(
+            'Submit staged failed: ' + ((e && e.message) || e), { type: 'error' });
+    } finally {
+        cshSubmitStagedRunning = false;
+        $btn.prop('disabled', false);
+        cshRefreshCartToolbar();
+    }
+}
+
+async function cshRunClearStaged() {
+    var key = cshCartToolbarKey();
+    if (!key || !window.cshCart || !window.cshCart.clearWithPrompt) return;
+    try {
+        await window.cshCart.clearWithPrompt(key);
+    } catch (e) {
+        window.cshToast && window.cshToast.show(
+            'Clear failed: ' + ((e && e.message) || e), { type: 'error' });
+    }
+    cshRefreshCartToolbar();
 }
 function cshTypeSyncJobKey(orgId, type) {
     return 'component-type-refresh::' + orgId + '::' + (type || 'unknown');
@@ -4231,9 +4347,9 @@ $(document).ready(function () {
             .catch(function (e) { console.warn('cshIdMap.putMapping failed:', e && e.message); });
     }
 
-    // Kick off the cart module: caches the form shape for this type, restores
-    // staged checkboxes from any prior session, installs the type-switch
-    // guard, and renders the floating panel if there are pending items.
+    // Kick off the cart module: caches the form shape for this type and
+    // restores staged checkboxes from any prior session (with a visible
+    // toast, so stale restores are never silent).
     if (window.cshCart && window.cshCart.init) {
         window.cshCart.init({
             changeSetId: __cshPkgId || __cshCsId || __cshRawId,
@@ -4241,44 +4357,13 @@ $(document).ready(function () {
         });
     }
 
-    // Populate the cart with components already in the change set so the
-    // panel reflects reality on first visit to the Add page (previously the
-    // panel stayed empty unless the user had already visited the Detail
-    // page AND its dual-key sync had happened to land on the 033 key).
-    //
-    // Writes to both the 033 (Add-page) and 0A2 (Detail-page) storage keys
-    // so the cart stays in sync across navigations.
-    if (window.cshCart && window.cshCart.syncFromChangeSetView) {
-        (async function () {
-            var __cshSetSync = window.cshCart.setSyncState || function () {};
-            if (!__cshPkgId && window.cshIdMap && __cshCsId) {
-                try {
-                    var __cshCachedPkg = await window.cshIdMap.getPackageId(__cshCsId);
-                    if (__cshCachedPkg && __cshPackageIdRe.test(__cshCachedPkg)) {
-                        __cshPkgId = __cshCachedPkg;
-                    }
-                } catch (e) {
-                    console.warn('cshIdMap.getPackageId failed:', e && e.message);
-                }
-            }
-            if (!__cshPkgId || !__cshPackageIdRe.test(__cshPkgId)) {
-                console.warn('[CSH] Add-page cart sync skipped: no 033 MetadataPackage id found. rawId=',
-                    __cshRawId, 'changeSetId=', __cshCsId);
-                __cshSetSync('idle');
-                return;
-            }
-            __cshSetSync('syncing');
-            window.cshCart.syncFromChangeSetView(__cshCsId || __cshPkgId, __cshPkgId)
-                .then(function (r) {
-                    console.log('[CSH] Add-page cart sync:', r);
-                    __cshSetSync('idle');
-                })
-                .catch(function (e) {
-                    console.warn('[CSH] Add-page cart sync failed:', e && e.message);
-                    __cshSetSync('error', (e && e.message) || 'Sync failed');
-                });
-        })();
-    }
+    // NOTE: the page-load authoritative sync that used to run here is gone
+    // with the floating panel it fed. It hammered the classic components view
+    // on every Add-page visit (constant "Sync failed" on orgs where that URL
+    // redirects, plus prune exposure and storage churn) to keep a display
+    // truthful that no longer exists. Membership refresh is now on demand via
+    // the toolbar's Full Sync button (cshRunAddPageFullSync), and post-submit
+    // verification still re-reads the server after every cart submit.
 });
 
 //Find out if they are logged in already
