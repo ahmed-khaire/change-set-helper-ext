@@ -5,6 +5,34 @@
 //   chrome.storage.local.set({ cshDevLogs: true })
 //   localStorage.setItem('cshDevLogs', '1')
 //   ?cshDevLogs=1 on extension pages/content-script pages
+
+// Drop 'unload' listener registrations before the vendored libraries load.
+//
+// Salesforce serves Setup pages with `Permissions-Policy: unload=()` (part of
+// Chrome's unload-handler deprecation), so every addEventListener('unload')
+// is rejected and logged as a "Permissions policy violation" on the
+// extension's error page. Two of our vendored libraries register one anyway:
+// jQuery's Sizzle (an ancient IE memory-leak workaround in setDocument) and
+// jsforce's event registry — both legacy cleanup that page teardown performs
+// regardless, so losing the listeners changes nothing in Chrome. This file is
+// the first script in every content-script context, and the shim only affects
+// this extension's isolated world; the page's own listeners are untouched.
+// 'beforeunload' and 'pagehide' pass through unmodified — cart.js relies on
+// 'beforeunload' for its last-chance storage write.
+(function () {
+    'use strict';
+    if (typeof window === 'undefined' || !window.addEventListener) return;
+    try {
+        var originalAdd = window.addEventListener.bind(window);
+        window.addEventListener = function (type, listener, options) {
+            // Exact match: DOM event types are case-sensitive and the policy
+            // only governs the literal 'unload' type.
+            if (type === 'unload') return undefined;
+            return originalAdd(type, listener, options);
+        };
+    } catch (_) { /* shim is best-effort; violations are harmless noise */ }
+})();
+
 (function () {
     'use strict';
 
