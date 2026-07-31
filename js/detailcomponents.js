@@ -1384,91 +1384,71 @@
         return null;
     }
 
-    // Salesforce only accepts the 033 MetadataPackage id on /<id>?tab=
-    // PackageComponents — the 0A2 outbound-change-set id redirects right
-    // back to the Visualforce detail page and the classic table never
-    // renders. The Add page (/p/mfpkg/AddToPackage...) accepts the 0A2 in
-    // its URL and exposes the matching 033 as $('#id').val() once rendered,
-    // which is exactly what changeset.js:230 reads to build its "View
-    // change set" button. We load the Add page in a hidden same-origin
-    // iframe, poll until #id populates, then tear the iframe down.
     var PACKAGE_ID_RE = /^033[A-Za-z0-9]{12,15}$/;
     var packageIdCache = null;
 
-    function loadAddPageInIframe(url, timeoutMs) {
-        return new Promise(function (resolve, reject) {
-            var iframe = document.createElement('iframe');
-            iframe.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;border:0;';
-            iframe.src = url;
-            var settled = false;
-            var pollTimer = null;
-            function cleanup() {
-                if (pollTimer) clearInterval(pollTimer);
-                if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
-            }
-            function finish(value, err) {
-                if (settled) return;
-                settled = true;
-                cleanup();
-                err ? reject(err) : resolve(value);
-            }
-            var timeoutHandle = setTimeout(function () {
-                finish(null, new Error('Add page iframe timed out after ' + timeoutMs + 'ms'));
-            }, timeoutMs);
-            var dumpedOnce = false;
-            function dumpIframeState(doc, reason) {
-                if (dumpedOnce) return;
-                dumpedOnce = true;
-                try {
-                    var allIdInputs = Array.from(doc.querySelectorAll('input[id="id"], input[name="id"]'))
-                        .map(function (el) { return { id: el.id, name: el.name, value: el.value }; });
-                    var any033 = (doc.body && doc.body.innerHTML || '').match(/033[A-Za-z0-9]{12,15}/);
-                    console.log('[CSH] Add-page iframe dump (' + reason + '):',
-                        'href=', doc.location && doc.location.href,
-                        'idInputs=', allIdInputs,
-                        'first-033-in-body=', any033 && any033[0]);
-                } catch (e) {
-                    console.warn('[CSH] Add-page iframe dump failed:', e);
-                }
-            }
-            iframe.addEventListener('load', function () {
-                var tries = 0;
-                pollTimer = setInterval(function () {
-                    tries++;
-                    try {
-                        var doc = iframe.contentDocument;
-                        if (!doc) return;
-                        // Try the jQuery-visible element first, then any 033 reachable from inputs or raw HTML.
-                        var input = doc.getElementById('id');
-                        var val = input && input.value;
-                        if (val && PACKAGE_ID_RE.test(val)) {
-                            clearTimeout(timeoutHandle);
-                            finish(val);
-                            return;
-                        }
-                        // Fallback: scan every input for a 033 value — SF has changed the field name across releases.
-                        var alt = Array.from(doc.querySelectorAll('input')).find(function (el) {
-                            return el.value && PACKAGE_ID_RE.test(el.value);
-                        });
-                        if (alt) {
-                            clearTimeout(timeoutHandle);
-                            finish(alt.value);
-                            return;
-                        }
-                        // After ~2s of no match, dump state once so we can see what's actually on the page.
-                        if (tries === 20) dumpIframeState(doc, 'still-empty-after-2s');
-                    } catch (err) {
-                        clearTimeout(timeoutHandle);
-                        finish(null, err);
-                    }
-                }, 100);
-            });
-            iframe.addEventListener('error', function () {
-                clearTimeout(timeoutHandle);
-                finish(null, new Error('Add page iframe failed to load'));
-            });
-            document.body.appendChild(iframe);
+    // Cold 0A2 -> 033 resolution. GETting /p/mfpkg/AddToPackage*?id=<0A2>
+    // renders "Add to Change Set: null" with NO 033 anywhere in the HTML
+    // (verified live on both origins, open and closed sets alike), so
+    // fetch-and-scan and hidden-iframe loads of that URL can never work.
+    // The one server artifact that maps the ids without an Add-page visit
+    // is the redirect the detail page's own "Add" button produces: an A4J
+    // post carrying doRedirect=1 answers with a ~1KB redirect stub whose
+    // target URL embeds the 033. Replicate that post from the live page —
+    // same-origin, no navigation, and nothing is added to the change set
+    // (the Add action merely opens the component picker).
+    // The detail page renders an "Add" button only while the change set is
+    // open; uploaded (closed) sets are immutable and lose it. That makes
+    // the button's presence the closed/open probe — a DOM fact, checked
+    // directly by mutation entry points too, because a cached 0A2->033
+    // mapping from when the set was still open would otherwise skip the
+    // resolver (and this check) entirely.
+    function findAddButton() {
+        var inputs = document.querySelectorAll('input[name]');
+        for (var i = 0; i < inputs.length; i++) {
+            if (/:outboundCs_add$/.test(inputs[i].name)) return inputs[i];
+        }
+        return null;
+    }
+
+    function closedChangeSetError() {
+        var err = new Error('this change set is closed — components cannot be added or removed. Use the standard table below to view them.');
+        err.cshClosedChangeSet = true;
+        return err;
+    }
+
+    async function resolveViaAddButtonPost() {
+        var addBtn = findAddButton();
+        if (!addBtn || !addBtn.form) {
+            // Closed set: fail fast with the user-facing message instead of
+            // burning time on probes that cannot succeed.
+            throw closedChangeSetError();
+        }
+        var form = addBtn.form;
+        var params = new URLSearchParams();
+        params.append('AJAXREQUEST', '_viewRoot');
+        Array.prototype.forEach.call(form.elements, function (el) {
+            if (el.name && el.type === 'hidden') params.append(el.name, el.value);
         });
+        // The com.salesforce.visualforce.ViewState* inputs live OUTSIDE the
+        // form element on VF pages; A4J submits them all the same.
+        Array.prototype.forEach.call(document.querySelectorAll('input[type="hidden"]'), function (el) {
+            if (/^com\.salesforce\.visualforce\./.test(el.name || '')) params.append(el.name, el.value);
+        });
+        params.append('doRedirect', '1');
+        params.append(addBtn.name, addBtn.name);
+        var action = new URL(form.getAttribute('action'), location.href).href;
+        var resp = await fetch(action, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: params.toString()
+        });
+        if (!resp.ok) throw new Error('Add-button post failed: HTTP ' + resp.status);
+        var text = await resp.text();
+        var m = text.match(/033[A-Za-z0-9]{12,15}/);
+        if (!m) throw new Error('Add-button post response had no 033 (' + text.length + ' bytes)');
+        return m[0];
     }
 
     async function resolvePackageId(csId) {
@@ -1498,75 +1478,18 @@
                 console.warn('[CSH] cshIdMap.getPackageId failed:', e && e.message);
             }
         }
-        // BOTH origins, current page's first. Enhanced-domain orgs split page
-        // families across hosts: the classic components view (an APP page)
-        // lives on *.my.salesforce.com, but /p/mfpkg/AddToPackage* is a SETUP
-        // page served on *.my.salesforce-setup.com — the app-origin fetch gets
-        // a Lightning shell with no 033 input there, which left the resolver
-        // dead on any change set whose id-map cache was cold ("could not
-        // resolve the 033 package id" the moment Browse & Filter or bulk
-        // remove ran before an Add-page visit). Classic orgs collapse both
-        // origins to one, so the dedupe keeps this a single-probe list there.
-        var addPagePaths = ['/p/mfpkg/AddToPackageFromChangeMgmtUi?id=', '/p/mfpkg/AddToPackageUi?id='];
-        var addPageOrigins = [location.origin, appOriginForChangeSetView()].filter(function (o, i, a) {
-            return a.indexOf(o) === i;
-        });
-        var addPageUrls = [];
-        addPageOrigins.forEach(function (origin) {
-            addPagePaths.forEach(function (path) {
-                addPageUrls.push(new URL(path + encodeURIComponent(csId), origin).href);
-            });
-        });
-        // Preferred: plain fetch of the Add page HTML (SW-proxied when this
-        // detail page is on *.salesforce-setup.com) and scan it for the 033 —
-        // same technique as outboundlist.js. The hidden-iframe fallback below
-        // is unreliable: Salesforce often refuses to render the Add page in
-        // an iframe, and on Setup-domain orgs a relative iframe URL targeted
-        // the wrong host entirely (issue: "no <input id=\"id\"> was present").
-        for (var f = 0; f < addPageUrls.length; f++) {
-            try {
-                var page = await fetchClassicPage(addPageUrls[f]);
-                if (!page.ok) continue;
-                var addDoc = new DOMParser().parseFromString(page.text, 'text/html');
-                var found = null;
-                var inputs = addDoc.querySelectorAll('input');
-                for (var j = 0; j < inputs.length; j++) {
-                    var v = inputs[j].value || '';
-                    if (PACKAGE_ID_RE.test(v)) { found = v; break; }
-                }
-                if (!found) {
-                    var bodyMatch = (addDoc.body && addDoc.body.innerHTML || '').match(/033[A-Za-z0-9]{12,15}/);
-                    if (bodyMatch) found = bodyMatch[0];
-                }
-                if (found) {
-                    packageIdCache = found;
-                    console.log('[CSH] packageId from Add page fetch (' + addPageUrls[f] + '):', packageIdCache);
-                    if (window.cshIdMap) window.cshIdMap.putMapping(csId, found).catch(function () {});
-                    return packageIdCache;
-                }
-                console.warn('[CSH] Add page fetch had no 033:', page.url);
-            } catch (err) {
-                console.warn('[CSH] Add page fetch failed:', addPageUrls[f], err && err.message);
-            }
-        }
-        // Iframe fallback is a last resort Salesforce usually refuses to
-        // render, at 15s per attempt — probe ONE url per origin, not the
-        // full path cross-product, so the worst case stays bounded.
-        var iframeUrls = addPageOrigins.map(function (origin) {
-            return new URL(addPagePaths[0] + encodeURIComponent(csId), origin).href;
-        });
-        for (var i = 0; i < iframeUrls.length; i++) {
-            try {
-                var val = await loadAddPageInIframe(iframeUrls[i], 15000);
-                if (val) {
-                    packageIdCache = val;
-                    console.log('[CSH] packageId from Add page iframe (' + iframeUrls[i] + '):', packageIdCache);
-                    if (window.cshIdMap) window.cshIdMap.putMapping(csId, val).catch(function () {});
-                    return packageIdCache;
-                }
-            } catch (err) {
-                console.warn('[CSH] Add page iframe failed:', iframeUrls[i], err);
-            }
+        try {
+            var posted = await resolveViaAddButtonPost();
+            packageIdCache = posted;
+            console.log('[CSH] packageId from Add-button post:', packageIdCache);
+            if (window.cshIdMap) window.cshIdMap.putMapping(csId, posted).catch(function () {});
+            return packageIdCache;
+        } catch (err) {
+            // The closed-set error is deliberate and user-facing; let it
+            // surface. Anything else degrades to the callers' own
+            // could-not-resolve handling.
+            if (err && err.cshClosedChangeSet) throw err;
+            console.warn('[CSH] Add-button post resolution failed:', err && err.message);
         }
         return null;
     }
@@ -1577,8 +1500,7 @@
         if (!urlId) throw new Error('No change-set id in URL');
         var csId = await resolvePackageId(urlId);
         if (!csId) {
-            throw new Error('Could not resolve the 033 MetadataPackage id for this change set. ' +
-                            'Fetched /p/mfpkg/AddToPackageUi?id=' + urlId + ' but no <input id="id"> was present.');
+            throw new Error('Could not resolve the 033 MetadataPackage id for this change set.');
         }
         console.log('[CSH] buildDelHrefMap using id:', csId);
         var map = new Map();
@@ -1981,6 +1903,11 @@
         toolbar.parentNode.insertBefore(el, toolbar.nextSibling);
         try {
             var csId = urlChangeSetId();
+            // DOM check, not resolver check: a cached 0A2->033 mapping from
+            // when this set was still open would bypass the resolver's own
+            // closed detection and render Remove controls on an immutable
+            // set.
+            if (!findAddButton()) throw closedChangeSetError();
             var packageId = await resolvePackageId(csId);
             if (!packageId) throw new Error('could not resolve the 033 package id');
             var scrape = await fetchAllChangeSetComponents(csId, packageId);
@@ -2169,6 +2096,37 @@
         }
     }
 
+    // Recompute the "All components (N)" total and the type dropdown's
+    // per-type counts from browserItems after removals purge rows. Types
+    // that reach zero are dropped; if the active filter's type vanished,
+    // the filter resets to "All types" so the table doesn't strand the
+    // user on a guaranteed-empty view.
+    function refreshBrowserHeaderCounts() {
+        if (!browserEl) return;
+        var counts = {};
+        var total = 0;
+        Object.keys(browserItems).forEach(function (cid) {
+            var t = browserItems[cid].type;
+            counts[t] = (counts[t] || 0) + 1;
+            total++;
+        });
+        var strong = browserEl.querySelector('strong');
+        if (strong) strong.textContent = 'All components (' + total + ')';
+        var sel = browserEl.querySelector('.csh-dc-browser-type');
+        if (!sel) return;
+        var current = sel.value;
+        sel.innerHTML = '<option value="">All types</option>' +
+            Object.keys(counts).sort().map(function (t) {
+                return '<option value="' + browserEsc(t) + '">' + browserEsc(t) +
+                    ' (' + counts[t] + ')</option>';
+            }).join('');
+        sel.value = current;
+        if (sel.value !== current && browserTable) {
+            sel.value = '';
+            browserTable.column(2).search('', true, false).draw();
+        }
+    }
+
     async function browserRemoveSelected() {
         var cids = Object.keys(browserSelected);
         if (!cids.length) return;
@@ -2202,6 +2160,8 @@
                 var m = String(data[0]).match(/data-cid="([^"]+)"/);
                 return !!(m && removedSet[m[1]]);
             }).remove().draw(false);
+            removedItems.forEach(function (r) { delete browserItems[r.id]; });
+            refreshBrowserHeaderCounts();
             await removeFromCartPanel(removedItems);
             backgroundSyncCart(getCurrentTable(), { force: true }).catch(function (e) {
                 console.warn('[CSH] post-browser-remove sync failed:', e && e.message);
