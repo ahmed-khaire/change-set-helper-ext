@@ -1955,7 +1955,7 @@ function cshInstallToolbarActions() {
               '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
               '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
               '<input type="button" value="Refresh Type"           class="cshRefreshType btn"   title="Refresh the selected component type from Salesforce and update the local cache" />' +
-              '<input type="button" value="Clear cart"             class="cshClearStaged btn"   style="display:none" title="Clear staged, completed, or all items from the local cart" />' +
+              '<input type="button" value="Clear saved selections" class="cshClearStaged btn"   style="display:none" title="Clear locally saved selections (staged, completed, or all) — never removes anything from the change set on the server" />' +
               '<span class="csh-type-sync-status" style="align-self:center;margin-left:4px;color:#666;font-size:12px;"></span>' +
               '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
             '</span>'

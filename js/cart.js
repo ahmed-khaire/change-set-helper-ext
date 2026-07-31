@@ -3096,7 +3096,7 @@
         } else if (action === 'all') {
             if (!await window.cshDialog.confirm(
                     'Clear every cart item — staged, completed, and failed? This cannot be undone.',
-                    { title: 'Clear cart', confirmLabel: 'Clear everything', destructive: true })) {
+                    { title: 'Clear saved selections', confirmLabel: 'Clear everything', destructive: true })) {
                 return 'cancel';
             }
             // Re-read via getCart so an unflushed snapshot isn't lost, and
@@ -3226,7 +3226,7 @@
             scrim.className = 'csh-modal-scrim';
             scrim.innerHTML =
                 '<div class="csh-modal">' +
-                  '<h3>Clear cart</h3>' +
+                  '<h3>Clear saved selections</h3>' +
                   '<p>Pick what to remove from the cart. Items already in the change set on the server are not affected.</p>' +
                   submittingNote +
                   '<div class="csh-modal-actions">' +
@@ -3286,7 +3286,7 @@
                 // submitted. Clear staged in the toolbar is the undo.
                 window.cshToast && window.cshToast.show(
                     'Restored ' + restored + ' saved selection(s) from your last visit. ' +
-                    'Untick any you no longer want, or use "Clear cart" in the toolbar.',
+                    'Untick any you no longer want, or use "Clear saved selections" in the toolbar.',
                     { type: 'info', duration: 8000 }
                 );
             }
