@@ -117,7 +117,57 @@
         if (!cartDetailInitStarted && window.cshCart && window.cshCart.init) {
             cartDetailInitStarted = true;
             window.cshCart.init({ changeSetId: urlChangeSetId() })
+                .then(function () { return notifyPendingStagedWork(); })
                 .catch(function (e) { console.warn('cshCart detail init failed:', e && e.message); });
+        }
+    }
+
+    // With the floating panel gone, staged-but-unsubmitted cart work would be
+    // completely invisible on this page — the "my selections disappeared when
+    // I switched Component Type" report is really this invisibility. One
+    // informational toast per page load, pointing at the surface that can act
+    // on it. Storage-only: no server traffic. Staged rows live under the
+    // Add-page's 033 key while this page is keyed by the 0A2 id, so check
+    // both via the id-map cache.
+    async function notifyPendingStagedWork() {
+        try {
+            if (!window.cshCart || !window.cshCart.getCart) return;
+            var keys = [urlChangeSetId()];
+            if (window.cshIdMap && keys[0]) {
+                try {
+                    var pkg = await window.cshIdMap.getPackageId(keys[0]);
+                    if (pkg && keys.indexOf(pkg) < 0) keys.push(pkg);
+                } catch (_) {}
+            }
+            var staged = 0;
+            var seen = {};
+            for (var i = 0; i < keys.length; i++) {
+                if (!keys[i]) continue;
+                // peekCart: read-only — getCart would create empty cart
+                // entries for these keys that a later flush could persist.
+                var cart = window.cshCart.peekCart
+                    ? await window.cshCart.peekCart(keys[i])
+                    : null;
+                (cart && cart.items || []).forEach(function (it) {
+                    // Status filter FIRST, then dedupe — otherwise a 'done'
+                    // copy of the same component under the other cart key
+                    // marks the id seen and masks a genuinely staged row.
+                    if (!it || (it.status !== 'staged' && it.status !== 'failed')) return;
+                    var k = it.salesforceId ? 'id:' + String(it.salesforceId).slice(0, 15) : 'uid:' + it.uid;
+                    if (seen[k]) return;
+                    seen[k] = true;
+                    staged++;
+                });
+            }
+            if (staged > 0 && window.cshToast) {
+                window.cshToast.show(
+                    staged + ' component(s) are staged but not yet in this change set. ' +
+                    'Open Add Components and press "Submit staged" to send them, or "Clear cart" to discard.',
+                    { type: 'info', duration: 9000 }
+                );
+            }
+        } catch (e) {
+            console.warn('[CSH] pending-staged check failed:', e && e.message);
         }
     }
 

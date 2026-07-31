@@ -1726,6 +1726,17 @@ function cshInstallAddPageSubmitBridge() {
     }
     $("#editPage").off('submit.cshSubmitBridge').on('submit.cshSubmitBridge', function (event) {
         if (cshIsCancelSubmit(event)) return true;
+        // A cart submission is mid-flight (Add-all or Submit staged). A
+        // second Add click — native or otherwise — would race it and can
+        // double-add the same components, so consume the click visibly.
+        if (cshSubmitStagedRunning) {
+            event.preventDefault();
+            window.cshToast && window.cshToast.show(
+                'A cart submission is already running — wait for it to finish before adding more.',
+                { type: 'warning', duration: 5000 }
+            );
+            return false;
+        }
         var form = this;
         var submitter = event.originalEvent && event.originalEvent.submitter;
 
@@ -1742,22 +1753,84 @@ function cshInstallAddPageSubmitBridge() {
         // is precisely the "my click submitted something else" bug this guard
         // exists to prevent. :checked only matches checkboxes/radios, so the
         // hidden id inputs some layouts use cannot inflate the count.
-        var checkedCount = form.querySelectorAll(
+        var tickedIds = [];
+        var seenTicked = {};
+        var SF_ID15_RE = /^[0-9a-zA-Z]{15}/;
+        form.querySelectorAll(
             'input[name="ids"]:checked, table.list tr.dataRow input[type="checkbox"]:checked'
-        ).length;
+        ).forEach(function (cb) {
+            // The id lives on the row's hidden input[name="ids"] on layouts
+            // where the visible checkbox carries no value (it would read
+            // "on") — same resolution order as cart.js idForRow.
+            var row = cb.closest('tr');
+            var hidden = row ? row.querySelector('input[name="ids"]') : null;
+            var v = String((hidden && hidden.value) || cb.value || '').slice(0, 15);
+            if (SF_ID15_RE.test(v) && !seenTicked[v]) { seenTicked[v] = true; tickedIds.push(v); }
+        });
+        var checkedCount = tickedIds.length;
 
-        // An explicit selection is an explicit instruction: submit THESE. Hand
-        // straight back to Salesforce, untouched — no preventDefault, no
-        // re-submit, and the real submitter (save=Add To Change Set) is carried
-        // naturally.
+        // Staged rows the ticked boxes do NOT cover — components staged under
+        // another Component Type or on a page that isn't rendered right now.
+        // Read from the toolbar's cached snapshot because this handler is
+        // synchronous and cannot await storage; the cache refreshes on every
+        // cart mutation via the csh:cart-changed beacon, so at human click
+        // speed it is current.
+        var otherStaged = cshCartStagedIdCache.filter(function (id) { return !seenTicked[id]; });
+
+        // An explicit selection is an explicit instruction: submit THESE via
+        // Salesforce's own form — no preventDefault, no re-submit, the real
+        // submitter (save=Add To Change Set) carried naturally. The marker
+        // lets the NEXT page drop the auto-staged shadow copies of the ticked
+        // rows, so they stop resurfacing as pending work after they landed.
         //
-        // The bridge used to divert the click to the cart worker whenever the
-        // cart held any staged row, so "tick a box, press Add To Change Set"
-        // submitted whatever the cart happened to contain instead of the
-        // selection — and with a stale cart it added nothing at all while
-        // consuming the click. Cross-type and off-page cart work now belongs to
-        // the cart panel's Submit All, which is the affordance built for it.
-        if (checkedCount > 0) return true;
+        // The old bridge diverted this click to the cart worker whenever ANY
+        // staged row existed, submitting whatever the cart held instead of the
+        // selection — with a stale cart, silently nothing. That was the
+        // reported dead button.
+        if (checkedCount > 0 && otherStaged.length === 0) {
+            window.cshCart && window.cshCart.markNativeAddSubmitted &&
+                window.cshCart.markNativeAddSubmitted(cshCartToolbarKey() || changeSetId, tickedIds, cshAddPagePackageId);
+            return true;
+        }
+
+        // Selection AND cross-type staged work: this is the multi-type flow
+        // (tick Apps, switch type, tick Objects, press Add once). The old
+        // build submitted everything implicitly; make the same choice explicit
+        // so the user always knows what one click is about to send.
+        if (checkedCount > 0 && otherStaged.length > 0) {
+            event.preventDefault();
+            var dlgForm = form, dlgSubmitter = submitter;
+            window.cshDialog.open({
+                title: 'Add components',
+                message: 'You selected ' + checkedCount + ' component(s) here, and ' +
+                    otherStaged.length + ' more are staged from other component types or pages.\n\n' +
+                    'What should be added to the change set?',
+                escValue: 'cancel',
+                buttons: [
+                    { label: 'Add all (' + (checkedCount + otherStaged.length) + ')', kind: 'primary', value: 'all', isDefault: true },
+                    { label: 'Only the ' + checkedCount + ' selected', kind: 'ghost', value: 'selected' },
+                    { label: 'Cancel', kind: 'ghost', value: 'cancel' }
+                ]
+            }).then(function (choice) {
+                if (choice === 'selected') {
+                    window.cshCart && window.cshCart.markNativeAddSubmitted &&
+                        window.cshCart.markNativeAddSubmitted(cshCartToolbarKey() || changeSetId, tickedIds, cshAddPagePackageId);
+                    cshSubmitNatively(dlgForm, dlgSubmitter);
+                    return;
+                }
+                if (choice === 'all') {
+                    // The worker submits the full staged set (all types) via
+                    // the cached form shapes, with its own outcome toasts. No
+                    // native submit — mixing the two paths in one click is
+                    // how components get double-added. The checkbox harvest
+                    // happens inside cshRunSubmitStaged, under its running
+                    // flag and error handling.
+                    cshRunSubmitStaged();
+                }
+                // cancel: the click ends here, visibly chosen by the user.
+            });
+            return false;
+        }
 
         clearFilters();
         if (!window.cshCart || !window.cshCart.getCart || !window.cshCart.runWorker) return true;
@@ -2025,6 +2098,11 @@ function cshWireToolbarActions() {
 // ---------------------------------------------------------------------------
 var cshCartToolbarListenerInstalled = false;
 var cshSubmitStagedRunning = false;
+// Snapshot of staged/failed component ids (15-char), refreshed on every
+// csh:cart-changed beacon. The submit bridge reads it synchronously — a
+// submit event handler cannot await chrome.storage.
+var cshCartStagedIdCache = [];
+var cshCartToolbarRefreshGen = 0;
 
 function cshCartToolbarKey() {
     return cshAddPagePackageId || cshAddPageChangeSetId || $('#id').val() || null;
@@ -2036,15 +2114,28 @@ async function cshRefreshCartToolbar() {
     if (!$submit.length || !window.cshCart || !window.cshCart.getCart) return;
     var key = cshCartToolbarKey();
     if (!key) { $submit.hide(); $clear.hide(); return; }
+    var gen = ++cshCartToolbarRefreshGen;
     try {
-        var state = await window.cshCart.getCart(key);
+        var cart = window.cshCart.peekCart
+            ? await window.cshCart.peekCart(key)
+            : (await window.cshCart.getCart(key) || {}).cart;
         var staged = 0, failed = 0, done = 0;
-        (state && state.cart && state.cart.items || []).forEach(function (it) {
+        var stagedIds = [];
+        var seenIds = {};
+        (cart && cart.items || []).forEach(function (it) {
             if (!it) return;
             if (it.status === 'staged') staged++;
             else if (it.status === 'failed') failed++;
             else if (it.status === 'done') done++;
+            if ((it.status === 'staged' || it.status === 'failed') && it.salesforceId) {
+                var id15 = String(it.salesforceId).slice(0, 15);
+                if (!seenIds[id15]) { seenIds[id15] = true; stagedIds.push(id15); }
+            }
         });
+        // Generation guard: overlapping refreshes (beacon bursts) must not
+        // let a slower, staler read overwrite a newer snapshot.
+        if (gen !== cshCartToolbarRefreshGen) return;
+        cshCartStagedIdCache = stagedIds;
         if (staged + failed > 0) {
             $submit.val(failed > 0
                 ? 'Submit staged (' + staged + ' + ' + failed + ' failed)'
@@ -2073,6 +2164,11 @@ async function cshRunSubmitStaged() {
     cshSubmitStagedRunning = true;
     $btn.prop('disabled', true);
     try {
+        // Flush the 60ms checkbox-autosave debounce first so a fast
+        // tick->submit cannot run the worker against stale staged state.
+        // Inside the flag and this try: a harvest failure gets the error
+        // toast below instead of silently consuming the click.
+        if (window.cshCart.harvestNow) await window.cshCart.harvestNow();
         // retryFailed re-stages failed rows (no-op when there are none) and
         // then runs the worker, whose per-batch toasts report the outcomes.
         var result = await window.cshCart.retryFailed(key);

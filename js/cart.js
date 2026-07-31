@@ -429,6 +429,20 @@
     // -----------------------------------------------------------------------
     // Cart CRUD
     // -----------------------------------------------------------------------
+    // Read-only view: unlike getCart this NEVER creates the cart entry, so
+    // observers (toolbar counts, the detail-page pending toast) cannot leak
+    // empty cart records into a later flush.
+    async function peekCart(changeSetId) {
+        var all;
+        if (pendingAll) {
+            all = pendingAll;
+        } else {
+            var s = await storageGet([CART_KEY]);
+            all = s[CART_KEY] || {};
+        }
+        return all[changeSetId] || null;
+    }
+
     async function getCart(changeSetId) {
         var all;
         if (pendingAll) {
@@ -1249,6 +1263,100 @@
     // "discard my pending picks" action — keeps authoritative state (what's
     // already in the change set, what's actively posting) and drops only
     // the user's in-flight selections.
+    // sessionStorage marker bridging a native form submit and the page that
+    // loads after it. The submit bridge cannot await storage before the
+    // navigation tears the page down, but sessionStorage writes are
+    // synchronous and survive same-tab navigation, so the NEXT page's init
+    // performs the cart cleanup with async room to breathe. Content scripts
+    // share DOM storage with the page, and both the Add page and the detail
+    // retURL target live on the same origin.
+    var NATIVE_ADD_MARKER = 'cshPendingNativeAddV1';
+
+    var NATIVE_ADD_MARKER_TTL_MS = 10 * 60 * 1000;
+
+    function markNativeAddSubmitted(changeSetId, ids, packageId) {
+        try {
+            sessionStorage.setItem(NATIVE_ADD_MARKER, JSON.stringify({
+                key: changeSetId,
+                pkg: packageId || null,
+                ts: Date.now(),
+                ids: (ids || []).map(function (id) { return String(id).slice(0, 15); })
+            }));
+        } catch (e) {
+            console.warn('[CSH] could not record native-add marker:', e && e.message);
+        }
+    }
+
+    // The marker records INTENT, not success — the native submit may have
+    // died on a Salesforce validation page after the marker was written.
+    // So consumption never deletes anything on faith: it re-reads the live
+    // membership and lets syncItemsFromServer PROMOTE the staged rows that
+    // actually landed to 'done' (which stops restoreFromCart re-ticking
+    // them and removes them from the Submit staged count). Rows that did
+    // not land stay staged — which is exactly right, because they were not
+    // added. If the membership read fails, everything stays staged and the
+    // restore-toast + Clear cart mitigation applies; a stale marker on an
+    // unrelated page costs one scrape and promotes nothing.
+    async function consumeNativeAddMarker() {
+        var raw = null;
+        try {
+            raw = sessionStorage.getItem(NATIVE_ADD_MARKER);
+            if (raw) sessionStorage.removeItem(NATIVE_ADD_MARKER);
+        } catch (_) { return 0; }
+        if (!raw) return 0;
+        try {
+            var marker = JSON.parse(raw);
+            if (!marker || !marker.key || !Array.isArray(marker.ids) || !marker.ids.length) return 0;
+            if (marker.ts && (Date.now() - marker.ts) > NATIVE_ADD_MARKER_TTL_MS) {
+                console.log('[CSH] native-add marker expired — leaving staged rows untouched');
+                return 0;
+            }
+            // Package id from the marker itself, else the id-map cache.
+            // Never the current page's DOM - a stale marker consumed on an
+            // unrelated change set's page would otherwise verify against
+            // the WRONG package.
+            var packageId = (marker.pkg && PACKAGE_ID_RE.test(marker.pkg)) ? marker.pkg : null;
+            if (!packageId && PACKAGE_ID_RE.test(marker.key)) packageId = marker.key;
+            if (!packageId && window.cshIdMap) {
+                var cached = await window.cshIdMap.getPackageId(marker.key);
+                if (cached && PACKAGE_ID_RE.test(cached)) packageId = cached;
+            }
+            if (!packageId) {
+                console.warn('[CSH] native-add verification: no trusted 033 id for', marker.key);
+                return 0;
+            }
+            // Bounded: init awaits this, and neither fetch path has its own
+            // timeout - a hung request must not stall checkbox restore and
+            // auto-save installation indefinitely.
+            var live = await Promise.race([
+                fetchChangeSetViewItems(packageId),
+                new Promise(function (_, rej) {
+                    setTimeout(function () { rej(new Error('verification timed out after 15s')); }, 15000);
+                })
+            ]);
+            // Scope strictly to what THIS native submit sent. Passing the
+            // full inventory would insert every server component into the
+            // cart as 'done' - re-creating the whole-change-set-in-storage
+            // bloat the panel removal eliminated.
+            var wanted = {};
+            marker.ids.forEach(function (id) { wanted[String(id).slice(0, 15)] = true; });
+            var confirmed = live.filter(function (it) {
+                return it && it.id && wanted[String(it.id).slice(0, 15)];
+            });
+            if (!confirmed.length) {
+                console.log('[CSH] native-add verification: none of the submitted ids are in the change set');
+                return 0;
+            }
+            var r = await syncItemsFromServer(marker.key, confirmed, { authoritative: false });
+            console.log('[CSH] native-add verification: promoted', r.promoted,
+                'of', marker.ids.length, 'submitted row(s) confirmed in the change set');
+            return r.promoted;
+        } catch (e) {
+            console.warn('[CSH] native-add verification failed — staged rows left untouched:', e && e.message);
+            return 0;
+        }
+    }
+
     async function clearStaged(changeSetId) {
         var { all, cart } = await getCart(changeSetId);
         dropCartItems(cart, function (it) {
@@ -1416,6 +1524,15 @@
         $table.off('draw.cshAutoSave').on('draw.cshAutoSave', function () {
             restoreVisibleTicksFromCart(changeSetId, type).catch(function () {});
         });
+    }
+
+    // Synchronously-awaitable harvest for callers that must not race the
+    // 60ms checkbox debounce (the Add-all dialog starts the worker
+    // immediately; a just-ticked row must be staged before it reads).
+    async function harvestNow() {
+        if (_currentChangeSetId && _cartType) {
+            await syncCartFromCheckboxes(_currentChangeSetId, _cartType);
+        }
     }
 
     async function syncCartFromCheckboxes(changeSetId, type) {
@@ -2997,6 +3114,11 @@
         if (!_currentChangeSetId) return;
         var currentType = normalizeCartType(opts.currentType);
 
+        // A native Add submit on the previous page may have taken staged
+        // rows with it — clean them up BEFORE restoreFromCart re-ticks them
+        // as if they were still pending.
+        await consumeNativeAddMarker();
+
         // Cache the form shape for this type so the worker can replay later
         // even if the user has navigated away.
         var shape = scrapeFormShape();
@@ -3077,6 +3199,9 @@
         clearDone: clearDone,
         clearStaged: clearStaged,
         clearWithPrompt: clearWithPrompt,
+        markNativeAddSubmitted: markNativeAddSubmitted,
+        peekCart: peekCart,
+        harvestNow: harvestNow,
         runWorker: runWorker,
         retryFailed: retryFailed,
         harvestChecked: harvestChecked,
