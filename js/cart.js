@@ -3127,10 +3127,15 @@
         }
         if (renderScheduled) return;
         renderScheduled = true;
-        requestAnimationFrame(function () {
+        // setTimeout, NOT requestAnimationFrame: rAF callbacks don't run
+        // while the browser window is occluded or minimized, so an
+        // rAF-deferred beacon can starve indefinitely — leaving the
+        // toolbar count and the submit bridge's synchronous staged-id
+        // cache stale even though the cart already changed.
+        setTimeout(function () {
             renderScheduled = false;
             try { window.dispatchEvent(new CustomEvent('csh:cart-changed')); } catch (_) {}
-        });
+        }, 0);
     }
 
     // Shown in place of the cart when the content script is orphaned by an
@@ -3315,6 +3320,17 @@
         // run, so the cart survives refresh without relying on modal timing.
         if (currentType) {
             installCheckboxAutoSave(_currentChangeSetId, currentType);
+            // Harvest any rows ticked BEFORE the delegate above existed —
+            // those clicks never reached the cart, so a type switch made
+            // moments after page load silently dropped them. Safe to run
+            // here: restoreFromCart has already re-ticked this type's
+            // staged rows, so a visible staged row can't read as an
+            // explicit untick.
+            try {
+                await syncCartFromCheckboxes(_currentChangeSetId, currentType);
+            } catch (e) {
+                console.warn('cshCart: pre-init tick harvest failed:', e && e.message);
+            }
         }
         // Type-switch guard kept as NO-OP: dropdown change now lets Salesforce
         // navigate freely because state is already persisted on every click.
