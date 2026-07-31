@@ -2073,7 +2073,9 @@
               '<button type="button" class="csh-dc-browser-close">Hide</button>' +
             '</div>' +
             '<table class="csh-dc-browser-table list" style="width:100%"><thead><tr>' +
-              '<th></th><th>Name</th><th>Type</th><th>API Name</th>' +
+              '<th><input type="checkbox" class="csh-dc-browser-selall" ' +
+              'title="Select or clear every row matching the current type filter and search (all pages)"></th>' +
+              '<th>Name</th><th>Type</th><th>API Name</th>' +
               '<th>Last Modified</th><th>Modified By</th><th>Created</th><th>Created By</th>' +
             '</tr></thead></table>';
         var $tbl = $(browserEl).find('.csh-dc-browser-table');
@@ -2091,6 +2093,7 @@
             $(browserEl).find('.csh-dc-browser-cb').each(function () {
                 this.checked = !!browserSelected[this.getAttribute('data-cid')];
             });
+            updateBrowserCount();
         });
         $(browserEl)
             .off('.cshBrowser')
@@ -2098,6 +2101,19 @@
                 var cid = this.getAttribute('data-cid');
                 if (this.checked) browserSelected[cid] = true;
                 else delete browserSelected[cid];
+                updateBrowserCount();
+            })
+            .on('change.cshBrowser', '.csh-dc-browser-selall', function () {
+                var select = this.checked;
+                browserFilteredCids().forEach(function (cid) {
+                    if (select) browserSelected[cid] = true;
+                    else delete browserSelected[cid];
+                });
+                // Re-sync the visible page's row checkboxes without a full
+                // redraw.
+                $(browserEl).find('.csh-dc-browser-cb').each(function () {
+                    this.checked = !!browserSelected[this.getAttribute('data-cid')];
+                });
                 updateBrowserCount();
             })
             .on('change.cshBrowser', '.csh-dc-browser-type', function () {
@@ -2124,12 +2140,33 @@
         updateBrowserCount();
     }
 
+    // Every cid in the CURRENTLY FILTERED set (type dropdown + search),
+    // across all pages — the unit "select all" operates on.
+    function browserFilteredCids() {
+        var out = [];
+        if (!browserTable) return out;
+        browserTable.rows({ search: 'applied' }).data().toArray().forEach(function (d) {
+            var m = String(d[0]).match(/data-cid="([^"]+)"/);
+            if (m) out.push(m[1]);
+        });
+        return out;
+    }
+
     function updateBrowserCount() {
         var n = Object.keys(browserSelected).length;
         var countEl = browserEl.querySelector('.csh-dc-browser-count');
         var removeBtn = browserEl.querySelector('.csh-dc-browser-remove');
         if (countEl) countEl.textContent = n + ' selected';
         if (removeBtn) removeBtn.disabled = n === 0;
+        // Header checkbox mirrors the filtered set: checked when all of it
+        // is selected, dash when only part of it is.
+        var selAll = browserEl.querySelector('.csh-dc-browser-selall');
+        if (selAll) {
+            var cids = browserFilteredCids();
+            var selectedInFilter = cids.filter(function (c) { return browserSelected[c]; }).length;
+            selAll.checked = cids.length > 0 && selectedInFilter === cids.length;
+            selAll.indeterminate = selectedInFilter > 0 && selectedInFilter < cids.length;
+        }
     }
 
     async function browserRemoveSelected() {
