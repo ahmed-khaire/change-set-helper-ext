@@ -2475,20 +2475,26 @@ function cshExportTable() {
     var lines = [];
     lines.push(headers.map(cshCsvEscape).join(','));
 
-    var rowApi = changeSetTable.rows({ search: 'applied' });
-    var data = rowApi.data().toArray();
-    var nodes = rowApi.nodes();
-    for (var i = 0; i < data.length; i++) {
-        var rowData = data[i];
-        var rowNode = nodes[i];
+    // rows().every(), NOT parallel data()/nodes() arrays: with deferRender
+    // the nodes() collection SKIPS unrendered rows, so nodes[i] can belong to
+    // a different data[i] and rows silently pair with the wrong DOM. every()
+    // keeps row data, node, and index together. cell(rowIdx, colIdx).node()
+    // rather than children('td').eq(colIdx): colIdx is a DataTables column
+    // index, and any hidden column makes it diverge from DOM td positions —
+    // that off-by-N shipped CSVs with an empty Name column and shifted fields.
+    changeSetTable.rows({ search: 'applied' }).every(function () {
+        var rowData = this.data();
+        var rowIdx = this.index();
         var line = visibleIdxs.map(function (colIdx) {
             // Prefer the rendered DOM text over raw cell data so we export
-            // exactly what the user sees (includes name links, date strings).
-            var cell = rowNode ? $(rowNode).children('td').eq(colIdx).text() : rowData[colIdx];
+            // exactly what the user sees (includes name links, date strings);
+            // unrendered (deferRender) rows fall back to raw data.
+            var cellNode = changeSetTable.cell(rowIdx, colIdx).node();
+            var cell = cellNode ? $(cellNode).text() : rowData[colIdx];
             return cshCsvEscape(String(cell == null ? '' : cell).replace(/\s+/g, ' ').trim());
         });
         lines.push(line.join(','));
-    }
+    });
 
     var entityType = $('#entityType').val() || 'change-set';
     var stamp = new Date().toISOString().slice(0, 10);
@@ -2496,21 +2502,17 @@ function cshExportTable() {
     // UTF-8 BOM (U+FEFF) so Excel on Windows treats the file as UTF-8 and
     // renders non-ASCII characters (e.g. curly apostrophes in component
     // names) correctly instead of garbling them in the Windows-1252 guess.
-    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function () {
-        a.remove();
-        URL.revokeObjectURL(url);
-    }, 500);
-    window.cshToast && window.cshToast.show(
-        'Exported ' + (lines.length - 1) + ' row(s) to ' + fname,
-        { type: 'success', duration: 3000 }
-    );
+    window.cshDownload(fname, '\ufeff' + lines.join('\r\n'), 'text/csv;charset=utf-8')
+        .then(function () {
+            window.cshToast && window.cshToast.show(
+                'Exported ' + (lines.length - 1) + ' row(s) to ' + fname,
+                { type: 'success', duration: 3000 }
+            );
+        })
+        .catch(function (e) {
+            window.cshToast && window.cshToast.show(
+                'Export failed: ' + ((e && e.message) || e), { type: 'error' });
+        });
 }
 
 /**

@@ -366,6 +366,57 @@ window.cshAuth = (function () {
     window.cshToast = { show: show };
 })();
 
+// 3a2) Downloads.
+//
+//      Blob-anchor downloads (a[download] + click) are broken inside the
+//      Lightning Setup iframe: without a real user gesture Chrome treats the
+//      blob navigation as a POPUP — it lands in Salesforce's queued "Open
+//      this page?" prompt and, even when allowed, opens the raw blob in a tab
+//      instead of saving. With a gesture the file does save, but Chrome
+//      ignores the anchor's download attribute in this context and names the
+//      file after the blob UUID. Routing through chrome.downloads in the
+//      service worker sidesteps all of it: no gesture requirement, no popup
+//      blocker, correct filename.
+window.cshDownload = function (filename, data, mime) {
+    return new Promise(function (resolve, reject) {
+        var blob = (typeof Blob !== 'undefined' && data instanceof Blob)
+            ? data
+            : new Blob([data], { type: mime || 'application/octet-stream' });
+        // The payload crosses one runtime message as base64 (~4/3 expansion)
+        // against Chrome's 64MiB message ceiling. Guard well below it — a
+        // clear error beats an opaque messaging failure. Bigger exports need
+        // a chunked/offscreen path, not a bigger limit here.
+        var MAX_BYTES = 40 * 1024 * 1024;
+        if (blob.size > MAX_BYTES) {
+            reject(new Error('Export is ' + Math.round(blob.size / 1048576) +
+                ' MB — larger than the ' + Math.round(MAX_BYTES / 1048576) +
+                ' MB download limit.'));
+            return;
+        }
+        var fr = new FileReader();
+        fr.onerror = function () { reject(fr.error || new Error('Could not read export data')); };
+        fr.onload = function () {
+            try {
+                chrome.runtime.sendMessage(
+                    { type: 'cshDownload', filename: filename, url: fr.result },
+                    function (resp) {
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message));
+                        } else if (!resp || !resp.ok) {
+                            reject(new Error((resp && resp.error) || 'Download failed'));
+                        } else {
+                            resolve(resp.downloadId);
+                        }
+                    }
+                );
+            } catch (e) { reject(e); }
+        };
+        // data: URL keeps the payload self-contained across the message —
+        // the service worker cannot resolve a content script's blob: URL.
+        fr.readAsDataURL(blob);
+    });
+};
+
 // 3b) In-page confirm/alert dialogs.
 //
 //     Chrome 92+ ignores window.confirm/alert/prompt called from a cross-origin

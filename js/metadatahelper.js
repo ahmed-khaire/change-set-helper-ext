@@ -47,13 +47,23 @@ function downloadPackage() {
                     unSetDownloading();
                 } else {
                     var zip = new JSZip();
-                    zip.loadAsync(response.result.zipFile, {base64: true}).then(
-                        function (zip) {
+                    // Single chain: any failure in load/generate/download
+                    // lands in ONE catch, and the button restores exactly
+                    // once via finally (it used to restore before the
+                    // download even began).
+                    zip.loadAsync(response.result.zipFile, {base64: true})
+                        .then(function (z) {
+                            return z.generateAsync({type: "blob"});
+                        })
+                        .then(function (blob) {
+                            return window.cshDownload(changename + ".zip", blob);
+                        })
+                        .catch(function (e) {
+                            window.cshToast && window.cshToast.show(
+                                'Download failed: ' + ((e && e.message) || e), { type: 'error' });
+                        })
+                        .finally(function () {
                             unSetDownloading();
-                            zip.generateAsync({type: "blob"})
-                                .then(function (blob) {
-                                    saveAs(blob, changename + ".zip");
-                                });
                         });
                 }
             });
@@ -115,20 +125,25 @@ function exportPackageXmlOnly() {
                         restoreExportBtn();
                         return;
                     }
-                    entry.async('string').then(function (xml) {
+                    // Returned so a rejection anywhere in extract->download
+                    // reaches the catch below instead of vanishing; success
+                    // toasts only after the download actually started.
+                    return entry.async('string').then(function (xml) {
                         var stamp = new Date().toISOString().slice(0, 10);
                         var safeName = String(changename || 'changeset').replace(/[^a-zA-Z0-9-_]+/g, '-');
                         var fname = 'package-' + safeName + '-' + stamp + '.xml';
                         var blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
-                        saveAs(blob, fname);
-                        window.cshToast && window.cshToast.show(
-                            'Exported package.xml for "' + changename + '" (' + xml.length + ' chars).',
-                            { type: 'success' }
-                        );
-                        restoreExportBtn();
+                        return window.cshDownload(fname, blob).then(function () {
+                            window.cshToast && window.cshToast.show(
+                                'Exported package.xml for "' + changename + '" (' + xml.length + ' chars).',
+                                { type: 'success' }
+                            );
+                        });
                     });
                 }).catch(function (e) {
-                    window.cshToast && window.cshToast.show('Zip parse failed: ' + e.message, { type: 'error' });
+                    window.cshToast && window.cshToast.show(
+                        'Export failed: ' + ((e && e.message) || e), { type: 'error' });
+                }).finally(function () {
                     restoreExportBtn();
                 });
             });

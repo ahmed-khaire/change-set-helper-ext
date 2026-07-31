@@ -164,7 +164,8 @@
     "identity",
     "storage",
     "offscreen",
-    "cookies"
+    "cookies",
+    "downloads"
   ],
   "host_permissions": [
     "https://*.salesforce.com/*",

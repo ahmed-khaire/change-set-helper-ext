@@ -1205,6 +1205,36 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         return true;
     }
 
+    if (request.type == "cshDownload") {
+        // Downloads on behalf of content scripts. Blob-anchor downloads are
+        // unreliable in the Lightning Setup iframe (popup-blocked without a
+        // gesture; UUID filenames with one) — chrome.downloads has neither
+        // problem. The payload arrives as a data: URL because the worker
+        // cannot resolve a content script's blob: URL.
+        (function () {
+            if (!request.url || !/^data:/i.test(request.url)) {
+                sendResponse({ ok: false, error: 'cshDownload: data: url required' });
+                return;
+            }
+            var filename = String(request.filename || 'download.bin')
+                .replace(/[\\/:*?"<>|]+/g, '_')
+                .replace(/[\x00-\x1f\x7f]+/g, '')   // control chars: chrome.downloads rejects them
+                .replace(/[. ]+$/g, '');            // trailing dots/spaces: invalid on Windows
+            if (!filename || filename === '.' || filename === '..') filename = 'download.bin';
+            chrome.downloads.download(
+                { url: request.url, filename: filename, conflictAction: 'uniquify' },
+                function (downloadId) {
+                    if (chrome.runtime.lastError) {
+                        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+                    } else {
+                        sendResponse({ ok: true, downloadId: downloadId });
+                    }
+                }
+            );
+        })();
+        return true;
+    }
+
     if (request.type == "cshClassicFetch") {
         // Content-script proxy for credentialed GETs of classic Salesforce
         // pages. Content scripts running on *.my.salesforce-setup.com can't

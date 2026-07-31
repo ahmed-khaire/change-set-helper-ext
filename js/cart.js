@@ -2108,17 +2108,7 @@
 
         var stamp = new Date().toISOString().slice(0, 10);
         var fname = 'csh-cart-package-' + stamp + '.xml';
-        var blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement('a');
-        a.href = url;
-        a.download = fname;
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(function () {
-            a.remove();
-            URL.revokeObjectURL(url);
-        }, 500);
+        await window.cshDownload(fname, xml, 'application/xml;charset=utf-8');
         window.cshToast && window.cshToast.show(
             'Exported ' + eligible.length + ' cart item(s) to ' + fname,
             { type: 'success' }
