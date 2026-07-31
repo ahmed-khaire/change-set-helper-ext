@@ -1884,7 +1884,7 @@
                         window.cshToast && window.cshToast.show(
                             'Cart: submitted ' + batchItems.length + ' ' + type + ' item(s), but could not verify ' +
                             'them against the change set (' + ((e && e.message) || 'sync failed') + '). ' +
-                            'Use Full Sync to confirm what actually landed.',
+                            'Use Full Sync on the Change Set Details page to confirm what actually landed.',
                             { type: 'warning', duration: 9000 }
                         );
                         reportedToUser = true;
@@ -2074,6 +2074,75 @@
             .replace(/'/g, '&apos;');
     }
 
+    // Cart type label -> Metadata API type name, for package.xml export.
+    //
+    // Cart rows carry HUMAN vocabulary: either the change-set view's display
+    // label ("App", "Visualforce Page") or the Add-page picker's entityType
+    // run through normalizeCartType ("Tab Set" from TabSet). package.xml needs
+    // API names — a live comparison of our export against the Salesforce-
+    // authored retrieve manifest for the same change set showed
+    // "App"/"Apex Class" where "CustomApplication"/"ApexClass" belong, which
+    // our own import round-trips but sfdx/Workbench reject.
+    //
+    // The default inverse is stripping spaces — the exact inverse of
+    // normalizeCartType's camel-split, correct for every regular type. The map
+    // covers the labels where Salesforce's display name is NOT a camel-split
+    // of the API name, in both vocabularies where they differ. The retrieve
+    // manifest (Metadata Helper -> Export package.xml) is the authoritative
+    // source for new pairs.
+    var CSH_API_TYPE_BY_LABEL = {
+        'App': 'CustomApplication',
+        'Tab Set': 'CustomApplication',          // Add-page picker: TabSet
+        'Visualforce Page': 'ApexPage',
+        'Visualforce Component': 'ApexComponent',
+        'Lightning Component Bundle': 'AuraDefinitionBundle',
+        'Lightning Web Component Bundle': 'LightningComponentBundle',
+        'Page Layout': 'Layout',
+        'Tab': 'CustomTab',
+        'Button or Link': 'WebLink',
+        'Action': 'QuickAction',
+        'Custom Report Type': 'ReportType',
+        'S-Control': 'Scontrol',
+        'Site.com': 'SiteDotCom',
+        'Flow Definition': 'Flow'                // modern retrieves use Flow
+    };
+
+    // Normalized-key view of changeset.js's authoritative picker->API map
+    // (window.cshEntityTypeMap). Cart rows store normalizeCartType'd values,
+    // so the picker's 'CustomEntityDefinition' arrives here as 'Custom
+    // Entity Definition' — the derived map indexes by that form. Built
+    // lazily because changeset.js loads after this file; by export time (a
+    // toolbar click on the Add page) it is present. Cached once.
+    var _pickerApiByNormalized = null;
+    function pickerApiByNormalized() {
+        if (_pickerApiByNormalized) return _pickerApiByNormalized;
+        var out = {};
+        var shared = window.cshEntityTypeMap || {};
+        Object.keys(shared).forEach(function (k) {
+            out[normalizeCartType(k)] = shared[k];
+        });
+        _pickerApiByNormalized = out;
+        return out;
+    }
+
+    function apiTypeForCartLabel(label) {
+        var t = normalizeCartType(label);
+        // Curated display-label overrides first: for package.xml purposes
+        // they win even over the picker map (e.g. 'Flow Definition' exports
+        // as modern 'Flow', not the legacy FlowDefinition the picker uses
+        // for LISTING).
+        if (CSH_API_TYPE_BY_LABEL[t]) return CSH_API_TYPE_BY_LABEL[t];
+        // Then the authoritative picker->API map — covers every
+        // non-identity picker pair (AssignmentRule->AssignmentRules,
+        // CustomEntityDefinition->CustomObject, ActionEmail->WorkflowAlert,
+        // Queues->Queue, ...).
+        var viaPicker = pickerApiByNormalized()[t];
+        if (viaPicker) return viaPicker;
+        // Default: strip spaces — the exact inverse of normalizeCartType's
+        // camel-split, correct for regular types.
+        return String(t || '').replace(/ /g, '');
+    }
+
     async function exportCartAsPackageXml() {
         var changeSetId = currentChangeSetId();
         if (!changeSetId) throw new Error('No change-set context');
@@ -2087,7 +2156,11 @@
         eligible.forEach(function (it) {
             var member = it.fullName || it.name;
             if (!member) return;
-            (byType[it.type] = byType[it.type] || []).push(member);
+            // API name, not the display label — see CSH_API_TYPE_BY_LABEL.
+            // Grouping by the converted name also merges rows whose labels
+            // differ only by vocabulary ("App" + "Tab Set") into one <types>.
+            var apiType = apiTypeForCartLabel(it.type);
+            (byType[apiType] = byType[apiType] || []).push(member);
         });
 
         var apiVersion = (window.cshApiVersion && window.cshApiVersion.resolved) ||

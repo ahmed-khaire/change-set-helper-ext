@@ -162,7 +162,7 @@
             if (staged > 0 && window.cshToast) {
                 window.cshToast.show(
                     staged + ' component(s) are staged but not yet in this change set. ' +
-                    'Open Add Components and press "Submit staged" to send them, or "Clear cart" to discard.',
+                    'Open Add Components and press "Add Components to Change Set" to send them, or "Clear cart" to discard.',
                     { type: 'info', duration: 9000 }
                 );
             }

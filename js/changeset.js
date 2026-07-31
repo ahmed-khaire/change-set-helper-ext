@@ -100,6 +100,11 @@ var entityTypeMap = {
     'Custom Metadata Type': 'CustomObject',
     'Custom Metadata Types': 'CustomObject',
 }
+// Shared with cart.js's package.xml export (apiTypeForCartLabel): cart rows
+// staged from this picker carry these entity names (camel-split by
+// normalizeCartType), and the export must translate them to Metadata API
+// names. This object is the single authority for picker->API pairs.
+window.cshEntityTypeMap = entityTypeMap;
 
 // Per-picker post-filter applied to both local getMetaData results and the
 // compare-org result set. Used when the resolved Metadata API type is broader
@@ -1893,7 +1898,7 @@ function cshInstallAddPageSubmitBridge() {
                     window.cshToast && window.cshToast.show(
                         'Submitted, but Salesforce could not be re-read to confirm what landed' +
                         (result.lastError ? ' (' + result.lastError + ')' : '') +
-                        '. Not retrying automatically — use Full Sync to check before resubmitting.',
+                        '. Not retrying automatically — use Full Sync on the Change Set Details page to check before resubmitting.',
                         { type: 'warning', duration: 10000 }
                     );
                     return;
@@ -1918,8 +1923,8 @@ function cshInstallAddPageSubmitBridge() {
                     // server state is unknown, so do not submit again.
                     window.cshToast && window.cshToast.show(
                         'Background submit failed partway (' + ((e && e.message) || 'unknown') + '). ' +
-                        'Some components may already have been added — use Full Sync to check ' +
-                        'before retrying.',
+                        'Some components may already have been added — use Full Sync on the ' +
+                        'Change Set Details page to check before retrying.',
                         { type: 'error', duration: 10000 }
                     );
                     return;
@@ -1944,13 +1949,12 @@ function cshInstallToolbarActions() {
     if (!$group.length) {
         $group = $(
             '<span class="csh-toolbar-actions" style="float:left;display:inline-flex;gap:4px;margin-right:8px;">' +
+              '<input type="button" value="Add Components to Change Set" class="cshSubmitStaged btn" style="display:none;font-weight:bold" title="Submit the cart\'s staged components (package.xml imports and selections saved earlier) to the change set in the background" />' +
               '<input type="button" value="Reset Search Filters"   class="clearFilters btn"     title="Reset search filters" />' +
               '<input type="button" value="Export CSV"             class="cshExportCsv btn"     title="Download the currently-filtered table as a CSV file" />' +
               '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
               '<input type="button" value="Import package.xml"     class="cshImportPkg btn"     title="Load a package.xml into the cart; items are staged and resolved against the current change-set add page" />' +
               '<input type="button" value="Refresh Type"           class="cshRefreshType btn"   title="Refresh the selected component type from Salesforce and update the local cache" />' +
-              '<input type="button" value="Full Sync"              class="cshFullSync btn"      title="Refresh the full server-side change set membership cache" />' +
-              '<input type="button" value="Submit staged"          class="cshSubmitStaged btn"  style="display:none" title="Submit the cart\'s staged components (package.xml imports and selections saved earlier) to the change set in the background" />' +
               '<input type="button" value="Clear cart"             class="cshClearStaged btn"   style="display:none" title="Clear staged, completed, or all items from the local cart" />' +
               '<span class="csh-type-sync-status" style="align-self:center;margin-left:4px;color:#666;font-size:12px;"></span>' +
               '<input type="file"   class="cshImportPkgFile" accept=".xml,application/xml" style="display:none" />' +
@@ -2033,14 +2037,6 @@ function cshWireToolbarActions() {
         });
 
     $(document)
-        .off('click.cshToolbarActions', '.csh-toolbar-actions .cshFullSync')
-        .on('click.cshToolbarActions', '.csh-toolbar-actions .cshFullSync', function (ev) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            cshRunAddPageFullSync();
-        });
-
-    $(document)
         .off('change.cshToolbarActions', '.csh-toolbar-actions .cshImportPkgFile')
         .on('change.cshToolbarActions', '.csh-toolbar-actions .cshImportPkgFile', async function (ev) {
             var file = ev.target.files && ev.target.files[0];
@@ -2054,7 +2050,7 @@ function cshWireToolbarActions() {
                 window.cshToast && window.cshToast.show(
                     'Imported ' + added + ' item(s) from ' + file.name + '. ' +
                     'Items without a Salesforce Id will resolve when you visit each type; ' +
-                    'then press "Submit staged" in this toolbar.',
+                    'then press "Add Components to Change Set" in this toolbar.',
                     { type: 'success', duration: 7000 }
                 );
             } catch (e) {
@@ -2137,10 +2133,13 @@ async function cshRefreshCartToolbar() {
         if (gen !== cshCartToolbarRefreshGen) return;
         cshCartStagedIdCache = stagedIds;
         if (staged + failed > 0) {
-            $submit.val(failed > 0
-                ? 'Submit staged (' + staged + ' + ' + failed + ' failed)'
-                : 'Submit staged (' + staged + ')').show();
-        } else {
+            if (!cshSubmitStagedRunning) {
+                $submit.val(failed > 0
+                    ? 'Add Components to Change Set (' + staged + ' + ' + failed + ' failed)'
+                    : 'Add Components to Change Set (' + staged + ')');
+            }
+            $submit.show();
+        } else if (!cshSubmitStagedRunning) {
             $submit.hide();
         }
         // Clear covers completed rows too — without this, a cart holding only
@@ -2162,7 +2161,10 @@ async function cshRunSubmitStaged() {
     if (!key || !window.cshCart || !window.cshCart.retryFailed) return;
     var $btn = $('.csh-toolbar-actions .cshSubmitStaged');
     cshSubmitStagedRunning = true;
-    $btn.prop('disabled', true);
+    // Visible in-flight state: the disabled attribute alone reads as a dead
+    // button; the label makes the wait — and the double-click protection —
+    // legible.
+    $btn.prop('disabled', true).val('Adding\u2026');
     try {
         // Flush the 60ms checkbox-autosave debounce first so a fast
         // tick->submit cannot run the worker against stale staged state.
@@ -2180,10 +2182,12 @@ async function cshRunSubmitStaged() {
         }
     } catch (e) {
         window.cshToast && window.cshToast.show(
-            'Submit staged failed: ' + ((e && e.message) || e), { type: 'error' });
+            'Add Components to Change Set failed: ' + ((e && e.message) || e), { type: 'error' });
     } finally {
         cshSubmitStagedRunning = false;
-        $btn.prop('disabled', false);
+        // Reset the label SYNCHRONOUSLY: the counter refresh is async and
+        // can fail, which would leave an enabled button stuck on 'Adding…'.
+        $btn.prop('disabled', false).val('Add Components to Change Set');
         cshRefreshCartToolbar();
     }
 }
@@ -2420,34 +2424,11 @@ async function cshRefreshSelectedType() {
     }
 }
 
-async function cshRunAddPageFullSync() {
-    var $btn = $('.cshFullSync');
-    if (!window.cshCart || !window.cshCart.syncFromChangeSetView) {
-        window.cshToast && window.cshToast.show('Cart sync is not ready yet - try again in a moment.', { type: 'info' });
-        return;
-    }
-    if (!cshAddPagePackageId) {
-        window.cshToast && window.cshToast.show('Full Sync is not available yet because the change-set package id was not resolved.', { type: 'error' });
-        return;
-    }
-    var syncKey = cshAddPageChangeSetId || cshAddPagePackageId;
-    var setSync = window.cshCart.setSyncState || function () {};
-    try {
-        $btn.prop('disabled', true).val('Syncing...');
-        setSync('syncing');
-        var result = await window.cshCart.syncFromChangeSetView(syncKey, cshAddPagePackageId, { force: true });
-        setSync('idle');
-        window.cshToast && window.cshToast.show(
-            'Full change set sync completed (' + ((result && result.count) || 0) + ' item(s)).',
-            { type: 'success', duration: 3000 }
-        );
-    } catch (e) {
-        setSync('error', (e && e.message) || 'Sync failed');
-        window.cshToast && window.cshToast.show('Full Sync failed: ' + ((e && e.message) || e), { type: 'error' });
-    } finally {
-        $btn.prop('disabled', false).val('Full Sync');
-    }
-}
+// The Add-page "Full Sync" button was removed with the floating panel era:
+// membership reconciliation now happens exactly where it matters (native-add
+// verification, post-submit reconcile, post-bulk-remove sync, and the
+// Detail page's Full Sync button). cshCart.syncFromChangeSetView remains
+// the programmatic path.
 
 // ---------------------------------------------------------------------------
 // Phase 5.1 — CSV export
@@ -4460,7 +4441,7 @@ $(document).ready(function () {
     // on every Add-page visit (constant "Sync failed" on orgs where that URL
     // redirects, plus prune exposure and storage churn) to keep a display
     // truthful that no longer exists. Membership refresh is now on demand via
-    // the toolbar's Full Sync button (cshRunAddPageFullSync), and post-submit
+    // the Detail page's Full Sync button, and post-submit
     // verification still re-reads the server after every cart submit.
 });
 
