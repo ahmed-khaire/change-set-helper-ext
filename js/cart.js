@@ -1624,7 +1624,17 @@
         });
         findRowCheckboxes().each(function () {
             var id = idForRow(this);
-            if (id && wanted[id] && !this.checked) this.checked = true;
+            if (id && wanted[id] && !this.checked) {
+                // Native click, same as uncheckRowForSfId and for the same
+                // reason: DataTables-Checkboxes tracks state via its
+                // click.dtCheckboxes handler, so setting .checked (with or
+                // without a change trigger) leaves the plugin's internal set
+                // stale and the next draw reverts the tick — reopening the
+                // drop-on-harvest window this restore exists to close. click()
+                // flips the box, updates the plugin, and re-runs the autosave
+                // delegate (idempotent — the row is already staged).
+                this.click();
+            }
         });
     }
 
@@ -1641,8 +1651,11 @@
         findRowCheckboxes().each(function () {
             var id = idForRow(this);
             if (id && wanted[id] && !this.checked) {
-                this.checked = true;
-                $(this).trigger('change');
+                // Native click for the same DataTables-Checkboxes state
+                // reason as restoreVisibleTicksFromCart — .checked + change
+                // leaves the plugin's tracked set stale and the next draw
+                // reverts the restored tick.
+                this.click();
                 restored++;
             }
         });
@@ -2262,6 +2275,16 @@
         if (resolved > 0 || enriched > 0) {
             await saveCart(all);
             console.log('cshCart: resolved ' + resolved + ' id(s), enriched ' + enriched + ' fullName(s) for type', type);
+        }
+        if (resolved > 0) {
+            // Tick the rows we just resolved. restoreFromCart ran at init,
+            // BEFORE metadata resolved these ids, so their checkboxes are
+            // still unticked — and syncCartFromCheckboxes treats a visible
+            // unticked row as "the user removed it" and DROPS the staged row.
+            // Without this re-tick, Submit staged deleted freshly-imported
+            // items instead of submitting them (found live: an imported
+            // ApexClass vanished silently on Submit staged).
+            await restoreVisibleTicksFromCart(changeSetId, type);
         }
         return resolved + enriched;
     }
