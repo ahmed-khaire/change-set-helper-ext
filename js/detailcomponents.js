@@ -1498,10 +1498,25 @@
                 console.warn('[CSH] cshIdMap.getPackageId failed:', e && e.message);
             }
         }
-        var addPageUrls = [
-            new URL('/p/mfpkg/AddToPackageFromChangeMgmtUi?id=' + encodeURIComponent(csId), appOriginForChangeSetView()).href,
-            new URL('/p/mfpkg/AddToPackageUi?id=' + encodeURIComponent(csId), appOriginForChangeSetView()).href
-        ];
+        // BOTH origins, current page's first. Enhanced-domain orgs split page
+        // families across hosts: the classic components view (an APP page)
+        // lives on *.my.salesforce.com, but /p/mfpkg/AddToPackage* is a SETUP
+        // page served on *.my.salesforce-setup.com — the app-origin fetch gets
+        // a Lightning shell with no 033 input there, which left the resolver
+        // dead on any change set whose id-map cache was cold ("could not
+        // resolve the 033 package id" the moment Browse & Filter or bulk
+        // remove ran before an Add-page visit). Classic orgs collapse both
+        // origins to one, so the dedupe keeps this a single-probe list there.
+        var addPagePaths = ['/p/mfpkg/AddToPackageFromChangeMgmtUi?id=', '/p/mfpkg/AddToPackageUi?id='];
+        var addPageOrigins = [location.origin, appOriginForChangeSetView()].filter(function (o, i, a) {
+            return a.indexOf(o) === i;
+        });
+        var addPageUrls = [];
+        addPageOrigins.forEach(function (origin) {
+            addPagePaths.forEach(function (path) {
+                addPageUrls.push(new URL(path + encodeURIComponent(csId), origin).href);
+            });
+        });
         // Preferred: plain fetch of the Add page HTML (SW-proxied when this
         // detail page is on *.salesforce-setup.com) and scan it for the 033 —
         // same technique as outboundlist.js. The hidden-iframe fallback below
@@ -1534,17 +1549,23 @@
                 console.warn('[CSH] Add page fetch failed:', addPageUrls[f], err && err.message);
             }
         }
-        for (var i = 0; i < addPageUrls.length; i++) {
+        // Iframe fallback is a last resort Salesforce usually refuses to
+        // render, at 15s per attempt — probe ONE url per origin, not the
+        // full path cross-product, so the worst case stays bounded.
+        var iframeUrls = addPageOrigins.map(function (origin) {
+            return new URL(addPagePaths[0] + encodeURIComponent(csId), origin).href;
+        });
+        for (var i = 0; i < iframeUrls.length; i++) {
             try {
-                var val = await loadAddPageInIframe(addPageUrls[i], 15000);
+                var val = await loadAddPageInIframe(iframeUrls[i], 15000);
                 if (val) {
                     packageIdCache = val;
-                    console.log('[CSH] packageId from Add page iframe (' + addPageUrls[i] + '):', packageIdCache);
+                    console.log('[CSH] packageId from Add page iframe (' + iframeUrls[i] + '):', packageIdCache);
                     if (window.cshIdMap) window.cshIdMap.putMapping(csId, val).catch(function () {});
                     return packageIdCache;
                 }
             } catch (err) {
-                console.warn('[CSH] Add page iframe failed:', addPageUrls[i], err);
+                console.warn('[CSH] Add page iframe failed:', iframeUrls[i], err);
             }
         }
         return null;
@@ -1927,8 +1948,24 @@
         loadComponentsBrowser();
     }
 
+    function cshContextAlive() {
+        try { return !!(chrome.runtime && chrome.runtime.id); } catch (_) { return false; }
+    }
+
     async function loadComponentsBrowser() {
         if (browserLoading) return;
+        // An extension reload orphans this content script: every chrome.*
+        // call dies with 'Extension context invalidated' and the id
+        // resolution cascades through dead fetches into 15s iframe
+        // timeouts — observed live as a spinner followed by a confusing
+        // resolver error. Say the real thing immediately instead.
+        if (!cshContextAlive()) {
+            window.cshToast && window.cshToast.show(
+                'The extension was updated or reloaded — refresh this page (F5) to continue.',
+                { type: 'error', duration: 9000 }
+            );
+            return;
+        }
         browserLoading = true;
         var gen = ++browserGen;
         var toolbar = document.querySelector('.csh-dc-toolbar');
