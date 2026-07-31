@@ -1949,7 +1949,7 @@ function cshInstallToolbarActions() {
     if (!$group.length) {
         $group = $(
             '<span class="csh-toolbar-actions" style="float:left;display:inline-flex;gap:4px;margin-right:8px;">' +
-              '<input type="button" value="Add Components to Change Set" class="cshSubmitStaged btn" style="display:none;font-weight:bold" title="Submit the cart\'s staged components (package.xml imports and selections saved earlier) to the change set in the background" />' +
+              '<input type="button" value="Add Selected Items" class="cshSubmitStaged btn" style="display:none;font-weight:bold" title="Submit the cart\'s staged components (package.xml imports and selections saved earlier) to the change set in the background" />' +
               '<input type="button" value="Reset Search Filters"   class="clearFilters btn"     title="Reset search filters" />' +
               '<input type="button" value="Export CSV"             class="cshExportCsv btn"     title="Download the currently-filtered table as a CSV file" />' +
               '<input type="button" value="Export package.xml"     class="cshExportPkg btn"     title="Serialize the cart (staged + submitted items) into a Salesforce package.xml file" />' +
@@ -2050,7 +2050,7 @@ function cshWireToolbarActions() {
                 window.cshToast && window.cshToast.show(
                     'Imported ' + added + ' item(s) from ' + file.name + '. ' +
                     'Items without a Salesforce Id will resolve when you visit each type; ' +
-                    'then press "Add Components to Change Set" in this toolbar.',
+                    'then press "Add Selected Items" in this toolbar.',
                     { type: 'success', duration: 7000 }
                 );
             } catch (e) {
@@ -2135,8 +2135,8 @@ async function cshRefreshCartToolbar() {
         if (staged + failed > 0) {
             if (!cshSubmitStagedRunning) {
                 $submit.val(failed > 0
-                    ? 'Add Components to Change Set (' + staged + ' + ' + failed + ' failed)'
-                    : 'Add Components to Change Set (' + staged + ')');
+                    ? 'Add Selected Items (' + staged + ' + ' + failed + ' failed)'
+                    : 'Add Selected Items (' + staged + ')');
             }
             $submit.show();
         } else if (!cshSubmitStagedRunning) {
@@ -2182,12 +2182,12 @@ async function cshRunSubmitStaged() {
         }
     } catch (e) {
         window.cshToast && window.cshToast.show(
-            'Add Components to Change Set failed: ' + ((e && e.message) || e), { type: 'error' });
+            'Add Selected Items failed: ' + ((e && e.message) || e), { type: 'error' });
     } finally {
         cshSubmitStagedRunning = false;
         // Reset the label SYNCHRONOUSLY: the counter refresh is async and
         // can fail, which would leave an enabled button stuck on 'Adding…'.
-        $btn.prop('disabled', false).val('Add Components to Change Set');
+        $btn.prop('disabled', false).val('Add Selected Items');
         cshRefreshCartToolbar();
     }
 }
