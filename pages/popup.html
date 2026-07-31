@@ -1,15 +1,46 @@
 <html>
 <head>
 <meta charset="utf-8">
-</head>
 <style type="text/css">
 body {
   min-width: 300px;
   min-height: 200px;
+  font-family: "Salesforce Sans", Arial, sans-serif;
 }
-</style >
+#downloadsSection {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid #d8d8d8;
+  border-radius: 6px;
+  background: #fafaf9;
+  font-size: 13px;
+  line-height: 1.45;
+}
+#downloadsSection h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+#enableDownloads {
+  margin-top: 8px;
+  padding: 6px 14px;
+  background: #0176d3;
+  color: #fff;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+#downloadsStatus.ok { color: #2e844a; font-weight: 600; }
+</style>
+</head>
 <body>
 <h2>Welcome to the Salesforce Change Set Helper Reloaded.</h2>
 <h3>To use the helper, edit your outbound change set in Salesforce.  The additional information and functionality will automatically be added to the page.</h3>
+<div id="downloadsSection">
+  <h4>Downloads</h4>
+  <div id="downloadsStatus"></div>
+  <button id="enableDownloads" type="button">Enable named downloads</button>
+</div>
+<script src="popup.js"></script>
 </body>
 </html>

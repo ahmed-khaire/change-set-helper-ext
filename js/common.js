@@ -402,6 +402,44 @@ window.cshDownload = function (filename, data, mime) {
                     function (resp) {
                         if (chrome.runtime.lastError) {
                             reject(new Error(chrome.runtime.lastError.message));
+                        } else if (resp && resp.needsPermission) {
+                            // Optional permission not granted yet. The legacy
+                            // anchor download is only safe while the user's
+                            // click still counts as transient activation
+                            // (~1s): without it Chrome turns the blob
+                            // navigation into a queued popup — the exact
+                            // "Open this page?" failure this module exists to
+                            // remove. Long pipelines (the metadata zip's
+                            // retrieve takes 30s+) always land here without
+                            // activation, so they must fail actionably, not
+                            // silently queue.
+                            var hasGesture = !!(navigator.userActivation && navigator.userActivation.isActive);
+                            if (!hasGesture) {
+                                reject(new Error('Enable named downloads from the Change Set Helper ' +
+                                    'toolbar popup (one time), then retry this export.'));
+                                return;
+                            }
+                            try {
+                                var a = document.createElement('a');
+                                a.href = URL.createObjectURL(blob);
+                                a.download = filename;
+                                document.body.appendChild(a);
+                                a.click();
+                                setTimeout(function () {
+                                    a.remove();
+                                    URL.revokeObjectURL(a.href);
+                                }, 500);
+                                if (!window.__cshDownloadNudged) {
+                                    window.__cshDownloadNudged = true;
+                                    window.cshToast && window.cshToast.show(
+                                        'Download started, but the browser may use a generic filename. ' +
+                                        'Click the Change Set Helper toolbar icon and "Enable named downloads" ' +
+                                        '(one time) to keep real filenames.',
+                                        { type: 'info', duration: 9000 }
+                                    );
+                                }
+                                resolve('fallback');
+                            } catch (e) { reject(e); }
                         } else if (!resp || !resp.ok) {
                             reject(new Error((resp && resp.error) || 'Download failed'));
                         } else {

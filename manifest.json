@@ -164,7 +164,9 @@
     "identity",
     "storage",
     "offscreen",
-    "cookies",
+    "cookies"
+  ],
+  "optional_permissions": [
     "downloads"
   ],
   "host_permissions": [

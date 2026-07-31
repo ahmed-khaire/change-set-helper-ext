@@ -1216,6 +1216,19 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                 sendResponse({ ok: false, error: 'cshDownload: data: url required' });
                 return;
             }
+            // "downloads" is an OPTIONAL permission: required would trip the
+            // "Manage your downloads" warning and disable every installed
+            // copy on update. Until the user grants it (one click in the
+            // popup), the caller falls back to its legacy anchor download.
+            chrome.permissions.contains({ permissions: ['downloads'] }, function (granted) {
+                if (!granted) {
+                    sendResponse({ ok: false, needsPermission: true,
+                        error: 'downloads permission not granted yet' });
+                    return;
+                }
+                doDownload();
+            });
+            function doDownload() {
             var filename = String(request.filename || 'download.bin')
                 .replace(/[\\/:*?"<>|]+/g, '_')
                 .replace(/[\x00-\x1f\x7f]+/g, '')   // control chars: chrome.downloads rejects them
@@ -1231,6 +1244,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
                     }
                 }
             );
+            }
         })();
         return true;
     }
