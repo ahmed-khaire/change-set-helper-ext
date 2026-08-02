@@ -503,7 +503,19 @@ This project builds upon the original work by Susan Bohme. Please respect the or
 
 ## 📊 Version History
 
-### v3.1.5 (Current)
+### v3.1.6 (Current)
+- 🐛 Fixed "Add To Change Set" doing nothing: native adds are now verified against the server, and staged selections are promoted only once confirmed
+- 🐛 Fixed selections vanishing after refresh and constant sync errors (on-demand sync replaces page-load sync storms)
+- ✨ New "Browse & Filter" table on the change set detail page: filter by type, search, select-all across pages, bulk remove, with cached created/modified metadata columns
+- ✨ Cross-type staging: selections survive switching Component Type and can be submitted together via "Add All Selected Components (N)" (with in-flight "Adding…" state)
+- ⚡ Slow/large-org resilience: no artificial timeouts; post-add verification continues in the background on orgs where Salesforce responds slowly
+- 🛡️ Orgs blocked by Salesforce's "Bad External References" page: membership reads fall back to the change-set detail page, with clear "Recompile All" guidance
+- 🔽 Named downloads via an optional downloads permission (enable once from the toolbar popup) — no install-time permission warning
+- 🐛 Fixed package.xml exports using display labels instead of Metadata API type names
+- 🔧 Clearer toolbar wording ("Clear saved selections") and a live staged-count that updates as you tick
+- ✅ Verified end-to-end on Lightning and Classic, small and very large orgs
+
+### v3.1.5
 - 🐛 Fixed component removal and cart sync on enhanced-domain (Setup-domain) orgs
 - 🐛 Fixed Lightning iframe + Setup-domain cart sync issues
 - 🔒 Restricted messaging to trusted HTTPS Salesforce domains
