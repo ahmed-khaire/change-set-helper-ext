@@ -952,6 +952,12 @@
                 promoted++;
                 return;
             }
+            if (options.updateOnly) {
+                // Late-verification promotion: a row absent from THIS read
+                // was cleared or removed after the scrape started and must
+                // stay gone - never insert on its behalf.
+                return;
+            }
             var row = {
                 uid: uid(),
                 type: it.type,
@@ -1328,33 +1334,66 @@
             // Bounded: init awaits this, and neither fetch path has its own
             // timeout - a hung request must not stall checkbox restore and
             // auto-save installation indefinitely.
-            var live = await Promise.race([
-                fetchChangeSetViewItems(packageId),
-                new Promise(function (_, rej) {
-                    setTimeout(function () { rej(new Error('verification timed out after 15s')); }, 15000);
-                })
-            ]);
-            // Scope strictly to what THIS native submit sent. Passing the
-            // full inventory would insert every server component into the
-            // cart as 'done' - re-creating the whole-change-set-in-storage
-            // bloat the panel removal eliminated.
-            var wanted = {};
-            marker.ids.forEach(function (id) { wanted[String(id).slice(0, 15)] = true; });
-            var confirmed = live.filter(function (it) {
-                return it && it.id && wanted[String(it.id).slice(0, 15)];
-            });
-            if (!confirmed.length) {
-                console.log('[CSH] native-add verification: none of the submitted ids are in the change set');
+            var livePromise = fetchChangeSetViewItems(packageId, marker.key);
+            var live;
+            try {
+                live = await Promise.race([
+                    livePromise,
+                    new Promise(function (_, rej) {
+                        setTimeout(function () { rej(new Error('verification timed out after 15s')); }, 15000);
+                    })
+                ]);
+            } catch (raceErr) {
+                if (!/timed out/i.test((raceErr && raceErr.message) || '')) throw raceErr;
+                // Slow org: don't hold init (checkbox restore, auto-save
+                // install) hostage - let the ALREADY-RUNNING scrape finish in
+                // the background and promote late; the cart beacon updates
+                // the toolbar when it lands. updateOnly: a user may Clear
+                // saved selections while the slow verification is still in
+                // flight, and late promotion must never resurrect cleared
+                // rows. Verified need: the heavy-org detail fallback fetch
+                // alone can take ~2 minutes.
+                console.warn('[CSH] native-add verification exceeded 15s - continuing in the background');
+                livePromise.then(function (lateLive) {
+                    return _promoteMarkerConfirmed(marker, lateLive, { updateOnly: true })
+                        .then(function (lateN) {
+                            console.log('[CSH] late native-add verification promoted', lateN, 'row(s)');
+                        });
+                }).catch(function (lateErr) {
+                    console.warn('[CSH] late native-add verification failed - staged rows left untouched:', lateErr && lateErr.message);
+                });
                 return 0;
             }
-            var r = await syncItemsFromServer(marker.key, confirmed, { authoritative: false });
-            console.log('[CSH] native-add verification: promoted', r.promoted,
-                'of', marker.ids.length, 'submitted row(s) confirmed in the change set');
-            return r.promoted;
+            return await _promoteMarkerConfirmed(marker, live);
         } catch (e) {
             console.warn('[CSH] native-add verification failed — staged rows left untouched:', e && e.message);
             return 0;
         }
+    }
+
+    // Scope strictly to what THIS native submit sent. Passing the full
+    // inventory would insert every server component into the cart as 'done'
+    // - re-creating the whole-change-set-in-storage bloat the panel removal
+    // eliminated.
+    async function _promoteMarkerConfirmed(marker, live, opts) {
+        opts = opts || {};
+        var wanted = {};
+        marker.ids.forEach(function (id) { wanted[String(id).slice(0, 15)] = true; });
+        var confirmed = live.filter(function (it) {
+            return it && it.id && wanted[String(it.id).slice(0, 15)];
+        });
+        if (!confirmed.length) {
+            console.log('[CSH] native-add verification: none of the submitted ids are in the change set');
+            return 0;
+        }
+        // updateOnly is enforced inside syncItemsFromServer, against ITS
+        // cart read - checking here first would be check-then-act across
+        // two independent reads (a Clear could land in between).
+        var r = await syncItemsFromServer(marker.key, confirmed,
+            { authoritative: false, updateOnly: !!opts.updateOnly });
+        console.log('[CSH] native-add verification: promoted', r.promoted,
+            'of', marker.ids.length, 'submitted row(s) confirmed in the change set');
+        return r.promoted;
     }
 
     async function clearStaged(changeSetId) {
@@ -2507,70 +2546,51 @@
         });
     }
 
-    // On some orgs (observed live on a large enhanced-domain sandbox),
-    // requesting /<033>?tab=PackageComponents redirects to Salesforce's
-    // "Bad External References" interstitial (/udd/AllPackage/
-    // badExternalRefs.apexp) — a warning page with no table.list, which used
-    // to surface as "No table.list on classic components view" and break both
-    // membership sync and bulk remove there. Other orgs serve the components
-    // table directly, so this is a per-org redirect, not a URL-scheme change.
-    // Recovery: scan the interstitial once for an onward link back to the
-    // components view (a continue/skip anchor or form) and follow it a single
-    // time. If no onward path exists, fail with a message that names the real
-    // condition instead of a generic parse error.
+    // Some orgs (verified live on dubaisouth--uatrevamp) block
+    // /<033>?tab=PackageComponents behind Salesforce's "Bad External
+    // References" interstitial until an admin presses Recompile All. The
+    // real interstitial offers NO onward link back to the view, and when
+    // fetched with X-Requested-With the blocked content is served at the
+    // ORIGINAL url - so detection must look at content, not just the final
+    // URL, and recovery-by-link-following is impossible. Throw a typed
+    // error instead; membership readers fall back to the change-set detail
+    // page, which renders the same table ungated.
     async function _fetchClassicPage(url) {
         var r = await _fetchClassicPageRaw(url);
-        if (!/badExternalRefs\.apexp/i.test(String(r.url || ''))) return r;
-        console.warn('[CSH] classic components view redirected to badExternalRefs:', r.url);
-        var onward = null;
-        try {
-            var doc = new DOMParser().parseFromString(r.text, 'text/html');
-            // The 033 we asked for — the onward link must point at the SAME
-            // package, on the interstitial's own origin, or we could scrape a
-            // different package's membership as this change set's.
-            var wantedPkg = (String(url).match(/033[A-Za-z0-9]{12,15}/) || [null])[0];
-            var wantedPkg15 = wantedPkg ? wantedPkg.slice(0, 15) : null;
-            // Anchors, plus GET-only forms: a POST action cannot be replayed
-            // as a bare fetch without its method and field payload.
-            var candidates = [].concat(
-                [...doc.querySelectorAll('a[href]')].map(function (a) { return a.getAttribute('href'); }),
-                [...doc.querySelectorAll('form[action]')]
-                    .filter(function (f) { return !f.getAttribute('method') || /^get$/i.test(f.getAttribute('method')); })
-                    .map(function (f) { return f.getAttribute('action'); })
-            );
-            onward = candidates.find(function (href) {
-                if (!href || !/tab=PackageComponents/i.test(href) || /badExternalRefs/i.test(href)) return false;
-                try {
-                    var abs = new URL(href, r.url);
-                    if (abs.origin !== new URL(r.url).origin) return false;
-                    if (wantedPkg15) {
-                        var m = abs.href.match(/033[A-Za-z0-9]{12,15}/);
-                        if (!m || m[0].slice(0, 15) !== wantedPkg15) return false;
-                    }
-                    return true;
-                } catch (_) { return false; }
-            }) || null;
-            if (!onward) {
-                // Log what the page offered so the next report of this can be
-                // diagnosed from a console screenshot alone.
-                console.warn('[CSH] badExternalRefs page offered no onward link. anchors=',
-                    candidates.filter(Boolean).slice(0, 10));
-            }
-        } catch (e) {
-            console.warn('[CSH] could not parse badExternalRefs page:', e && e.message);
+        if (_looksLikeBadRefsPage(r)) {
+            console.warn('[CSH] components view blocked by the Bad External References interstitial:', r.url || url);
+            throw _badRefsBlockedError();
         }
-        if (onward) {
-            var followed = await _fetchClassicPageRaw(new URL(onward, r.url).href);
-            if (!/badExternalRefs\.apexp/i.test(String(followed.url || ''))) {
-                console.log('[CSH] recovered components view via badExternalRefs onward link');
-                return followed;
-            }
-        }
-        throw new Error('Salesforce redirected the components view to its "Bad External References" ' +
-            'page for this package, and no usable continuation link was found on it. ' +
-            'The membership list cannot be read until Salesforce serves the components view.');
+        return r;
     }
 
+    function _looksLikeBadRefsPage(r) {
+        if (/badExternalRefs\.apexp/i.test(String(r && r.url || ''))) return true;
+        var t = (r && r.text) || '';
+        return /Bad References Found/i.test(t) && /Recompile/i.test(t);
+    }
+
+    function _badRefsBlockedError() {
+        var err = new Error('Salesforce is blocking this package\'s components view ("Bad References Found"). ' +
+            'Open the components view for this change set and press "Recompile All", then retry.');
+        err.cshBadRefsBlocked = true;
+        return err;
+    }
+
+    // The bad-refs fallback needs the 0A2 for the detail-page URL but most
+    // callers only hold the 033 - reverse the persisted id map.
+    async function _changeSetIdForPackage(packageId) {
+        try {
+            var s = await storageGet(['cshIdMap']);
+            var map = (s && s.cshIdMap) || {};
+            var want = String(packageId).slice(0, 15);
+            for (var k in map) {
+                if (map.hasOwnProperty(k) && /^0A2/i.test(k) &&
+                        String(map[k]).slice(0, 15) === want) return k;
+            }
+        } catch (_) { }
+        return null;
+    }
     // Complete-or-throw scraper for reconcileSubmittedBatch, its only caller.
     // Reconciliation marks every batch item NOT found in this list as failed
     // (and, in the caller's failed-POST branch, decides whether a native
@@ -2584,7 +2604,43 @@
     //     localized/renamed-header case drops every row as no-type).
     // Callers already handle the throw as "unverified" (successful POST) or
     // "indeterminate" (failed POST).
-    async function fetchChangeSetViewItems(packageId) {
+    // Prefer the table.list whose header row actually has a Type column -
+    // the detail page can render other table.list blocks and picking the
+    // wrong one would drop every row as noType.
+    function _pickComponentsTable(doc) {
+        var tables = doc.querySelectorAll('table.list');
+        for (var i = 0; i < tables.length; i++) {
+            var hr = tables[i].querySelector('tr.headerRow');
+            if (!hr) continue;
+            for (var j = 0; j < hr.children.length; j++) {
+                if ((hr.children[j].textContent || '').trim().toLowerCase() === 'type') return tables[i];
+            }
+        }
+        return tables[0] || null;
+    }
+
+    async function fetchChangeSetViewItems(packageId, changeSetIdHint) {
+        var appOrigin = _appOriginForChangeSetView();
+        var viewUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
+        try {
+            return await _walkComponentsList(viewUrl, packageId);
+        } catch (e) {
+            if (!e || !e.cshBadRefsBlocked) throw e;
+            // Bad-refs block: the change-set detail page renders the same
+            // membership table ungated. Its URL needs the 0A2 - the caller's
+            // hint when it had one, else the id map reversed.
+            var csId = (changeSetIdHint && /^0A2/i.test(String(changeSetIdHint)))
+                ? changeSetIdHint
+                : await _changeSetIdForPackage(packageId);
+            if (!csId) throw e;
+            console.warn('[CSH] components view blocked - reading membership from the change-set detail page for', csId);
+            var detailUrl = new URL('/changemgmt/outboundChangeSetDetailPage.apexp?id=' +
+                encodeURIComponent(csId) + '&rowsperpage=5000&isdtp=p1', appOrigin).href;
+            return await _walkComponentsList(detailUrl, packageId);
+        }
+    }
+
+    async function _walkComponentsList(startUrl, packageId) {
         var items = [];
         // Zero rows only counts as "genuinely empty" when page 1 carried the
         // classic view's own empty placeholder — the same rule the
@@ -2593,8 +2649,7 @@
         // false confirmed-zero: reconciliation would fail rows that may have
         // landed, and the submit bridge would native-resubmit on top of them.
         var emptyConfirmed = false;
-        var appOrigin = _appOriginForChangeSetView();
-        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOrigin).href;
+        var nextUrl = startUrl;
         var safety = 200;
         var pageNum = 0;
         while (nextUrl && safety-- > 0) {
@@ -2602,7 +2657,7 @@
             var r = await _fetchClassicPage(nextUrl);
             if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
             var doc = new DOMParser().parseFromString(r.text, 'text/html');
-            var table = doc.querySelector('table.list');
+            var table = _pickComponentsTable(doc);
             if (!table) {
                 throw new Error('No table.list on classic components view page ' + pageNum +
                     ' (' + r.url + ') — membership list would be ' +
@@ -2664,7 +2719,7 @@
     }
 
     async function reconcileSubmittedBatch(changeSetId, packageId, batchItems, fallbackError) {
-        var liveItems = await fetchChangeSetViewItems(packageId);
+        var liveItems = await fetchChangeSetViewItems(packageId, changeSetId);
         // Verify by Salesforce component id first. If Salesforce only exposes
         // a package-member/remove id on the Package Components row, fall back
         // to component name/fullName so a successful add is not marked failed.

@@ -279,6 +279,41 @@
         if (!packageId) {
             throw new Error('Could not resolve 033 MetadataPackage id for authoritative sync');
         }
+        var viewUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOriginForChangeSetView()).href;
+        try {
+            var res = await walkComponentList(viewUrl, packageId);
+            res.viaDetailFallback = false;
+            return res;
+        } catch (e) {
+            if (!e || !e.cshBadRefsBlocked) throw e;
+            console.warn('[CSH] components view blocked - reading membership from the change-set detail page for', urlId);
+            var detailUrl = new URL('/changemgmt/outboundChangeSetDetailPage.apexp?id=' +
+                encodeURIComponent(urlId) + '&rowsperpage=5000&isdtp=p1', appOriginForChangeSetView()).href;
+            var res2 = await walkComponentList(detailUrl, packageId);
+            res2.viaDetailFallback = true;
+            return res2;
+        }
+    }
+
+    // Prefer the table.list whose header row actually has a Type column -
+    // the detail page can render other table.list blocks and picking the
+    // wrong one would drop every row as noType.
+    function pickComponentsTable(doc) {
+        var tables = doc.querySelectorAll('table.list');
+        for (var i = 0; i < tables.length; i++) {
+            var hr = tables[i].querySelector('tr.headerRow');
+            if (!hr) continue;
+            for (var j = 0; j < hr.children.length; j++) {
+                if ((hr.children[j].textContent || '').trim().toLowerCase() === 'type') return tables[i];
+            }
+        }
+        return tables[0] || null;
+    }
+
+    // Pagination walk shared by the components view and its detail-page
+    // fallback - identical markup family (table.list + headerRow with
+    // Name/Type/API Name columns), verified live on both.
+    async function walkComponentList(startUrl, packageId) {
         var items = [];
         // Whether we walked the pagination chain to its natural end. A page
         // that fails to parse half-way through leaves us holding a PARTIAL
@@ -291,8 +326,7 @@
         // Distinguishes "user emptied the set" from "our scrape broke", which
         // otherwise both look like a zero-length item list.
         var emptyConfirmed = false;
-        // App origin, not the current page's — see buildDelHrefMap.
-        var nextUrl = new URL('/' + packageId + '?tab=PackageComponents&rowsperpage=5000', appOriginForChangeSetView()).href;
+        var nextUrl = startUrl;
         var safety = 200;
         var pageNum = 0;
         while (nextUrl && safety-- > 0) {
@@ -301,7 +335,7 @@
             if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching classic components view');
             var html = r.text;
             var doc = new DOMParser().parseFromString(html, 'text/html');
-            var table = doc.querySelector('table.list');
+            var table = pickComponentsTable(doc);
             if (!table) {
                 if (pageNum === 1) {
                     throw new Error('No table.list on classic components view (' + r.url + ')');
@@ -1190,62 +1224,33 @@
         });
     }
 
-    // Same badExternalRefs interstitial recovery as cart.js:_fetchClassicPage
-    // — this file's scrapers (buildDelHrefMap, fetchAllChangeSetComponents)
-    // hit the identical URL family and broke identically on the org where
-    // Salesforce redirects it. One onward-link follow, then a descriptive
-    // failure instead of a generic "No table.list".
+    // Bad External References detection, same rules as cart.js:
+    // _fetchClassicPage - content sniff plus URL (the interstitial has no
+    // onward link and is served at the original URL for XHR fetches, so
+    // link-following recovery is impossible). fetchAllChangeSetComponents
+    // falls back to the change-set detail page; buildDelHrefMap surfaces
+    // the actionable error (removal genuinely needs the components view).
     async function fetchClassicPage(url) {
         var r = await fetchClassicPageRaw(url);
-        if (!/badExternalRefs\.apexp/i.test(String(r.url || ''))) return r;
-        console.warn('[CSH] classic components view redirected to badExternalRefs:', r.url);
-        var onward = null;
-        try {
-            var doc = new DOMParser().parseFromString(r.text, 'text/html');
-            // The 033 we asked for — the onward link must point at the SAME
-            // package, on the interstitial's own origin, or we could scrape a
-            // different package's membership as this change set's.
-            var wantedPkg = (String(url).match(/033[A-Za-z0-9]{12,15}/) || [null])[0];
-            var wantedPkg15 = wantedPkg ? wantedPkg.slice(0, 15) : null;
-            // Anchors, plus GET-only forms: a POST action cannot be replayed
-            // as a bare fetch without its method and field payload.
-            var candidates = [].concat(
-                [...doc.querySelectorAll('a[href]')].map(function (a) { return a.getAttribute('href'); }),
-                [...doc.querySelectorAll('form[action]')]
-                    .filter(function (f) { return !f.getAttribute('method') || /^get$/i.test(f.getAttribute('method')); })
-                    .map(function (f) { return f.getAttribute('action'); })
-            );
-            onward = candidates.find(function (href) {
-                if (!href || !/tab=PackageComponents/i.test(href) || /badExternalRefs/i.test(href)) return false;
-                try {
-                    var abs = new URL(href, r.url);
-                    if (abs.origin !== new URL(r.url).origin) return false;
-                    if (wantedPkg15) {
-                        var m = abs.href.match(/033[A-Za-z0-9]{12,15}/);
-                        if (!m || m[0].slice(0, 15) !== wantedPkg15) return false;
-                    }
-                    return true;
-                } catch (_) { return false; }
-            }) || null;
-            if (!onward) {
-                console.warn('[CSH] badExternalRefs page offered no onward link. anchors=',
-                    candidates.filter(Boolean).slice(0, 10));
-            }
-        } catch (e) {
-            console.warn('[CSH] could not parse badExternalRefs page:', e && e.message);
+        if (looksLikeBadRefsPage(r)) {
+            console.warn('[CSH] components view blocked by the Bad External References interstitial:', r.url || url);
+            throw badRefsBlockedError();
         }
-        if (onward) {
-            var followed = await fetchClassicPageRaw(new URL(onward, r.url).href);
-            if (!/badExternalRefs\.apexp/i.test(String(followed.url || ''))) {
-                console.log('[CSH] recovered components view via badExternalRefs onward link');
-                return followed;
-            }
-        }
-        throw new Error('Salesforce redirected the components view to its "Bad External References" ' +
-            'page for this package, and no usable continuation link was found on it. ' +
-            'The membership list cannot be read until Salesforce serves the components view.');
+        return r;
     }
 
+    function looksLikeBadRefsPage(r) {
+        if (/badExternalRefs\.apexp/i.test(String(r && r.url || ''))) return true;
+        var t = (r && r.text) || '';
+        return /Bad References Found/i.test(t) && /Recompile/i.test(t);
+    }
+
+    function badRefsBlockedError() {
+        var err = new Error('Salesforce is blocking this package\'s components view ("Bad References Found"). ' +
+            'Open the components view for this change set and press "Recompile All", then retry.');
+        err.cshBadRefsBlocked = true;
+        return err;
+    }
     function postClassicForm(url, body, method) {
         var sameOrigin = (function () {
             try { return new URL(url).origin === location.origin; }
@@ -1830,6 +1835,10 @@
     // Reload or an A4J reset started a newer one) must not render into the
     // newer panel.
     var browserGen = 0;
+    // True when the current browser contents came from the detail-page
+    // fallback (components view bad-refs blocked). Removal needs the
+    // components view's Del URLs, so the Remove control stays disabled.
+    var browserRemoveBlockedByOrg = false;
 
     function browserEsc(s) {
         return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -1911,6 +1920,13 @@
             var packageId = await resolvePackageId(csId);
             if (!packageId) throw new Error('could not resolve the 033 package id');
             var scrape = await fetchAllChangeSetComponents(csId, packageId);
+            browserRemoveBlockedByOrg = !!scrape.viaDetailFallback;
+            if (scrape.viaDetailFallback) {
+                window.cshToast && window.cshToast.show(
+                    'Loaded via the change-set page: Salesforce is blocking this org\'s components view ' +
+                    '("Bad References Found"). Removal from this table is disabled until "Recompile All" is run.',
+                    { type: 'warning', duration: 9000 });
+            }
             var items = scrape.items;
             if (!scrape.complete) {
                 window.cshToast && window.cshToast.show(
@@ -2084,7 +2100,12 @@
         var countEl = browserEl.querySelector('.csh-dc-browser-count');
         var removeBtn = browserEl.querySelector('.csh-dc-browser-remove');
         if (countEl) countEl.textContent = n + ' selected';
-        if (removeBtn) removeBtn.disabled = n === 0;
+        if (removeBtn) {
+            removeBtn.disabled = n === 0 || browserRemoveBlockedByOrg;
+            removeBtn.title = browserRemoveBlockedByOrg
+                ? 'Removal needs the components view, which Salesforce is blocking for this org ("Bad References Found" - run Recompile All first)'
+                : '';
+        }
         // Header checkbox mirrors the filtered set: checked when all of it
         // is selected, dash when only part of it is.
         var selAll = browserEl.querySelector('.csh-dc-browser-selall');
