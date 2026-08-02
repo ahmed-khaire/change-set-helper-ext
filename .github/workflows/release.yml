@@ -74,7 +74,7 @@ jobs:
             js/common.js js/cart.js js/cshlogger.js js/cshdb.js js/outboundlist.js \
             js/compare.js pages/compare.html \
             pages/options.html js/options.js \
-            pages/popup.html \
+            pages/popup.html pages/popup.js \
             css/changeset.css css/cart.css \
             lib \
             assets/icons/brainbulb128.png assets/icons/brainbulb48.png assets/icons/braincloudsmall.png \
