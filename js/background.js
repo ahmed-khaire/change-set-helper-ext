@@ -304,7 +304,7 @@ async function cshRefreshAccessToken(host, refreshToken) {
     };
 }
 
-async function cshRunOauthLogin(host) {
+async function cshRunOauthLogin(host, prompt) {
     var pkce = await cshGeneratePkce();
     var state = Math.random().toString(36).slice(2);
     var authUrl = host + '/services/oauth2/authorize' +
@@ -314,7 +314,8 @@ async function cshRunOauthLogin(host) {
         '&scope=' + encodeURIComponent('api refresh_token id') +
         '&code_challenge=' + encodeURIComponent(pkce.challenge) +
         '&code_challenge_method=S256' +
-        '&state=' + state;
+        '&state=' + state +
+        (prompt ? '&prompt=' + encodeURIComponent(prompt) : '');
     // Hold the service worker awake for the duration of the OAuth popup.
     // Users can take 30s+ to enter credentials / clear a 2FA prompt; without
     // keep-alive the MV3 SW can idle and lose the pending launchWebAuthFlow
@@ -361,7 +362,7 @@ async function cshRunOauthLogin(host) {
 // they switched change sets.
 //
 // We now persist per-org credentials (access + refresh token, instance URL,
-// identity) in chrome.storage.local keyed by host+username, plus a
+// identity) in chrome.storage.local keyed by stable Salesforce identity, plus a
 // per-change-set "last used org" map so the Validate Helper can auto-select
 // the org the user most recently deployed this change set to. Refresh tokens
 // let us mint fresh access tokens without a popup until the refresh itself
@@ -384,8 +385,40 @@ function cshWriteJsonKey(key, val) {
     });
 }
 
-function cshMakeOrgId(host, username) {
-    return (host || '').toLowerCase() + '|' + (username || '').toLowerCase();
+function cshNormalizeOrgKeyPart(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function cshLegacyOrgId(host, username) {
+    return cshNormalizeOrgKeyPart(host) + '|' + cshNormalizeOrgKeyPart(username);
+}
+
+function cshMakeOrgId(orgRecord) {
+    var organizationId = cshNormalizeOrgKeyPart(orgRecord.organizationId);
+    var userIdentity = cshNormalizeOrgKeyPart(orgRecord.userId || orgRecord.username);
+    if (organizationId && userIdentity) {
+        return 'salesforce|' + organizationId + '|' + userIdentity;
+    }
+
+    // Identity endpoints can be restricted by Connected App policy. The
+    // token's instance URL is still org-specific, unlike login.salesforce.com
+    // and test.salesforce.com, so it prevents separate orgs from collapsing
+    // into one generic-host entry even when organizationId is unavailable.
+    var orgHost = cshNormalizeOrgKeyPart(orgRecord.instanceUrl || orgRecord.host);
+    return orgHost + '|' + (userIdentity || 'unknown');
+}
+
+async function cshReplaceOrgUsageId(oldOrgId, newOrgId) {
+    if (!oldOrgId || !newOrgId || oldOrgId === newOrgId) return;
+    var usage = await cshReadJsonKey(ORG_USAGE_KEY);
+    var changed = false;
+    Object.keys(usage).forEach(function (changeSetId) {
+        if (usage[changeSetId] && usage[changeSetId].lastOrgId === oldOrgId) {
+            usage[changeSetId].lastOrgId = newOrgId;
+            changed = true;
+        }
+    });
+    if (changed) await cshWriteJsonKey(ORG_USAGE_KEY, usage);
 }
 
 async function cshListSavedOrgs() {
@@ -405,16 +438,21 @@ async function cshGetSavedOrg(orgId) {
 }
 
 async function cshSaveOrg(orgRecord) {
-    var id = orgRecord.orgId || cshMakeOrgId(orgRecord.host, orgRecord.username);
+    var explicitId = orgRecord.orgId || null;
+    var id = explicitId || cshMakeOrgId(orgRecord);
     var all = await cshReadJsonKey(SAVED_ORGS_KEY);
-    var prev = all[id] || {};
+    var legacyId = explicitId ? null : cshLegacyOrgId(orgRecord.host, orgRecord.username);
+    var migrateLegacy = legacyId && legacyId !== id && !!all[legacyId];
+    var prev = all[id] || (migrateLegacy ? all[legacyId] : {});
     // Preserve fields from prior record that the caller didn't supply (e.g.
     // refreshToken when only the access token was rotated).
     all[id] = Object.assign({}, prev, orgRecord, {
         orgId: id,
         lastUsedAt: orgRecord.lastUsedAt || Date.now()
     });
+    if (migrateLegacy) delete all[legacyId];
     await cshWriteJsonKey(SAVED_ORGS_KEY, all);
+    if (migrateLegacy) await cshReplaceOrgUsageId(legacyId, id);
     return id;
 }
 
@@ -555,20 +593,23 @@ async function cshConnectDeployOrg(request) {
 
     // New-org path: PKCE login + identity fetch + save + connect offscreen.
     var host = cshAuthHostForEnv(request && request.environment, request && request.customHost);
-    var tokens = await cshRunOauthLogin(host);
+    // A generic Salesforce login host can reuse its existing browser session
+    // and silently return the org that is already signed in. Adding (or
+    // re-authorizing) a target org must ask for credentials so the user can
+    // select a genuinely different Salesforce org.
+    var tokens = await cshRunOauthLogin(host, 'login');
     var ident = {};
     try {
         ident = await cshFetchOrgIdentity(tokens.instanceUrl, tokens.accessToken);
     } catch (e) {
-        // Identity fetch shouldn't block the login — fall back to the host
-        // as the visible label. Users will see the org listed but with an
-        // empty username; we'll refresh the identity on next successful use.
+        // Identity fetch shouldn't block the login. The verified offscreen
+        // connection below supplies the username, while the org-specific
+        // instance URL keeps the fallback storage key unique.
         console.warn('cshFetchOrgIdentity failed:', e.message);
     }
-    var username = ident.username || 'unknown';
     var record = {
         host: host,
-        username: username,
+        username: ident.username || '',
         userId: ident.userId || null,
         organizationId: ident.organizationId || null,
         displayName: ident.displayName || '',
@@ -579,7 +620,6 @@ async function cshConnectDeployOrg(request) {
         issuedAt: tokens.issuedAt,
         scope: tokens.scope
     };
-    var orgId = await cshSaveOrg(record);
     var offRes = await sendToOffscreen({
         action: 'connectToOrg',
         connType: 'deploy',
@@ -587,6 +627,12 @@ async function cshConnectDeployOrg(request) {
         accessToken: tokens.accessToken
     });
     if (offRes && offRes.error) throw new Error(offRes.error);
+    // Do not persist an "unknown" user merely because the direct identity
+    // endpoint was unavailable. The verified JSforce connection also returns
+    // the username and gives the fallback key a stable user component.
+    var username = ident.username || (offRes && offRes.username) || 'unknown';
+    record.username = username;
+    var orgId = await cshSaveOrg(record);
     if (request && request.changeSetId) {
         await cshSetLastOrgForChangeSet(request.changeSetId, orgId);
     }
@@ -1580,9 +1626,18 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         sendToOffscreen({action: 'getDeployUsername'}).then(async response => {
             // Include the active org id so the page can pin which org this
             // connection points at (see cshCheckExpectedDeployOrg).
-            sendResponse(response.username
-                ? { username: response.username, orgId: await cshGetActiveDeployOrgId() }
-                : null);
+            if (!response.username) {
+                sendResponse(null);
+                return;
+            }
+            var activeOrgId = await cshGetActiveDeployOrgId();
+            var activeOrg = activeOrgId ? await cshGetSavedOrg(activeOrgId) : null;
+            sendResponse({
+                username: response.username,
+                orgId: activeOrgId,
+                envLabel: (activeOrg && activeOrg.envLabel) || '',
+                host: (activeOrg && activeOrg.host) || ''
+            });
         }).catch(err => {
             console.error('Error in getDeployUsername:', err);
             sendResponse(null);

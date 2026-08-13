@@ -503,7 +503,15 @@ This project builds upon the original work by Susan Bohme. Please respect the or
 
 ## 📊 Version History
 
-### v3.1.6 (Current)
+### v3.1.7 (Current)
+- 🐛 Fixed "Add another org" reconnecting the already signed-in Salesforce org instead of prompting for a different account
+- 🔐 New target-org OAuth and reauthorization now require an explicit Salesforce login while preserving PKCE and refresh-token handling
+- 🛡️ Saved target orgs now use stable Salesforce organization/user identities, with org-specific fallbacks when identity endpoints are restricted
+- 🔄 Matching legacy saved-org records and per-change-set selections migrate automatically when an org is reauthorized
+- 🐛 Comparison now restores the active target org, environment, and cache identity after a page reload
+- 🐛 Fixed an initialization race that could show the saved-org picker over an already active comparison connection
+
+### v3.1.6
 - 🐛 Fixed "Add To Change Set" doing nothing: native adds are now verified against the server, and staged selections are promoted only once confirmed
 - 🐛 Fixed selections vanishing after refresh and constant sync errors (on-demand sync replaces page-load sync storms)
 - ✨ New "Browse & Filter" table on the change set detail page: filter by type, search, select-all across pages, bulk remove, with cached created/modified metadata columns

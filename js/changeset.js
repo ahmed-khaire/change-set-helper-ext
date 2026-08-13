@@ -603,10 +603,10 @@ function setupTable() {
 
     $('#editPage').append('<input type="hidden" name="rowsperpage" value="5000" /> ');
 
-    // Populate the saved-orgs dropdown now that its select exists. Safe to
-    // call again later (the wiring block also invokes it) — the function
-    // just re-reads storage and re-renders the dropdown.
-    if (typeof cshCompareRefreshSavedOrgsUI === 'function') {
+    // The active-connection probe can finish before these controls exist.
+    // Reapply its state now that the UI is mounted; only render the saved-org
+    // picker when there is no active shared target connection.
+    if (!cshApplyActiveCompareUiState() && typeof cshCompareRefreshSavedOrgsUI === 'function') {
         cshCompareRefreshSavedOrgsUI().catch(function () {});
     }
 }
@@ -2991,6 +2991,7 @@ function cshFilterOutManaged(records) {
 // against the same environment without prompting the user to reconnect.
 var cshLastCompareEnv = null;
 var cshLastCompareOrgId = null;
+var cshActiveCompareUsername = null;
 
 function cshNormalizeToolingRecord(rec, cfg, ctx) {
     var ns = rec.NamespacePrefix || '';
@@ -3284,6 +3285,14 @@ function cshCompareRefreshSavedOrgsUI() {
             type: 'cshListSavedOrgs',
             changeSetId: cshCompareChangeSetId()
         }, function (resp) {
+            // The active-connection probe and this storage read run in
+            // parallel. If the probe won while this request was in flight,
+            // keep its connected-state UI instead of showing the picker over
+            // the active org.
+            if (cshApplyActiveCompareUiState()) {
+                resolve();
+                return;
+            }
             if (resp && resp.ok) {
                 cshCompareRenderSavedOrgsDropdown(resp.orgs || [], resp.lastOrgIdForChangeSet || null);
             } else {
@@ -3493,7 +3502,8 @@ function cshCompareOnConnectSavedOrg() {
             window.cshToast && window.cshToast.show('Connect failed: ' + msg, { type: 'error' });
             return;
         }
-        $("#loggedInUsername").html(response.username || '');
+        cshActiveCompareUsername = response.username || '';
+        $("#loggedInUsername").text(cshActiveCompareUsername);
         cshLastCompareOrgId = response.orgId || orgId;
         // Fresh connection — nuke any entity-map cache from a previous
         // deploy org so Tier-2 composites (Layout, WorkflowRule) don't
@@ -3562,7 +3572,8 @@ async function cshCompareStartNewOrgLogin(env, customHost) {
             window.cshToast && window.cshToast.show('Problem logging in: ' + err, { type: 'error' });
             return;
         }
-        $("#loggedInUsername").html(response.username || '');
+        cshActiveCompareUsername = response.username || '';
+        $("#loggedInUsername").text(cshActiveCompareUsername);
         cshLastCompareOrgId = response.orgId || null;
         // Fresh connection — clear the deploy entity-map cache so Tier-2
         // composite resolution doesn't use Ids from a previous org.
@@ -3687,6 +3698,7 @@ function deployLogout() {
     $('#csh-compare-refresh').hide();
     cshLastCompareEnv = null;
     cshLastCompareOrgId = null;
+    cshActiveCompareUsername = null;
     // Refresh the saved-orgs picker — if the user has one or more saved
     // orgs they'll see the dropdown; otherwise they fall back to the classic
     // env-select form. Makes a silent no-op if the Compare UI isn't mounted
@@ -4296,8 +4308,9 @@ $(document).ready(function () {
         $('#compareNewOrgGroup').hide();
         $('#compareSavedOrgsGroup').show();
     });
-    // Populate the saved-orgs dropdown once the compare controls are rendered.
-    cshCompareRefreshSavedOrgsUI();
+    // Populate the saved-orgs dropdown once the compare controls are rendered,
+    // unless the async active-connection probe already restored a target org.
+    if (!cshApplyActiveCompareUiState()) cshCompareRefreshSavedOrgsUI();
     // Reveal My Domain URL input when the user picks it.
     $(document).on('change', '#compareEnv', function () {
         if ($(this).val() === 'mydomain') $('#compareMyDomain').show();
@@ -4445,17 +4458,46 @@ $(document).ready(function () {
     // verification still re-reads the server after every cart submit.
 });
 
-//Find out if they are logged in already
+function cshCompareEnvFromActiveConnection(response) {
+	if (!response || typeof response === 'string') return null;
+	if (response.envLabel === 'Sandbox') return 'sandbox';
+	if (response.envLabel === 'Production') return 'prod';
+	if (response.envLabel === 'My Domain') return 'mydomain';
+	if (/^https?:\/\/test\.salesforce\.com/i.test(response.host || '')) return 'sandbox';
+	if (/^https?:\/\/login\.salesforce\.com/i.test(response.host || '')) return 'prod';
+	return response.host ? 'mydomain' : null;
+}
+
+function cshApplyActiveCompareUiState() {
+	if (!cshActiveCompareUsername) return false;
+	$("#compareSavedOrgsGroup, #compareNewOrgGroup, #compareEnv, #compareMyDomain").hide();
+	$("#loggedInUsername").text(cshActiveCompareUsername);
+	$("#logout").show();
+	if (cshLastCompareEnv) $('#csh-compare-refresh').show();
+	return true;
+}
+
+// Find out if the shared target-org connection is already active. Restore
+// its opaque saved-org id as well as the username so comparison cache reads
+// and writes remain pinned to the correct org after a page reload.
 chrome.runtime.sendMessage({'proxyFunction': 'getDeployUsername'}, function(response) {
-	// Response is {username, orgId} (older shape was a bare string).
+	// Response is {username, orgId, envLabel, host}; older versions returned a
+	// bare username, which remains supported without guessing an org identity.
 	var username = response && (typeof response === 'string' ? response : response.username);
 	console.log(username);
 	if (username) {
-		//Then there is a logged in deploy user — hide both login paths
-		$("#compareSavedOrgsGroup, #compareNewOrgGroup, #compareEnv, #compareMyDomain").hide();
-		$("#loggedInUsername").html(username);
-		$("#logout").show();
+		cshActiveCompareUsername = username;
+		if (typeof response === 'object') {
+			cshLastCompareOrgId = response.orgId || null;
+			cshLastCompareEnv = cshCompareEnvFromActiveConnection(response);
+		}
+		// Do not automatically scan the target org: this shared connection may
+		// have been opened from Validate/Deployment. If its environment was
+		// restored, make the explicit refresh action available so Compare can
+		// resume with the correct cache key and connection.
+		cshApplyActiveCompareUiState();
 	} else {
+		cshActiveCompareUsername = null;
 		$("#loggedInUsername").html('');
 		$("#logout").hide();
 		// cshCompareRefreshSavedOrgsUI is also called from setupTable and
